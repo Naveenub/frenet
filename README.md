@@ -2,6 +2,17 @@
 
 Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 MVP node**: a real libp2p peer with a local dashboard.
 
+## Stack (as built)
+
+This is the actual stack. It differs from the original spec, which assumed Next.js/React/TypeScript/Tailwind for the frontend and Go or Rust for the backend.
+
+| Layer | What is used | Not used (despite the spec) |
+|---|---|---|
+| Frontend (`web/`) | Plain JavaScript ES modules (`web/app.js`), hand-written HTML and CSS, no framework, no bundler, no build step (`scripts/copy-web.mjs` only copies the files into `dist/`). Talks to the node over loopback HTTP + SSE. | Next.js, React, TypeScript, Tailwind |
+| Backend (`src/`) | Node.js >= 22.13 + strict TypeScript (ESM, `tsc`, run with `tsx`), js-libp2p, `node:sqlite` | Go, Rust |
+
+The one Rust component is a dependency, not our code: the QUIC transport `@chainsafe/libp2p-quic` is a native binding over `quinn`. All FRENET source is TypeScript.
+
 ## Status (what is real)
 
 | Feature | State |
