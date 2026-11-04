@@ -3,6 +3,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { startApi } from './api.js'
+import { startGateway } from './gateway.js'
 import { startFrenet } from './node.js'
 
 const { values } = parseArgs({
@@ -17,13 +18,15 @@ const { values } = parseArgs({
     'relay-server': { type: 'boolean', default: false },
     announce: { type: 'string', multiple: true },
     'no-nat': { type: 'boolean', default: false },
+    'gateway-port': { type: 'string', default: '7778' },
+    'no-gateway': { type: 'boolean', default: false },
     'no-mdns': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false }
   }
 })
 
 if (values.help) {
-  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--no-nat] [--no-mdns]
+  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--no-nat] [--gateway-port N] [--no-gateway] [--no-mdns]
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777`)
   process.exit(0)
 }
@@ -40,12 +43,14 @@ const node = await startFrenet({
   quotaBytes: Number(values['quota-mb']) * 1024 * 1024,
   replicaTtlMs: Number(values['replica-ttl-days']) * 86_400_000
 })
-const api = await startApi(node, Number(values['api-port']))
+const gateway = values['no-gateway'] ? null : await startGateway(node, Number(values['gateway-port']))
+const api = await startApi(node, Number(values['api-port']), '127.0.0.1', gateway?.port)
 
 console.log(`FRENET node ${node.libp2p.peerId.toString()}`)
 for (const a of node.libp2p.getMultiaddrs()) console.log(`  listening ${a.toString()}`)
 console.log(`dashboard http://127.0.0.1:${api.port}`)
+if (gateway) console.log(`site gateway http://<site-id>.localhost:${gateway.port}/`)
 
-const shutdown = async (): Promise<void> => { api.server.close(); await node.stop(); process.exit(0) }
+const shutdown = async (): Promise<void> => { api.server.close(); gateway?.server.close(); await node.stop(); process.exit(0) }
 process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)

@@ -16,6 +16,7 @@ import { loadOrCreateIdentity } from './identity.js'
 import { Blocks } from './blocks.js'
 import { FileStore } from './files.js'
 import { Messaging } from './messaging.js'
+import { Sites } from './sites.js'
 import { Store } from './store.js'
 
 export interface FrenetOptions {
@@ -46,6 +47,7 @@ export interface FrenetNode {
   messaging: Messaging
   blocks: Blocks
   files: FileStore
+  sites: Sites
   startedAt: number
   stop: () => Promise<void>
 }
@@ -108,6 +110,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const messaging = new Messaging(libp2p, store, privateKey)
   const blocks = new Blocks(libp2p, store, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
   const files = new FileStore(blocks, store)
+  const sites = new Sites(blocks, files)
   store.sweep()
   const sweeper = setInterval(() => store.sweep(), 10 * 60 * 1000)
   sweeper.unref()
@@ -128,6 +131,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     messaging,
     blocks,
     files,
+    sites,
     startedAt: Date.now(),
     stop: async () => {
       clearInterval(sweeper)

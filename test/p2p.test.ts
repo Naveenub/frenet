@@ -3,7 +3,9 @@ import { mkdtempSync, rmSync, statSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
+import { request } from 'node:http'
 import { startApi } from '../src/api.js'
+import { startGateway } from '../src/gateway.js'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { MAX_BODY_BYTES, MSG_PROTOCOL, RateLimiter, ReplayGuard, signMessage, verifyMessage } from '../src/messaging.js'
@@ -128,6 +130,97 @@ describe('NAT traversal: circuit relay', () => {
     await b.messaging.send(a.libp2p.peerId, 'via relay')
     await waitFor(() => got.length === 1)
     assert.equal(got[0], `${b.libp2p.peerId}:via relay`)   // sender identity is still the authenticated peer, not the relay
+  })
+})
+
+describe('decentralized sites + gateway', () => {
+  const get = (port: number, host: string, path: string, headers: Record<string, string> = {}, method = 'GET') =>
+    new Promise<{ status: number, headers: Record<string, any>, body: Buffer }>((resolve, reject) => {
+      const r = request({ host: '127.0.0.1', port, path, method, headers: { host, ...headers } }, (res) => {
+        const c: Buffer[] = []; res.on('data', (d) => c.push(d)); res.on('end', () => resolve({ status: res.statusCode!, headers: res.headers, body: Buffer.concat(c) }))
+      })
+      r.on('error', reject); r.end()
+    })
+  const html = '<!doctype html><link rel="stylesheet" href="css/app.css"><h1>hello frenet</h1>'
+
+  it('publishes on A and B serves it through the gateway, hash-verified, with a locked-down CSP', async () => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const b = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    await a.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    await new Promise((r) => setTimeout(r, 1500))
+    const site = await a.sites.publish([
+      { path: 'index.html', data: Buffer.from(html) },
+      { path: 'css/app.css', data: Buffer.from('h1{color:red}') },
+      { path: 'docs/index.html', data: Buffer.from('<p>docs</p>') },
+      { path: 'blob.bin', data: Buffer.from([1, 2, 3]) }
+    ])
+    assert.ok(site.announced)
+    const gw = await startGateway(b, 0)
+    try {
+      const host = `${site.cid}.localhost:${gw.port}`
+      const root = await get(gw.port, host, '/')
+      assert.equal(root.status, 200)
+      assert.equal(root.body.toString(), html)
+      assert.match(root.headers['content-type'], /text\/html/)
+      assert.match(root.headers['content-security-policy'], /default-src 'none'/)
+      assert.match(root.headers['content-security-policy'], /connect-src 'self'/)
+      assert.equal(root.headers['x-content-type-options'], 'nosniff')
+      assert.equal(root.headers['referrer-policy'], 'no-referrer')
+      assert.equal((await get(gw.port, host, '/css/app.css')).body.toString(), 'h1{color:red}')
+      assert.equal((await get(gw.port, host, '/docs/')).body.toString(), '<p>docs</p>')
+      const bin = await get(gw.port, host, '/blob.bin')
+      assert.equal(bin.headers['content-type'], 'application/octet-stream')
+      assert.equal(bin.headers['content-disposition'], 'attachment')
+      assert.equal((await get(gw.port, host, '/nope.html')).status, 404)
+      assert.equal((await get(gw.port, host, '/../../etc/passwd')).status, 404)
+      assert.equal((await get(gw.port, host, '/%2e%2e/%2e%2e/x')).status, 404)
+      assert.equal((await get(gw.port, host, '/', {}, 'POST')).status, 405)
+      assert.equal((await get(gw.port, `127.0.0.1:${gw.port}`, '/')).status, 404)          // no site in Host
+      assert.equal((await get(gw.port, `evil.example`, '/')).status, 404)                  // DNS rebinding
+      assert.equal((await get(gw.port, `${site.cid}.evil.example`, '/')).status, 404)
+      // drive-by subresource loads from other pages are refused; user navigation and same-origin loads work
+      assert.equal((await get(gw.port, host, '/', { 'sec-fetch-site': 'cross-site', 'sec-fetch-dest': 'image' })).status, 403)
+      assert.equal((await get(gw.port, host, '/', { 'sec-fetch-site': 'cross-site', 'sec-fetch-dest': 'iframe' })).status, 403)
+      assert.equal((await get(gw.port, host, '/', { 'sec-fetch-site': 'cross-site', 'sec-fetch-dest': 'document' })).status, 200)
+      assert.equal((await get(gw.port, host, '/css/app.css', { 'sec-fetch-site': 'same-origin', 'sec-fetch-dest': 'style' })).status, 200)
+    } finally { gw.server.close() }
+  })
+
+  it('rejects unsafe publishes and malicious manifests', async () => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const f = (path: string) => ({ path, data: Buffer.from('x') })
+    for (const bad of ['../x', '/abs', 'a//b', 'a/../b', './a', 'a b', 'a\\b', '']) {
+      await assert.rejects(a.sites.publish([f('index.html'), f(bad)]), /invalid path/, bad)
+    }
+    await assert.rejects(a.sites.publish([f('home.html')]), /index file/)
+    await assert.rejects(a.sites.publish([f('index.html'), f('index.html')]), /duplicate/)
+    await assert.rejects(a.sites.publish(Array.from({ length: 65 }, (_, i) => f(i === 0 ? 'index.html' : `f${i}`))), /too many/)
+    assert.equal(a.store.listFiles().length, 0)   // nothing half-published
+
+    // a hostile publisher's manifest cannot smuggle traversal paths or non-site blocks
+    const fc = (await a.files.add('x', Buffer.from('x'), { encrypt: false })).cid
+    const evil = await a.blocks.put(Buffer.from(JSON.stringify({ v: 1, type: 'site', index: 'index.html', files: { 'index.html': fc, '../../etc/passwd': fc } })))
+    await assert.rejects(a.sites.resolve(evil.cid, '/'), /bad site manifest/)
+    const notSite = await a.blocks.put(Buffer.from('just some bytes'))
+    await assert.rejects(a.sites.resolve(notSite.cid, '/'), /not a site/)
+    await assert.rejects(a.sites.resolve('not-a-cid', '/'), /invalid site id/)
+    const proto = await a.blocks.put(Buffer.from(JSON.stringify({ v: 1, type: 'site', index: 'index.html', files: { 'index.html': fc } })))
+    assert.equal(await a.sites.resolve(proto.cid, '/constructor'), null)   // prototype keys are not files
+  })
+
+  it('publishes through the local API', async () => {
+    const n = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const { server, port } = await startApi(n, 0, '127.0.0.1', 7778)
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/api/sites`, { method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ files: [{ path: 'index.html', data: Buffer.from('<p>hi</p>').toString('base64') }] }) })
+      const j = await r.json() as any
+      assert.equal(r.status, 200)
+      assert.equal(j.url, `http://${j.cid}.localhost:7778/`)
+      assert.equal((await n.sites.resolve(j.cid, '/'))!.data.toString(), '<p>hi</p>')
+      const bad = await fetch(`http://127.0.0.1:${port}/api/sites`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: [{ path: '../x', data: 'eA==' }] }) })
+      assert.equal(bad.status, 400)
+    } finally { server.close() }
   })
 })
 

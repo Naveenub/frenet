@@ -17,9 +17,10 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
-| Storage, browser, voice/video, governance, node operator tools | **not built** (Phases 2-3) |
+| Decentralized sites: publish a static folder (<= 64 files, 32 MB), content-addressed, served by a local gateway on an isolated per-site origin (`<site-id>.localhost`) with a no-third-party CSP; dashboard Browser view | working, tested (publish on A, serve via B over the DHT) |
+| Voice/video, governance, node operator tools | **not built** (Phase 3) |
 | NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | working: relayed delivery tested on loopback; hole punching and UPnP depend on your NAT/router and are untested here |
-| WebRTC, QUIC, DIDs, Sybil resistance | **not built** (Phase 2+) |
+| QUIC, DIDs, Sybil resistance, site naming / search | **not built** (Phase 2+) |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -39,6 +40,13 @@ npm start -- --data /tmp/b --listen /ip4/127.0.0.1/tcp/4102 --api-port 7802 --no
 # in A's dashboard: Connected Peers -> paste B's address (printed at startup)
 ```
 
+### Sites
+
+Publish a folder from the dashboard (**Decentralized Browser**) or via `POST /api/sites`, then share the `frenet-site://<id>` link.
+Sites are **public**: no encryption, anyone with the ID can read them. The ID is the hash of the site manifest, so the content cannot be swapped.
+Open `http://<site-id>.localhost:7778/` (the gateway fetches from peers and verifies hashes). Sites can only load their own files (no third-party requests, no framing)
+and each has its own browser origin. `--gateway-port N` / `--no-gateway`. Limits: static files only, no naming (IDs are hashes), no search, no updates (republish = new ID).
+
 Behind NAT (home router, CGNAT)? Point the node at a relay that has a public address:
 
 ```bash
@@ -53,7 +61,7 @@ capacity-limited (relay default: 2 min / 2 MiB per connection); peers try to upg
 connection with DCUtR hole punching, and UPnP opens a port when the router allows it.
 Use `--announce MULTIADDR` for a manually forwarded port or DNS name, `--no-nat` to disable all of this.
 
-Flags: `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
+Flags: `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--gateway-port N`, `--no-gateway`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
 
 ## Test
 

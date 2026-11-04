@@ -16,7 +16,7 @@ const ago = (ms) => { const s = Math.floor(ms / 1000); return s < 60 ? s + 's' :
 
 const SECTIONS = [
   ['overview', 'Network Overview'], ['peers', 'Connected Peers'], ['messages', 'Private Communications'],
-  ['storage', 'Distributed Storage'], ['browser', 'Decentralized Browser', 'Phase 3'],
+  ['storage', 'Distributed Storage'], ['browser', 'Decentralized Browser'],
   ['identity', 'Identity and Keys'], ['nodes', 'Network Nodes', 'Phase 3'],
   ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['governance', 'Community Governance', 'Phase 3']
 ]
@@ -38,7 +38,7 @@ function go (id) {
   const v = $('#view'); v.replaceChildren()
   const meta = SECTIONS.find((s) => s[0] === id)
   if (meta[2]) return v.append(el('div', { className: 'card' }, el('h3', {}, 'Not built yet'), el('p', { className: 'dim' }, `This section is planned for ${meta[2]}. Nothing here is simulated.`)))
-  ;({ overview, peers, messages, storage, identity, privacy, security })[id](v)
+  ;({ overview, peers, messages, storage, browser, identity, privacy, security })[id](v)
 }
 
 function stat (label, value) { return el('div', { className: 'stat' }, el('b', {}, String(value)), el('span', {}, label)) }
@@ -172,6 +172,41 @@ async function storage (v) {
       el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/files/delete', { cid: f.cid }); await refresh(); go('storage') } }, 'Delete local copy'))))
   }
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Files you added'), files.length ? t : el('p', { className: 'dim' }, 'No files yet. Other peers may still hold copies of anything you shared.')))
+}
+
+function browser (v) {
+  const gw = state.status.gatewayPort
+  if (!gw) { v.append(el('div', { className: 'card' }, el('h3', {}, 'Gateway is off'), el('p', { className: 'dim' }, 'Restart the node without --no-gateway to publish and open sites.'))); return }
+  const pick = el('input', { type: 'file', multiple: true, webkitdirectory: true, 'aria-label': 'Site folder' })
+  const ttl = el('input', { type: 'number', min: 1, placeholder: 'keep for N days (blank = until deleted)', 'aria-label': 'Retention in days' })
+  const msg = el('p', { className: 'err' }); const out = el('div')
+  const pub = el('button', { className: 'btn', type: 'button', onclick: async () => {
+    msg.textContent = ''; out.replaceChildren()
+    const fs = [...pick.files]
+    if (!fs.length) { msg.textContent = 'Choose a folder containing index.html.'; return }
+    const prefix = fs[0].webkitRelativePath.split('/')[0] + '/'
+    pub.disabled = true; msg.textContent = 'Publishing…'
+    try {
+      const files = []
+      for (const f of fs) files.push({ path: (f.webkitRelativePath || f.name).replace(prefix, ''), data: b64(await f.arrayBuffer()) })
+      const r = await api('/api/sites', { files, ttlDays: ttl.value ? Number(ttl.value) : undefined })
+      msg.textContent = ''
+      out.append(el('p', {}, `Published ${r.files} files.`), el('div', { className: 'mono' }, r.link),
+        el('p', {}, el('a', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open site')),
+        el('p', { className: 'dim' }, 'Sites are public: anyone with the site ID can read every file. Share the frenet-site:// link.'))
+    } catch (e) { msg.textContent = e.message } finally { pub.disabled = false }
+  } }, 'Publish site')
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Publish a site'), el('p', { className: 'dim' }, 'Static files only (max 64 files, 32 MB). Each site gets its own isolated origin and can only load its own files: no third-party requests, no tracking.'), el('div', { className: 'row' }, pick), el('div', { className: 'row' }, ttl, pub), msg, out))
+
+  const link = el('input', { placeholder: 'frenet-site://bafk…', 'aria-label': 'Site link' }); const omsg = el('p', { className: 'err' })
+  const open = el('button', { className: 'btn', type: 'button', onclick: () => {
+    omsg.textContent = ''
+    const cid = link.value.trim().replace(/^frenet-site:\/\//, '').replace(/\/.*$/, '')
+    if (!/^[a-z2-7]{20,63}$/.test(cid)) { omsg.textContent = 'That is not a valid site ID.'; return }
+    window.open(`http://${cid}.localhost:${gw}/`, '_blank', 'noopener,noreferrer')
+  } }, 'Open site')
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Open a site'), el('div', { className: 'row' }, link, open), omsg,
+    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do).')))
 }
 
 function identity (v) {

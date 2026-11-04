@@ -21,7 +21,7 @@ const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js
  * Local control API. Binds to loopback only, rejects foreign Host headers (DNS rebinding)
  * and cross-origin state-changing requests (CSRF).
  */
-export function startApi (n: FrenetNode, port: number, host = '127.0.0.1'): Promise<{ server: Server, port: number }> {
+export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number): Promise<{ server: Server, port: number }> {
   const clients = new Set<ServerResponse>()
   const push = (event: string, data: unknown): void => {
     const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -45,7 +45,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1'): Prom
         if (!String(req.headers['content-type'] ?? '').startsWith('application/json')) return json(res, 415, { error: 'json only' })
       }
 
-      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n))
+      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort))
       if (req.method === 'GET' && url.pathname === '/api/peers') return json(res, 200, await peers(n))
       if (req.method === 'GET' && url.pathname === '/api/messages') {
         return json(res, 200, n.store.list(url.searchParams.get('peer') ?? undefined))
@@ -81,6 +81,14 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1'): Prom
       if (req.method === 'POST' && url.pathname === '/api/files/delete') {
         const b = await body(req)
         return json(res, 200, { deleted: n.files.remove(String(b.cid)) })
+      }
+      if (req.method === 'POST' && url.pathname === '/api/sites') {
+        const b = await body(req, 48 * 1024 * 1024)
+        if (!Array.isArray(b.files)) throw new Error('files must be an array')
+        const entries = b.files.map((f: any) => ({ path: String(f?.path), data: Buffer.from(String(f?.data ?? ''), 'base64') }))
+        const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
+        const r = await n.sites.publish(entries, { ...(b.index ? { index: String(b.index) } : {}), ...(ttl ? { ttlMs: ttl } : {}) })
+        return json(res, 200, { ...r, url: gatewayPort ? `http://${r.cid}.localhost:${gatewayPort}/` : null })
       }
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
@@ -142,13 +150,14 @@ async function body (req: IncomingMessage, max = 64 * 1024): Promise<Record<stri
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
 }
 
-async function status (n: FrenetNode): Promise<unknown> {
+async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
   const l = n.libp2p
   const dht = (l.services as any).dht
   return {
     peerId: l.peerId.toString(),
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
+    gatewayPort: gatewayPort ?? null,
     nat: {
       enabled: !!(l.services as any).autonat,
       relayServer: !!(l.services as any).relay,

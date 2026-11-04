@@ -1,7 +1,7 @@
 # Architecture (Phase 1)
 
 ```
-web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts
+web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts          src/gateway.ts (sites, :7778)
                                                     |
                               src/node.ts  (libp2p: tcp, circuit-relay v2, noise, yamux, mdns, bootstrap, kad-dht, identify, ping, autonat, dcutr, upnp)
                                |-- src/identity.ts   Ed25519 key file, 0600
@@ -20,6 +20,11 @@ web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts
 
 ## Files (`src/files.ts`)
 File -> 256 KB chunks -> each sealed with AES-256-GCM (random per-file key, random 96-bit nonce, AAD `c<index>`) -> blocks. Manifest `{name,size,chunks[]}` is sealed too (AAD `m`) and its CID is the file ID. Link: `frenet://<manifestCid>#<key>`; the key is never stored or sent by the node, so providers see ciphertext only. `{encrypt:false}` makes a public file. Max 16 MB. No key recovery: lose the link, lose the file.
+
+## Sites (`src/sites.ts`, `src/gateway.ts`)
+A site = public files (Files with `encrypt:false`) plus a manifest block `{v:1,type:'site',index,files:{path->fileCid}}`; the site ID is the manifest's CID. Paths are relative, `[A-Za-z0-9._-]` segments, no `.`/`..`; max 64 files / 32 MB. The manifest is validated on read because the publisher is untrusted (path charset, CID shape, prototype keys are not files).
+The gateway (default `127.0.0.1:7778`) serves `GET/HEAD http://<siteCid>.localhost:<port>/<path>`: the `Host` must be a valid site CID (DNS-rebinding defence; each site is a separate browser origin). Responses carry `default-src 'none'; img/style/script/font/media/connect 'self'; form-action 'self'; base-uri 'none'; frame-ancestors 'none'`, `nosniff`, `no-referrer`, CORP same-origin. Only a fixed MIME allow-list is rendered; other types are served as attachments. Browser subresource requests from other pages (`Sec-Fetch-Dest` other than `document`, unless same-origin) are refused so a web page cannot make this node fetch arbitrary CIDs. Clients that send no `Sec-Fetch-*` headers (curl) are allowed: they are already local.
+Limits: static content only; no naming layer, search, or mutable sites; the gateway is plain HTTP on loopback; fetching an unseen site reveals the CID you want to your DHT neighbours.
 
 ## Retention
 Own blocks are pinned (until deleted or per-file TTL). Replicas fetched from peers expire after `--replica-ttl-days`. Expired blocks are never served and are swept every 10 min and at startup. `--quota-mb` bounds local bytes; over-quota adds fail and roll back, over-quota replicas are served but not cached. Local delete removes manifest + unshared chunks and vacuums the DB; copies on other peers are outside our control.
