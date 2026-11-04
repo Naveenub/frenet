@@ -3,7 +3,7 @@
 ```
 web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts
                                                     |
-                              src/node.ts  (libp2p: tcp, noise, yamux, mdns, bootstrap, kad-dht, identify, ping)
+                              src/node.ts  (libp2p: tcp, circuit-relay v2, noise, yamux, mdns, bootstrap, kad-dht, identify, ping, autonat, dcutr, upnp)
                                |-- src/identity.ts   Ed25519 key file, 0600
                                |-- src/messaging.ts  /frenet/msg/1.0.0, one JSON message per stream
                                `-- src/store.ts      SQLite (node:sqlite), local only
@@ -28,6 +28,9 @@ Own blocks are pinned (until deleted or per-file TTL). Replicas fetched from pee
 `GET /api/status|peers|messages|events(SSE)|blocks/<cid>|files`, `POST /api/send|dial|blocks|files|files/get|files/delete` (base64 `data`). Foreign `Host` headers (DNS rebinding) and cross-origin POSTs are rejected; JSON content-type required; strict CSP on static files.
 
 ## Known limits
-- No NAT traversal or relays: peers must be directly reachable (LAN, public IP, or forwarded port). Firewalls are not modified.
+- NAT traversal is best-effort, not guaranteed. Layers, in order: UPnP port mapping (router permitting) -> AutoNAT reachability detection -> circuit-relay v2 reservation on `--relay` peers (or relays discovered among connected peers) -> DCUtR hole punching to upgrade relayed links to direct. Symmetric NATs / CGNAT may stay relay-only.
+- Relayed connections are limited (a relay we run allows 2 min / 2 MiB per connection). Messaging and block fetch are allowed over them; large files may need the direct upgrade to succeed. Relays are not a privacy layer: they see peer IDs and traffic volume, but not content (Noise is end-to-end), and `remotePeer` is still the authenticated peer, never the relay.
+- Running a relay (`--relay-server`) donates bandwidth (capped at 64 reservations). There is no relay discovery service or reputation yet: you must supply relay addresses you trust to be available.
+- Firewalls are not modified.
 - Messages to offline peers fail; no store-and-forward.
 - Reputation, Sybil resistance, secure updates: not implemented.

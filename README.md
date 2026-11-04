@@ -18,7 +18,8 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
 | Storage, browser, voice/video, governance, node operator tools | **not built** (Phases 2-3) |
-| NAT traversal / relays, WebRTC, QUIC, DIDs, Sybil resistance | **not built** (Phase 2+) |
+| NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | working: relayed delivery tested on loopback; hole punching and UPnP depend on your NAT/router and are untested here |
+| WebRTC, QUIC, DIDs, Sybil resistance | **not built** (Phase 2+) |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -38,7 +39,21 @@ npm start -- --data /tmp/b --listen /ip4/127.0.0.1/tcp/4102 --api-port 7802 --no
 # in A's dashboard: Connected Peers -> paste B's address (printed at startup)
 ```
 
-Flags: `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
+Behind NAT (home router, CGNAT)? Point the node at a relay that has a public address:
+
+```bash
+# on a publicly reachable host (VPS, forwarded port)
+npm start -- --relay-server --listen /ip4/0.0.0.0/tcp/4001
+# on the NATed node(s): reserve a slot on that relay
+npm start -- --relay /ip4/<relay-ip>/tcp/4001/p2p/<relay-peer-id>
+```
+
+The node then advertises a `/p2p-circuit` address that other peers can dial. Relayed links are
+capacity-limited (relay default: 2 min / 2 MiB per connection); peers try to upgrade to a direct
+connection with DCUtR hole punching, and UPnP opens a port when the router allows it.
+Use `--announce MULTIADDR` for a manually forwarded port or DNS name, `--no-nat` to disable all of this.
+
+Flags: `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
 
 ## Test
 

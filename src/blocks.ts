@@ -55,7 +55,7 @@ export class Blocks {
         if (data) stream.send(data)
         await stream.close()
       } catch { stream.abort(new Error('bad request')) }
-    }, { maxInboundStreams: 32, maxOutboundStreams: 32 })
+    }, { maxInboundStreams: 32, maxOutboundStreams: 32, runOnLimitedConnection: true })
   }
 
   async stop (): Promise<void> { await this.node.unhandle(BLOCK_PROTOCOL) }
@@ -106,7 +106,7 @@ export class Blocks {
         if (prov.id.equals(this.node.peerId)) continue
         try {
           if (prov.multiaddrs.length) await this.node.peerStore.merge(prov.id, { multiaddrs: prov.multiaddrs })
-          const stream = await this.node.dialProtocol(prov.id, BLOCK_PROTOCOL, { signal })
+          const stream = await this.node.dialProtocol(prov.id, BLOCK_PROTOCOL, { signal, runOnLimitedConnection: true })
           stream.send(Buffer.from(cid.toString()))
           await stream.close()
           const chunks: Uint8Array[] = []

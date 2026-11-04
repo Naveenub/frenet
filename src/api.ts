@@ -149,6 +149,11 @@ async function status (n: FrenetNode): Promise<unknown> {
     peerId: l.peerId.toString(),
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
+    nat: {
+      enabled: !!(l.services as any).autonat,
+      relayServer: !!(l.services as any).relay,
+      relayedAddresses: l.getMultiaddrs().map(String).filter((a) => a.includes('/p2p-circuit'))
+    },
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),
@@ -172,6 +177,7 @@ async function peers (n: FrenetNode): Promise<unknown[]> {
       peer: c.remotePeer.toString(),
       address: c.remoteAddr.toString(),
       direction: c.direction,
+      relayed: c.remoteAddr.toString().includes('/p2p-circuit'),
       encryption: c.encryption,
       muxer: c.multiplexer,
       openedAt: c.timeline.open,

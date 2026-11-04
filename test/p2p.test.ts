@@ -56,6 +56,28 @@ describe('real two-node network (loopback TCP + Noise + yamux)', () => {
   })
 })
 
+describe('NAT traversal: circuit relay', () => {
+  it('delivers a message between two peers that only share a relay', async () => {
+    const relay = await track({ dataDir: ':memory:', listen: L, mdns: false, relayServer: true })
+    const relayAddr = relay.libp2p.getMultiaddrs()[0].toString()
+    // A and B never learn each other's direct addresses; both reserve a slot on the relay.
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false, relays: [relayAddr] })
+    const b = await track({ dataDir: ':memory:', listen: L, mdns: false, relays: [relayAddr] })
+    await waitFor(() => a.libp2p.getMultiaddrs().some((m) => m.toString().includes('/p2p-circuit')), 10_000)
+    const circuit = a.libp2p.getMultiaddrs().find((m) => m.toString().includes('/p2p-circuit'))!
+    const got: string[] = []
+    a.messaging.on('message', (m) => got.push(`${m.peer}:${m.body}`))
+
+    const conn = await b.libp2p.dial(circuit)
+    assert.equal(conn.remotePeer.toString(), a.libp2p.peerId.toString())
+    assert.ok(conn.remoteAddr.toString().includes('/p2p-circuit'))
+    assert.equal(conn.encryption, '/noise')   // end-to-end Noise on top of the relayed hop
+    await b.messaging.send(a.libp2p.peerId, 'via relay')
+    await waitFor(() => got.length === 1)
+    assert.equal(got[0], `${b.libp2p.peerId}:via relay`)   // sender identity is still the authenticated peer, not the relay
+  })
+})
+
 describe('local identity', () => {
   it('persists a stable Ed25519 identity with 0600 permissions', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'frenet-'))

@@ -1,11 +1,15 @@
 import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
+import { autoNAT } from '@libp2p/autonat'
 import { bootstrap } from '@libp2p/bootstrap'
+import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2'
+import { dcutr } from '@libp2p/dcutr'
 import { identify } from '@libp2p/identify'
 import { kadDHT, passthroughMapper } from '@libp2p/kad-dht'
 import { mdns } from '@libp2p/mdns'
 import { ping } from '@libp2p/ping'
 import { tcp } from '@libp2p/tcp'
+import { uPnPNAT } from '@libp2p/upnp-nat'
 import { createLibp2p } from 'libp2p'
 import type { Libp2p } from '@libp2p/interface'
 import { loadOrCreateIdentity } from './identity.js'
@@ -19,6 +23,17 @@ export interface FrenetOptions {
   listen?: string[]
   bootstrap?: string[]
   mdns?: boolean
+  /**
+   * NAT traversal: AutoNAT reachability checks, circuit-relay v2 client,
+   * DCUtR hole punching and UPnP port mapping. Default true.
+   */
+  nat?: boolean
+  /** Relay multiaddrs (with /p2p/<id>) to reserve a slot on, so NATed peers stay reachable. */
+  relays?: string[]
+  /** Also act as a circuit-relay v2 server for other peers (needs a publicly reachable address). */
+  relayServer?: boolean
+  /** Extra public multiaddrs to announce (e.g. a forwarded port or DNS name). */
+  announce?: string[]
   quotaBytes?: number
   replicaTtlMs?: number
   /** Only meaningful with dataDir ':memory:' (tests). */
@@ -46,24 +61,47 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
 
   const peerDiscovery = []
   if (opts.mdns !== false) peerDiscovery.push(mdns())
-  if (opts.bootstrap?.length) peerDiscovery.push(bootstrap({ list: opts.bootstrap }))
+
+  const useNat = opts.nat !== false
+  const relays = opts.relays ?? []
+  const listen = [...(opts.listen ?? ['/ip4/0.0.0.0/tcp/0'])]
+  // Reserve a slot on each configured relay; with none configured, let libp2p
+  // discover relays among connected peers that run the hop protocol.
+  for (const r of relays) listen.push(`${r.replace(/\/p2p-circuit$/, '')}/p2p-circuit`)
+  if (useNat && relays.length === 0) listen.push('/p2p-circuit')
+  // Bootstrap peers and relays are dialed at startup (relays so the reservation can be made).
+  const boot = [...(opts.bootstrap ?? []), ...relays]
+  if (boot.length) peerDiscovery.push(bootstrap({ list: boot }))
+
+  const services: Record<string, any> = {
+    identify: identify(),
+    ping: ping(),
+    dht: kadDHT({
+      protocol: '/frenet/kad/1.0.0',
+      clientMode: false,
+      peerInfoMapper: passthroughMapper
+    })
+  }
+  if (useNat) {
+    services.autonat = autoNAT()
+    services.dcutr = dcutr()
+    services.upnp = uPnPNAT()
+  }
+  if (opts.relayServer) {
+    // Relayed links are limited by design; peers upgrade to direct via DCUtR.
+    services.relay = circuitRelayServer({
+      reservations: { maxReservations: 64, defaultDurationLimit: 2 * 60_000, defaultDataLimit: BigInt(2 * 1024 * 1024) }
+    })
+  }
 
   const libp2p = await createLibp2p({
     privateKey,
-    addresses: { listen: opts.listen ?? ['/ip4/0.0.0.0/tcp/0'] },
-    transports: [tcp()],
+    addresses: { listen, ...(opts.announce?.length ? { announce: opts.announce } : {}) },
+    transports: [tcp(), ...(useNat || opts.relayServer ? [circuitRelayTransport()] : [])],
     connectionEncrypters: [noise()],   // Noise XX: authenticated, forward-secret
     streamMuxers: [yamux()],
     peerDiscovery,
-    services: {
-      identify: identify(),
-      ping: ping(),
-      dht: kadDHT({
-        protocol: '/frenet/kad/1.0.0',
-        clientMode: false,
-        peerInfoMapper: passthroughMapper
-      })
-    }
+    services
   })
 
   const store = new Store(opts.dataDir)

@@ -76,7 +76,7 @@ export class Messaging extends EventEmitter<{ message: [InboundMessage], dropped
       } catch (err) {
         this.drop(peer, `error: ${(err as Error).message}`)
       }
-    }, { maxInboundStreams: 64, maxOutboundStreams: 64 })
+    }, { maxInboundStreams: 64, maxOutboundStreams: 64, runOnLimitedConnection: true })
   }
 
   async stop (): Promise<void> { await this.node.unhandle(MSG_PROTOCOL) }
@@ -85,7 +85,7 @@ export class Messaging extends EventEmitter<{ message: [InboundMessage], dropped
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw new Error(`message exceeds ${MAX_BODY_BYTES} bytes`)
     if (body.length === 0) throw new Error('empty message')
     const w: Wire = { v: 1, id: randomUUID(), ts: Date.now(), body }
-    const stream = await this.node.dialProtocol(to, MSG_PROTOCOL)
+    const stream = await this.node.dialProtocol(to, MSG_PROTOCOL, { runOnLimitedConnection: true })
     stream.send(Buffer.from(JSON.stringify(w)))
     await stream.close()
     this.store.add({ id: w.id, peer: to.toString(), direction: 'out', ts: w.ts, body })
