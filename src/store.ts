@@ -18,6 +18,8 @@ export type CommunityState = 'invited' | 'joined' | 'removed' | 'left'
 export interface CommunityRow { id: string, owner: string, name: string, seq: number, members: string[], state: CommunityState, updated: number }
 export interface GroupEventRow { community: string, id: string, kind: string, author: string, ts: number, body: string, sig: string, meta: string | null }
 
+export interface CredentialRow { id: string, role: 'issued' | 'held', issuer: string, subject: string, type: string, issued: number, expires: number | null, jwt: string }
+
 export interface FileRow { cid: string, name: string, size: number, chunks: string[], encrypted: boolean, created: number, expires: number | null }
 
 /** Local-first message store (SQLite). Nothing here is ever uploaded. */
@@ -44,6 +46,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, seq INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('invited','joined','removed','left')), updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS group_events (community TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, author TEXT NOT NULL, ts INTEGER NOT NULL, body TEXT NOT NULL, sig TEXT NOT NULL, meta TEXT, PRIMARY KEY (community, id));
       CREATE INDEX IF NOT EXISTS group_events_ts ON group_events (community, kind, ts);
+      CREATE TABLE IF NOT EXISTS credentials (id TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('issued','held')), issuer TEXT NOT NULL, subject TEXT NOT NULL, type TEXT NOT NULL, issued INTEGER NOT NULL, expires INTEGER, jwt TEXT NOT NULL, PRIMARY KEY (id, role));
+      CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     for (const c of ['sig', 'sender', 'recipient']) {
@@ -165,6 +169,29 @@ export class Store {
   getGroupEvent (community: string, id: string): GroupEventRow | null { return (this.db.prepare('SELECT * FROM group_events WHERE community = ? AND id = ?').get(community, id) as unknown as GroupEventRow) ?? null }
   listGroupEvents (community: string, kind: string, limit = 200): GroupEventRow[] {
     return (this.db.prepare('SELECT * FROM group_events WHERE community = ? AND kind = ? ORDER BY ts DESC LIMIT ?').all(community, kind, limit) as unknown as GroupEventRow[]).reverse()
+  }
+
+  addCredential (c: CredentialRow): void {
+    this.db.prepare('INSERT OR REPLACE INTO credentials (id, role, issuer, subject, type, issued, expires, jwt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(c.id, c.role, c.issuer, c.subject, c.type, c.issued, c.expires, c.jwt)
+  }
+  getCredential (id: string, role: 'issued' | 'held'): CredentialRow | null {
+    const r = this.db.prepare('SELECT * FROM credentials WHERE id = ? AND role = ?').get(id, role) as any
+    return r ? this.credential(r) : null
+  }
+  listCredentials (role?: 'issued' | 'held'): CredentialRow[] {
+    const rows = role ? this.db.prepare('SELECT * FROM credentials WHERE role = ? ORDER BY issued DESC').all(role) : this.db.prepare('SELECT * FROM credentials ORDER BY issued DESC').all()
+    return (rows as any[]).map((r) => this.credential(r))
+  }
+  deleteCredential (id: string, role: 'issued' | 'held'): boolean { return Number(this.db.prepare('DELETE FROM credentials WHERE id = ? AND role = ?').run(id, role).changes) > 0 }
+  private credential (r: any): CredentialRow { return { id: r.id, role: r.role, issuer: r.issuer, subject: r.subject, type: r.type, issued: Number(r.issued), expires: r.expires == null ? null : Number(r.expires), jwt: r.jwt } }
+
+  addRevocation (issuer: string, id: string, jwt: string): boolean {
+    return Number(this.db.prepare('INSERT OR IGNORE INTO revocations (issuer, id, ts, jwt) VALUES (?, ?, ?, ?)').run(issuer, id, Date.now(), jwt).changes) > 0
+  }
+  isRevoked (issuer: string, id: string): boolean { return !!this.db.prepare('SELECT 1 FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) }
+  listRevocations (): Array<{ issuer: string, id: string, ts: number, jwt: string }> {
+    return (this.db.prepare('SELECT * FROM revocations ORDER BY ts DESC').all() as any[]).map((r) => ({ issuer: r.issuer, id: r.id, ts: Number(r.ts), jwt: r.jwt }))
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */

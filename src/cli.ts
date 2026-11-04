@@ -3,8 +3,15 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { startApi } from './api.js'
+import { IDENTITY_COMMANDS, runIdentityCommand } from './cli-identity.js'
 import { startGateway } from './gateway.js'
 import { startFrenet } from './node.js'
+
+// Identity and recovery subcommands (frenet identity | backup | restore | recovery ...) run without starting a node.
+const subcommand = process.argv[2]
+if (subcommand && IDENTITY_COMMANDS.includes(subcommand)) {
+  process.exit(await runIdentityCommand(subcommand, process.argv.slice(3)))
+}
 
 const { values } = parseArgs({
   options: {
@@ -28,7 +35,8 @@ const { values } = parseArgs({
 
 if (values.help) {
   console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--gateway-port N] [--no-gateway] [--no-mdns]
-  default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777`)
+  default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777
+  identity & recovery (node stopped): frenet identity | backup --out FILE | restore FILE | recovery split -k K -n N | recovery restore [SHARE...]   (frenet <cmd> --help)`)
   process.exit(0)
 }
 

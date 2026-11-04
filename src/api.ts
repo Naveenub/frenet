@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { DAY_MS } from './blocks.js'
+import { didDocument, resolveDid, toDid } from './did.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
 
@@ -112,6 +113,32 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         const q = String(url.searchParams.get('q') ?? '').slice(0, 200)
         return json(res, 200, { query: q, results: await n.names.search(q) })
       }
+      if (req.method === 'GET' && url.pathname === '/api/identity') return json(res, 200, { peerId: n.libp2p.peerId.toString(), did: n.did, document: didDocument(n.did) })
+      if (req.method === 'GET' && url.pathname === '/api/did/resolve') {
+        // Accepts a DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network.
+        const q = String(url.searchParams.get('did') ?? url.searchParams.get('peer') ?? '')
+        return json(res, 200, resolveDid(q.startsWith('did:') ? q : toDid(q)).document)
+      }
+      if (req.method === 'GET' && url.pathname === '/api/credentials') return json(res, 200, { did: n.did, credentials: n.credentials.list(), revocations: n.store.listRevocations().length })
+      if (req.method === 'POST' && url.pathname === '/api/credentials/issue') {
+        const b = await body(req)
+        const ttl = b.ttlDays === undefined || b.ttlDays === null || b.ttlDays === '' ? undefined : Number(b.ttlDays) * DAY_MS
+        return json(res, 200, await n.credentials.issue(String(b.subject ?? ''), String(b.type ?? ''), b.claims, ttl === undefined ? {} : { ttlMs: ttl }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/credentials/verify') return json(res, 200, await n.credentials.verify((await body(req, 20 * 1024)).jwt))
+      if (req.method === 'POST' && url.pathname === '/api/credentials/import') return json(res, 200, { credential: await n.credentials.hold((await body(req, 20 * 1024)).jwt) })
+      if (req.method === 'POST' && url.pathname === '/api/credentials/delete') { const b = await body(req); return json(res, 200, { deleted: n.credentials.remove(String(b.id), b.role === 'issued' ? 'issued' : 'held') }) }
+      if (req.method === 'POST' && url.pathname === '/api/credentials/revoke') return json(res, 200, await n.credentials.revoke(String((await body(req)).id)))
+      if (req.method === 'POST' && url.pathname === '/api/credentials/revocations') return json(res, 200, await n.credentials.importRevocation((await body(req, 4096)).jwt))
+      if (req.method === 'POST' && url.pathname === '/api/presentations/create') {
+        const b = await body(req)
+        const ttl = b.ttlSeconds === undefined || b.ttlSeconds === null || b.ttlSeconds === '' ? undefined : Number(b.ttlSeconds) * 1000
+        return json(res, 200, await n.credentials.present(b.credentials as string[], String(b.nonce ?? ''), { ...(b.audience !== undefined ? { audience: String(b.audience) } : {}), ...(ttl === undefined ? {} : { ttlMs: ttl }) }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/presentations/verify') {
+        const b = await body(req, 100 * 1024)
+        return json(res, 200, await n.credentials.verifyPresentation(b.jwt, String(b.nonce ?? ''), b.audience === undefined ? undefined : String(b.audience)))
+      }
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
         const r = await n.messaging.send(peerIdFromString(String(b.peer)), String(b.body ?? ''))
@@ -197,6 +224,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
   const dht = (l.services as any).dht
   return {
     peerId: l.peerId.toString(),
+    did: n.did,
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
     gatewayPort: gatewayPort ?? null,

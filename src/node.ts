@@ -15,6 +15,7 @@ import type { Libp2p } from '@libp2p/interface'
 import { loadOrCreateIdentity } from './identity.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
+import { Credentials } from './credentials.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
@@ -58,6 +59,9 @@ export interface FrenetNode {
   calls: Calls
   groups: Groups
   operator: Operator
+  credentials: Credentials
+  /** did:key of this node's identity (same key as the peer ID). */
+  did: string
   iceServers: string[]
   startedAt: number
   stop: () => Promise<void>
@@ -136,6 +140,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const calls = new Calls(libp2p, privateKey)
   const groups = new Groups(libp2p, store, privateKey)
   const operator = new Operator(libp2p, store, banned)
+  const credentials = new Credentials(store, privateKey)
   messaging.on('dropped', (d) => operator.noteDrop('msg', d.reason))
   calls.on('dropped', (d) => operator.noteDrop('call', d.reason))
   groups.on('dropped', (d) => operator.noteDrop('group', d.reason))
@@ -167,6 +172,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     calls,
     groups,
     operator,
+    credentials,
+    did: credentials.did,
     iceServers,
     startedAt: Date.now(),
     stop: async () => {

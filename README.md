@@ -25,7 +25,10 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | working: relayed delivery tested on loopback; hole punching and UPnP depend on your NAT/router and are untested here |
 | Names + updates: `<name>.<publisher-key>`, signed by your identity key, higher `seq` replaces lower, so a site keeps its address when you republish | working, tested (publish on A, resolve + serve on B, update, forged/stale/tampered records rejected) |
 | Search: keyword search over names/titles/keywords that publishers announce on the DHT, every record signature-checked | working, tested; opt-in per site, unranked, spammable (see limits) |
-| QUIC, DIDs, Sybil resistance, human-memorable global names | **not built** (Phase 2+) |
+| DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID | working, tested (spec test vector) |
+| Verifiable credentials: issue/verify W3C VC-JWTs signed by your identity key, holder presentations bound to a verifier nonce, issuer-signed revocation | working, tested (tamper, alg-confusion, replay, wrong-holder cases); revocation is pull-only, no trust registry |
+| Account recovery: passphrase-encrypted key backup and k-of-n Shamir recovery shares, CLI only | working, tested end to end; recovers the *same* key, cannot help if the key is stolen (see SECURITY.md) |
+| QUIC, Sybil resistance, human-memorable global names, key rotation | **not built** |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -70,6 +73,26 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
 Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (no reputation / Sybil resistance yet); full-text search of page contents is not built; own names are re-announced every 6 h, but file and site blocks are not re-announced automatically yet, so keep the publishing node online; there is no name transfer or revocation (publish a new record pointing elsewhere).
+
+### Identity, credentials and recovery
+
+```bash
+frenet identity                              # peer ID + DID (did:key:z6Mk...)
+frenet backup --out ~/frenet.backup          # passphrase-encrypted key backup (node stopped)
+frenet recovery split -k 3 -n 5              # 5 shares, any 3 recover the key
+frenet restore ~/frenet.backup               # or: frenet recovery restore SHARE SHARE SHARE
+```
+
+Back the key up **now**: losing it loses the identity, and a stolen key cannot be revoked (see `SECURITY.md`).
+Credentials go through the local API; subjects are DIDs or peer IDs:
+
+```bash
+curl -s localhost:7777/api/credentials/issue -H 'content-type: application/json' \
+  -d '{"subject":"<did or peer id>","type":"Membership","claims":{"club":"frenet"},"ttlDays":365}'   # -> {id, jwt}
+# holder: POST /api/credentials/import {jwt}; present: POST /api/presentations/create {credentials:[id], nonce, audience}
+# verifier: POST /api/credentials/verify {jwt}  and  POST /api/presentations/verify {jwt, nonce, audience}
+# issuer revokes: POST /api/credentials/revoke {id} -> {jwt}; verifiers import it with POST /api/credentials/revocations {jwt}
+```
 
 Behind NAT (home router, CGNAT)? Point the node at a relay that has a public address:
 
