@@ -11,13 +11,15 @@ const { values } = parseArgs({
     listen: { type: 'string', multiple: true },
     bootstrap: { type: 'string', multiple: true },
     'api-port': { type: 'string', default: '7777' },
+    'quota-mb': { type: 'string', default: '1024' },
+    'replica-ttl-days': { type: 'string', default: '7' },
     'no-mdns': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false }
   }
 })
 
 if (values.help) {
-  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--no-mdns]
+  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--no-mdns]
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777`)
   process.exit(0)
 }
@@ -26,7 +28,9 @@ const node = await startFrenet({
   dataDir: values.data!,
   listen: values.listen,
   bootstrap: values.bootstrap,
-  mdns: !values['no-mdns']
+  mdns: !values['no-mdns'],
+  quotaBytes: Number(values['quota-mb']) * 1024 * 1024,
+  replicaTtlMs: Number(values['replica-ttl-days']) * 86_400_000
 })
 const api = await startApi(node, Number(values['api-port']))
 

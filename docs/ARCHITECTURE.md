@@ -16,10 +16,16 @@ web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts
 - Messages are not yet signed at the application layer, so they are not verifiable by third parties; they are authenticated only per hop (direct connection).
 
 ## Blocks `/frenet/block/1.0.0`
-`put(bytes)` -> sha256 raw CIDv1, stored in SQLite, announced via DHT `provide`. `get(cid)` -> local, else `findProviders`, request the CID, verify sha256 before caching, then re-announce (replication). Cap 1 MB/block. No encryption, retention policy, or chunking of large files yet.
+`put(bytes)` -> sha256 raw CIDv1, stored in SQLite, announced via DHT `provide`. `get(cid)` -> local, else `findProviders`, request the CID, verify sha256 before caching, then re-announce (replication). Cap 1 MB/block. Raw blocks are plaintext to anyone with the CID.
+
+## Files (`src/files.ts`)
+File -> 256 KB chunks -> each sealed with AES-256-GCM (random per-file key, random 96-bit nonce, AAD `c<index>`) -> blocks. Manifest `{name,size,chunks[]}` is sealed too (AAD `m`) and its CID is the file ID. Link: `frenet://<manifestCid>#<key>`; the key is never stored or sent by the node, so providers see ciphertext only. `{encrypt:false}` makes a public file. Max 16 MB. No key recovery: lose the link, lose the file.
+
+## Retention
+Own blocks are pinned (until deleted or per-file TTL). Replicas fetched from peers expire after `--replica-ttl-days`. Expired blocks are never served and are swept every 10 min and at startup. `--quota-mb` bounds local bytes; over-quota adds fail and roll back, over-quota replicas are served but not cached. Local delete removes manifest + unshared chunks and vacuums the DB; copies on other peers are outside our control.
 
 ## Local API (127.0.0.1)
-`GET /api/status|peers|messages|events(SSE)|blocks/<cid>`, `POST /api/send|dial|blocks` (base64 `data`). Foreign `Host` headers (DNS rebinding) and cross-origin POSTs are rejected; JSON content-type required; strict CSP on static files.
+`GET /api/status|peers|messages|events(SSE)|blocks/<cid>|files`, `POST /api/send|dial|blocks|files|files/get|files/delete` (base64 `data`). Foreign `Host` headers (DNS rebinding) and cross-origin POSTs are rejected; JSON content-type required; strict CSP on static files.
 
 ## Known limits
 - No NAT traversal or relays: peers must be directly reachable (LAN, public IP, or forwarded port). Firewalls are not modified.

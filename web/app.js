@@ -16,7 +16,7 @@ const ago = (ms) => { const s = Math.floor(ms / 1000); return s < 60 ? s + 's' :
 
 const SECTIONS = [
   ['overview', 'Network Overview'], ['peers', 'Connected Peers'], ['messages', 'Private Communications'],
-  ['storage', 'Distributed Storage', 'Phase 2'], ['browser', 'Decentralized Browser', 'Phase 3'],
+  ['storage', 'Distributed Storage'], ['browser', 'Decentralized Browser', 'Phase 3'],
   ['identity', 'Identity and Keys'], ['nodes', 'Network Nodes', 'Phase 3'],
   ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['governance', 'Community Governance', 'Phase 3']
 ]
@@ -38,7 +38,7 @@ function go (id) {
   const v = $('#view'); v.replaceChildren()
   const meta = SECTIONS.find((s) => s[0] === id)
   if (meta[2]) return v.append(el('div', { className: 'card' }, el('h3', {}, 'Not built yet'), el('p', { className: 'dim' }, `This section is planned for ${meta[2]}. Nothing here is simulated.`)))
-  ;({ overview, peers, messages, identity, privacy, security })[id](v)
+  ;({ overview, peers, messages, storage, identity, privacy, security })[id](v)
 }
 
 function stat (label, value) { return el('div', { className: 'stat' }, el('b', {}, String(value)), el('span', {}, label)) }
@@ -119,6 +119,59 @@ async function messages (v) {
   state.chat = await api('/api/messages'); render()
   state.onMessage = (m) => { state.chat.push(m); render() }
   state.stop = () => { state.onMessage = null }
+}
+
+const mb = (n) => (n / 1048576).toFixed(n < 1048576 ? 2 : 1) + ' MB'
+const b64 = (buf) => { let s = ''; const u = new Uint8Array(buf); for (let i = 0; i < u.length; i += 0x8000) s += String.fromCharCode(...u.subarray(i, i + 0x8000)); return btoa(s) }
+
+async function storage (v) {
+  const b = state.status.blocks
+  v.append(el('div', { className: 'grid' }, stat('Local blocks', b.count), stat('Used', mb(b.bytes) + ' of ' + mb(b.quotaBytes)), stat('Your files', state.status.files), stat('Replica lifetime', b.replicaTtlDays + ' days')))
+
+  const pick = el('input', { type: 'file', 'aria-label': 'File to add' })
+  const enc = el('input', { type: 'checkbox', checked: true, id: 'enc' })
+  const ttl = el('input', { type: 'number', min: 1, placeholder: 'keep for N days (blank = until deleted)', 'aria-label': 'Retention in days' })
+  const msg = el('p', { className: 'err' }); const out = el('div')
+  const add = el('button', { className: 'btn', type: 'button', onclick: async () => {
+    msg.textContent = ''; out.replaceChildren()
+    const f = pick.files[0]
+    if (!f) { msg.textContent = 'Choose a file first (max 16 MB).'; return }
+    if (f.size > 16 * 1048576) { msg.textContent = 'File is larger than 16 MB.'; return }
+    add.disabled = true; msg.textContent = 'Encrypting and publishing…'
+    try {
+      const r = await api('/api/files', { name: f.name, data: b64(await f.arrayBuffer()), encrypt: enc.checked, ttlDays: ttl.value ? Number(ttl.value) : undefined })
+      msg.textContent = ''
+      out.append(el('p', {}, r.announced ? 'Added. Peers can find it.' : 'Added locally. No peers announced it yet; connect to peers and add it again to share.'),
+        el('div', { className: 'mono' }, r.link), el('p', { className: 'dim' }, r.key ? 'Anyone with this full link can read the file. The key is not stored on this node. Keep the link.' : 'Public file: anyone with the link can read it.'))
+      await refresh(); go('storage')
+    } catch (e) { msg.textContent = e.message } finally { add.disabled = false }
+  } }, 'Add file')
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Add a file'), el('div', { className: 'row' }, pick), el('label', { className: 'row' }, enc, 'Encrypt (recommended)'), el('div', { className: 'row' }, ttl, add), msg, out))
+
+  const link = el('input', { placeholder: 'frenet://bafk…#key', 'aria-label': 'File link' })
+  const dmsg = el('p', { className: 'err' })
+  const get = el('button', { className: 'btn', type: 'button', onclick: async () => {
+    dmsg.textContent = ''
+    try {
+      const [cid, key] = link.value.trim().replace(/^frenet:\/\//, '').split('#')
+      dmsg.textContent = 'Fetching from peers…'
+      const r = await api('/api/files/get', { cid, key })
+      const bytes = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0))
+      const a = el('a', { href: URL.createObjectURL(new Blob([bytes])), download: r.name }); document.body.append(a); a.click(); a.remove()
+      dmsg.textContent = `Downloaded ${r.name} (${mb(r.size)}).`
+    } catch (e) { dmsg.textContent = e.message }
+  } }, 'Download from network')
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Download a file'), el('div', { className: 'row' }, link, get), dmsg))
+
+  const files = await api('/api/files')
+  const t = el('table', {}, el('thead', {}, el('tr', {}, ...['Name', 'Size', 'Chunks', 'Encrypted', 'Retention', ''].map((h) => el('th', {}, h)))))
+  const tb = el('tbody'); t.append(tb)
+  for (const f of files) {
+    tb.append(el('tr', {}, el('td', {}, f.name), el('td', {}, mb(f.size)), el('td', {}, String(f.chunks.length)), el('td', {}, f.encrypted ? 'yes' : 'no (public)'),
+      el('td', {}, f.expires ? 'until ' + new Date(f.expires).toLocaleDateString() : 'until deleted'),
+      el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/files/delete', { cid: f.cid }); await refresh(); go('storage') } }, 'Delete local copy'))))
+  }
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Files you added'), files.length ? t : el('p', { className: 'dim' }, 'No files yet. Other peers may still hold copies of anything you shared.')))
 }
 
 function identity (v) {

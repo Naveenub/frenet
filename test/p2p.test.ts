@@ -141,3 +141,76 @@ describe('content-addressed blocks via DHT provider records', () => {
     assert.notEqual(cidFor(Buffer.from('a')).toString(), cidFor(Buffer.from('b')).toString())
   })
 })
+
+describe('encrypted, chunked files + retention', () => {
+  const trio = async (extra: Partial<Parameters<typeof startFrenet>[0]> = {}) => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false })
+    const b = await track({ dataDir: ':memory:', listen: L, mdns: false, ...extra })
+    const c = await track({ dataDir: ':memory:', listen: L, mdns: false, ...extra })
+    await a.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    await c.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    await new Promise((r) => setTimeout(r, 1500))
+    return { a, b, c }
+  }
+
+  it('multi-chunk file: providers hold only ciphertext; key holder decrypts; wrong/no key fails', async () => {
+    const { a, c } = await trio()
+    a.files.chunkBytes = 1000
+    const secret = Buffer.from('SECRET-PLAINTEXT-'.repeat(400)) // 6800 bytes -> 7 chunks
+    const f = await a.files.add('notes.txt', secret)
+    assert.equal(f.chunks, 7)
+    assert.ok(f.key && f.link.startsWith('frenet://') && f.link.endsWith('#' + f.key))
+    assert.ok(f.announced)
+
+    const row = a.store.getFile(f.cid)!
+    for (const cid of [f.cid, ...row.chunks]) {
+      assert.ok(!Buffer.from(a.store.getBlock(cid)!).includes('SECRET-PLAINTEXT'), 'block must be ciphertext')
+    }
+    const got = await c.files.get(f.cid, f.key)
+    assert.equal(got.name, 'notes.txt')
+    assert.deepEqual(got.data, secret)
+    assert.equal(c.store.blockStats().count, 8) // replicated manifest + 7 chunks
+
+    await assert.rejects(c.files.get(f.cid, Buffer.alloc(32, 1).toString('base64url')), /wrong key/)
+    await assert.rejects(c.files.get(f.cid), /key is required|encrypted/)
+  })
+
+  it('public (unencrypted) files are readable without a key', async () => {
+    const { a, c } = await trio()
+    const data = Buffer.from('public data ' + Math.random())
+    const f = await a.files.add('p.txt', data, { encrypt: false })
+    assert.equal(f.key, null)
+    assert.deepEqual((await c.files.get(f.cid)).data, data)
+  })
+
+  it('retention: replicas expire, pinned blocks stay, expired blocks are unreadable and swept', async () => {
+    const { a, c } = await trio({ replicaTtlMs: 50 })
+    const { cid } = await a.blocks.put(Buffer.from('keep me ' + Math.random()))
+    assert.ok(await c.blocks.get(cid))
+    assert.equal(c.store.blockStats().count, 1)
+    await new Promise((r) => setTimeout(r, 120))
+    assert.equal(c.store.getBlock(cid), null)          // expired = not served
+    assert.equal(c.store.sweep(), 1)                   // sweeper removes it
+    assert.equal(c.store.blockStats().count, 0)
+    assert.ok(a.store.getBlock(cid))                   // origin copy is pinned
+    assert.equal(a.store.sweep(), 0)
+  })
+
+  it('quota is enforced and partial file writes roll back', async () => {
+    const n = await track({ dataDir: ':memory:', listen: L, mdns: false, quotaBytes: 500 })
+    n.files.chunkBytes = 100
+    await assert.rejects(n.files.add('big', Buffer.alloc(900, 7)), /quota/)
+    assert.equal(n.store.blockStats().count, 0)
+    assert.equal(n.files.list().length, 0)
+  })
+
+  it('local delete removes manifest + chunks and the file record', async () => {
+    const n = await track({ dataDir: ':memory:', listen: L, mdns: false })
+    n.files.chunkBytes = 100
+    const f = await n.files.add('x', Buffer.alloc(350, 1))
+    assert.ok(n.store.blockStats().count >= 5)
+    assert.ok(n.files.remove(f.cid))
+    assert.equal(n.store.blockStats().count, 0)
+    assert.equal(n.files.list().length, 0)
+  })
+})

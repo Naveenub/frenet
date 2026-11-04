@@ -10,7 +10,10 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | TCP + Noise (forward-secret) + yamux via libp2p | working |
 | Peer discovery: mDNS (LAN) + bootstrap list + manual dial | working (mDNS untested across hosts) |
 | Kademlia DHT (`/frenet/kad/1.0.0`) provider records | working, tested (3 nodes, A<->B<->C) |
-| Content-addressed blocks (sha256 CIDs, <=1 MB, hash-verified fetch, replicate-on-fetch) | working; **unencrypted, CID holders can read; client-side encryption not yet** |
+| Content-addressed blocks (sha256 CIDs, <=1 MB, hash-verified fetch, replicate-on-fetch) | working; raw blocks are readable by CID holders |
+| Files: 256 KB chunks, AES-256-GCM client-side encryption, encrypted manifest, key only in the share link | working, tested (<= 16 MB/file) |
+| Retention: per-file TTL, replicas expire (default 7 d), byte quota (default 1 GiB), sweeper, local delete | working, tested |
+| Dashboard: Distributed Storage (add, share link, download, delete) | working |
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
@@ -35,7 +38,7 @@ npm start -- --data /tmp/b --listen /ip4/127.0.0.1/tcp/4102 --api-port 7802 --no
 # in A's dashboard: Connected Peers -> paste B's address (printed at startup)
 ```
 
-Flags: `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--no-mdns`.
+Flags: `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
 
 ## Test
 

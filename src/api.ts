@@ -5,6 +5,7 @@ import { dirname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
+import { DAY_MS } from './blocks.js'
 import type { FrenetNode } from './node.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -58,13 +59,28 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1'): Prom
       }
       if (req.method === 'POST' && url.pathname === '/api/blocks') {
         const b = await body(req)
-        const r = await n.blocks.put(Buffer.from(String(b.data ?? ''), 'base64'))
-        return json(res, 200, r)
+        const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
+        return json(res, 200, await n.blocks.put(Buffer.from(String(b.data ?? ''), 'base64'), ttl))
       }
       if (req.method === 'GET' && url.pathname.startsWith('/api/blocks/')) {
         const data = await n.blocks.get(decodeURIComponent(url.pathname.slice('/api/blocks/'.length)))
         if (!data) return json(res, 404, { error: 'no provider returned this block' })
         return json(res, 200, { data: Buffer.from(data).toString('base64') })
+      }
+      if (req.method === 'GET' && url.pathname === '/api/files') return json(res, 200, n.files.list())
+      if (req.method === 'POST' && url.pathname === '/api/files') {
+        const b = await body(req, 24 * 1024 * 1024)
+        const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
+        return json(res, 200, await n.files.add(String(b.name ?? 'file').slice(0, 255), Buffer.from(String(b.data ?? ''), 'base64'), { encrypt: b.encrypt !== false, ttlMs: ttl }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/files/get') {
+        const b = await body(req)
+        const f = await n.files.get(String(b.cid), b.key ? String(b.key) : null)
+        return json(res, 200, { name: f.name, size: f.data.length, data: f.data.toString('base64') })
+      }
+      if (req.method === 'POST' && url.pathname === '/api/files/delete') {
+        const b = await body(req)
+        return json(res, 200, { deleted: n.files.remove(String(b.cid)) })
       }
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
@@ -115,12 +131,12 @@ function json (res: ServerResponse, code: number, data: unknown): void {
   res.end(JSON.stringify(data))
 }
 
-async function body (req: IncomingMessage): Promise<Record<string, unknown>> {
+async function body (req: IncomingMessage, max = 64 * 1024): Promise<Record<string, unknown>> {
   let size = 0
   const chunks: Buffer[] = []
   for await (const c of req) {
     size += (c as Buffer).length
-    if (size > 64 * 1024) throw new Error('body too large')
+    if (size > max) throw new Error('body too large')
     chunks.push(c as Buffer)
   }
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
@@ -136,7 +152,8 @@ async function status (n: FrenetNode): Promise<unknown> {
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),
-    blocks: n.store.blockStats(),
+    blocks: { ...n.store.blockStats(), quotaBytes: n.blocks.retention.quotaBytes, replicaTtlDays: n.blocks.retention.replicaTtlMs / DAY_MS },
+    files: n.files.list().length,
     privacy: {
       transportEncryption: 'Noise XX (ChaCha20-Poly1305), forward secret',
       identity: 'Ed25519, key stored locally only',

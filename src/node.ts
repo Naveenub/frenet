@@ -10,6 +10,7 @@ import { createLibp2p } from 'libp2p'
 import type { Libp2p } from '@libp2p/interface'
 import { loadOrCreateIdentity } from './identity.js'
 import { Blocks } from './blocks.js'
+import { FileStore } from './files.js'
 import { Messaging } from './messaging.js'
 import { Store } from './store.js'
 
@@ -18,6 +19,8 @@ export interface FrenetOptions {
   listen?: string[]
   bootstrap?: string[]
   mdns?: boolean
+  quotaBytes?: number
+  replicaTtlMs?: number
   /** Only meaningful with dataDir ':memory:' (tests). */
   ephemeralIdentity?: boolean
 }
@@ -27,6 +30,7 @@ export interface FrenetNode {
   store: Store
   messaging: Messaging
   blocks: Blocks
+  files: FileStore
   startedAt: number
   stop: () => Promise<void>
 }
@@ -64,7 +68,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
 
   const store = new Store(opts.dataDir)
   const messaging = new Messaging(libp2p, store)
-  const blocks = new Blocks(libp2p, store)
+  const blocks = new Blocks(libp2p, store, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
+  const files = new FileStore(blocks, store)
+  store.sweep()
+  const sweeper = setInterval(() => store.sweep(), 10 * 60 * 1000)
+  sweeper.unref()
   await messaging.start()
   await blocks.start()
   await libp2p.start()
@@ -81,8 +89,10 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     store,
     messaging,
     blocks,
+    files,
     startedAt: Date.now(),
     stop: async () => {
+      clearInterval(sweeper)
       await messaging.stop()
       await blocks.stop()
       await libp2p.stop()

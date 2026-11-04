@@ -9,6 +9,8 @@ export interface StoredMessage {
   body: string
 }
 
+export interface FileRow { cid: string, name: string, size: number, chunks: string[], encrypted: boolean, created: number, expires: number | null }
+
 /** Local-first message store (SQLite). Nothing here is ever uploaded. */
 export class Store {
   private db: DatabaseSync
@@ -26,8 +28,10 @@ export class Store {
         PRIMARY KEY (id, direction)
       );
       CREATE INDEX IF NOT EXISTS messages_peer_ts ON messages (peer, ts);
-      CREATE TABLE IF NOT EXISTS blocks (cid TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS blocks (cid TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL, expires INTEGER);
+      CREATE TABLE IF NOT EXISTS files (cid TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, chunks TEXT NOT NULL, encrypted INTEGER NOT NULL, created INTEGER NOT NULL, expires INTEGER);
     `)
+    try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
   }
 
   add (m: StoredMessage): boolean {
@@ -50,12 +54,16 @@ export class Store {
     return out
   }
 
-  putBlock (cid: string, data: Uint8Array): void {
-    this.db.prepare('INSERT OR IGNORE INTO blocks (cid, data, ts) VALUES (?, ?, ?)').run(cid, data, Date.now())
+  /** expires = null pins the block (kept until deleted). A pin is never downgraded to an expiring copy. */
+  putBlock (cid: string, data: Uint8Array, expires: number | null = null): void {
+    this.db.prepare(`INSERT INTO blocks (cid, data, ts, expires) VALUES (?, ?, ?, ?)
+      ON CONFLICT(cid) DO UPDATE SET expires = CASE
+        WHEN excluded.expires IS NULL OR blocks.expires IS NULL THEN NULL
+        ELSE MAX(blocks.expires, excluded.expires) END`).run(cid, data, Date.now(), expires)
   }
 
   getBlock (cid: string): Uint8Array | null {
-    const r = this.db.prepare('SELECT data FROM blocks WHERE cid = ?').get(cid) as { data: Uint8Array } | undefined
+    const r = this.db.prepare('SELECT data FROM blocks WHERE cid = ? AND (expires IS NULL OR expires > ?)').get(cid, Date.now()) as { data: Uint8Array } | undefined
     return r ? new Uint8Array(r.data) : null
   }
 
@@ -64,9 +72,34 @@ export class Store {
     return { count: Number(r.n), bytes: Number(r.b) }
   }
 
-  deleteBlock (cid: string): void {
+  deleteBlock (cid: string, compact = true): void {
     this.db.prepare('DELETE FROM blocks WHERE cid = ?').run(cid)
-    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
+    if (compact) this.compact()
+  }
+
+  /** Retention sweeper: remove expired blocks and expired file records. Returns blocks removed. */
+  sweep (now = Date.now()): number {
+    const r = this.db.prepare('DELETE FROM blocks WHERE expires IS NOT NULL AND expires <= ?').run(now)
+    this.db.prepare('DELETE FROM files WHERE expires IS NOT NULL AND expires <= ?').run(now)
+    if (Number(r.changes) > 0) this.compact()
+    return Number(r.changes)
+  }
+
+  compact (): void { this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;') }
+
+  addFile (f: FileRow): void {
+    this.db.prepare('INSERT OR REPLACE INTO files (cid, name, size, chunks, encrypted, created, expires) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(f.cid, f.name, f.size, JSON.stringify(f.chunks), f.encrypted ? 1 : 0, f.created, f.expires)
+  }
+
+  private row (r: any): FileRow { return { cid: r.cid, name: r.name, size: Number(r.size), chunks: JSON.parse(r.chunks), encrypted: !!r.encrypted, created: Number(r.created), expires: r.expires == null ? null : Number(r.expires) } }
+  listFiles (): FileRow[] { return (this.db.prepare('SELECT * FROM files ORDER BY created DESC').all() as any[]).map((r) => this.row(r)) }
+  getFile (cid: string): FileRow | null { const r = this.db.prepare('SELECT * FROM files WHERE cid = ?').get(cid); return r ? this.row(r) : null }
+  deleteFileRow (cid: string): void { this.db.prepare('DELETE FROM files WHERE cid = ?').run(cid) }
+  referencedChunks (): Set<string> {
+    const out = new Set<string>()
+    for (const f of this.listFiles()) { out.add(f.cid); for (const c of f.chunks) out.add(c) }
+    return out
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */
