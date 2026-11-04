@@ -48,6 +48,13 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
+## Scope: deliberately not built
+
+These are **not in the spec's feature list**, so their absence is not a gap or a to-do:
+
+- **General web browsing.** The Decentralized Browser section is only the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`). It does not browse the public web, so there is no HTTPS browsing, no tracker blocking and no permission manager. (Published sites are already locked down by a no-third-party CSP and a deny-all `Permissions-Policy`; that is site hardening, not a browser feature.)
+- **Encrypted group messaging.** Community chat is signed by its author and travels over the Noise-encrypted link to each member, but there is no group key and no end-to-end encryption beyond that link. Stored events stay signed and plaintext on each member's device.
+
 ## Run
 
 ```bash
