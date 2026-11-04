@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { DAY_MS } from './blocks.js'
+import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
@@ -151,6 +152,8 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         return json(res, 200, { ok: true })
       }
       if (req.method === 'GET' && url.pathname === '/api/operator') return json(res, 200, n.operator.snapshot())
+      if (req.method === 'GET' && url.pathname === '/api/reputation') return json(res, 200, { threshold: n.reputation.opts.banThreshold, blocked: n.reputation.blockedCount(), peers: n.reputation.list(200), clusters: n.sybil.clusters() })
+      if (req.method === 'POST' && url.pathname === '/api/reputation/reset') { const b = await body(req); if (!isPeerId(b.peer)) return json(res, 400, { error: 'invalid peer ID' }); return json(res, 200, { removed: n.reputation.reset(b.peer) }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/ban') { const b = await body(req); await n.operator.ban(b.peer, b.reason); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/unban') return json(res, 200, { removed: n.operator.unban((await body(req)).peer) })
       if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }

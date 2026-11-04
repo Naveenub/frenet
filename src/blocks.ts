@@ -4,6 +4,7 @@ import { CID } from 'multiformats/cid'
 import * as raw from 'multiformats/codecs/raw'
 import { create as createDigest } from 'multiformats/hashes/digest'
 import { RateLimiter } from './messaging.js'
+import type { ReputationEvent } from './reputation.js'
 import type { Store } from './store.js'
 
 export const BLOCK_PROTOCOL = '/frenet/block/1.0.0'
@@ -38,6 +39,8 @@ function verify (cid: CID, data: Uint8Array): boolean {
 export class Blocks {
   private limiter = new RateLimiter(60, 10)
   readonly retention: RetentionOptions
+  /** Set by the node: told which provider served a verified or a corrupt block. */
+  report: (peer: string, event: ReputationEvent, detail?: string) => void = () => {}
 
   constructor (private node: Libp2p, private store: Store, retention: Partial<RetentionOptions> = {}) {
     this.retention = { ...DEFAULT_RETENTION, ...retention }
@@ -111,9 +114,11 @@ export class Blocks {
           await stream.close()
           const chunks: Uint8Array[] = []
           let n = 0
-          for await (const c of stream) { n += c.byteLength; if (n > MAX_BLOCK_BYTES) throw new Error('oversize'); chunks.push(c.subarray()) }
+          for await (const c of stream) { n += c.byteLength; if (n > MAX_BLOCK_BYTES) { this.report(prov.id.toString(), 'oversize', 'block response'); throw new Error('oversize') }; chunks.push(c.subarray()) }
           const data = Buffer.concat(chunks)
+          if (data.length && !verify(cid, data)) this.report(prov.id.toString(), 'bad-block', 'data does not match CID')
           if (data.length && verify(cid, data)) {
+            this.report(prov.id.toString(), 'valid-block')
             if (this.room(data.length)) {
               this.store.putBlock(cid.toString(), data, Date.now() + this.retention.replicaTtlMs)
               void this.announce(cid) // replicate: become a provider while the replica lives

@@ -4,6 +4,7 @@ import { base32 } from 'multiformats/bases/base32'
 import { CID } from 'multiformats/cid'
 import { cidFor, type Blocks } from './blocks.js'
 import { RateLimiter } from './messaging.js'
+import type { ReputationEvent } from './reputation.js'
 import { validCid } from './sites.js'
 import type { Store } from './store.js'
 
@@ -117,6 +118,8 @@ export class Names {
   private cache = new Map<string, { rec: NameRecord, at: number }>()
   private timer: NodeJS.Timeout | null = null
   readonly publisherKey: string
+  /** Set by the node: told which provider served a valid or a forged record. */
+  report: (peer: string, event: ReputationEvent, detail?: string) => void = () => {}
 
   constructor (private node: Libp2p, private store: Store, private blocks: Blocks, private key: PrivateKey) {
     this.publisherKey = pubToB32(key.publicKey.raw)
@@ -202,6 +205,7 @@ export class Names {
         if (++asked > PROVIDERS_PER_LOOKUP) break
         const raw = await this.ask(prov, { k: 'name', name, pub }, signal)
         const rec = await this.accept(raw)
+        if (raw !== null && raw !== undefined) this.report(prov.id.toString(), rec && rec.name === name && rec.pub === pub ? 'valid-record' : 'bad-record', 'name lookup')
         if (rec && rec.name === name && rec.pub === pub && (!best || rec.seq > best.seq)) best = rec
       }
     } catch { /* no providers / timeout: use what we have */ }
@@ -254,6 +258,7 @@ export class Names {
             if (!Array.isArray(list)) continue
             for (const x of list.slice(0, KW_RESULTS)) {
               const rec = await validateRecord(x)
+              this.report(prov.id.toString(), rec?.keywords.includes(w) ? 'valid-record' : 'bad-record', 'keyword search')
               if (rec?.keywords.includes(w)) this.store.putName(rec, false)
             }
           }

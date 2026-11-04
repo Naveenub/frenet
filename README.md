@@ -28,7 +28,12 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID | working, tested (spec test vector) |
 | Verifiable credentials: issue/verify W3C VC-JWTs signed by your identity key, holder presentations bound to a verifier nonce, issuer-signed revocation | working, tested (tamper, alg-confusion, replay, wrong-holder cases); revocation is pull-only, no trust registry |
 | Account recovery: passphrase-encrypted key backup and k-of-n Shamir recovery shares, CLI only | working, tested end to end; recovers the *same* key, cannot help if the key is stolen (see SECURITY.md) |
-| QUIC, Sybil resistance, human-memorable global names, key rotation | **not built** |
+| QUIC transport (`/udp/…/quic-v1`) next to TCP, on by default (`--no-quic` to disable); ban list and all other gating apply to it | working, tested on loopback (connect, messaging, ban); behaviour behind real NATs/firewalls untested; depends on the third-party native module `@chainsafe/libp2p-quic` |
+| Sybil resistance: optional identity proof-of-work (`--min-identity-bits N`, `frenet identity mine`), per-subnet peer limits, cluster flagging | working, tested; **raises the cost of fake identities, does not prevent them** (see ARCHITECTURE.md) |
+| Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
+| Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
+| Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
+| Human-memorable global names, key rotation | **not built** |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -72,7 +77,7 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 - **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
-Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (no reputation / Sybil resistance yet); full-text search of page contents is not built; own names are re-announced every 6 h, but file and site blocks are not re-announced automatically yet, so keep the publishing node online; there is no name transfer or revocation (publish a new record pointing elsewhere).
+Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h, but file and site blocks are not re-announced automatically yet, so keep the publishing node online; there is no name transfer or revocation (publish a new record pointing elsewhere).
 
 ### Identity, credentials and recovery
 

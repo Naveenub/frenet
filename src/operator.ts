@@ -2,7 +2,9 @@ import { cpus, loadavg } from 'node:os'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p } from '@libp2p/interface'
 import { isPeerId } from './channel.js'
+import type { Reputation } from './reputation.js'
 import type { Store } from './store.js'
+import type { SybilGuard } from './sybil.js'
 
 const MAX_DROP_KEYS = 100
 
@@ -13,7 +15,7 @@ const MAX_DROP_KEYS = 100
 export class Operator {
   private drops = new Map<string, number>()
 
-  constructor (private node: Libp2p, private store: Store, readonly banned: Set<string>) {
+  constructor (private node: Libp2p, private store: Store, readonly banned: Set<string>, private extras: { reputation?: Reputation, sybil?: SybilGuard, minIdentityBits?: number } = {}) {
     for (const b of store.listBans()) banned.add(b.peer)
   }
 
@@ -59,6 +61,8 @@ export class Operator {
         relayed: conns.filter((c) => c.remoteAddr.toString().includes('/p2p-circuit')).length
       },
       bans: this.store.listBans(),
+      reputation: this.extras.reputation ? { blocked: this.extras.reputation.blockedCount(), peers: this.extras.reputation.list(50).filter((r) => r.score !== 0 || r.blockedUntil), threshold: this.extras.reputation.opts.banThreshold } : null,
+      sybil: this.extras.sybil ? { minIdentityBits: this.extras.minIdentityBits ?? 0, maxPerSubnet: this.extras.sybil.opts.maxPerSubnet, clusters: this.extras.sybil.clusters() } : null,
       drops: Object.fromEntries(this.drops)
     }
   }

@@ -1,6 +1,7 @@
 # Security
 - Crypto: Noise (XX), Ed25519 and AES-256-GCM via libp2p / `@libp2p/crypto` / Node `crypto`; scrypt for backup passphrases; Shamir secret sharing over GF(2^8) for recovery shares (a textbook construction, ~60 lines in `src/recovery.ts`, covered by tests, **not independently reviewed**). No custom ciphers or signature schemes.
 - Private keys never leave `<data>/identity.key` (0600) except through the explicit recovery commands below. The HTTP API never returns key material.
+- **No independent security audit has been done.** `docs/AUDIT.md` lists scope, threat model and open questions for whoever is commissioned to do one.
 - This is unaudited pre-release software. Do not rely on it for high-risk use.
 - Report vulnerabilities privately to the maintainers before disclosure.
 
@@ -24,3 +25,9 @@ frenet restore ~/frenet.backup                # or: frenet recovery restore SHAR
 - Running split/restore with a node live on the same data directory is unsupported.
 
 **Credentials.** VC-JWTs are verified offline against the issuer's DID, with `alg` pinned to EdDSA. Expiry and issuer-signed revocation statements are honoured, but revocation is pull-only: a verifier only knows about revocations it has imported, and there is no revocation distribution network yet. A credential proves what the issuer signed, not that the issuer is trustworthy; deciding which DIDs to trust is the verifier's job. Presentations are only replay-safe if the verifier supplies a fresh nonce per request.
+
+## Abuse, Sybil and update security (Phase 4)
+- **Fake identities.** Anyone can create unlimited peer IDs. `--min-identity-bits`, the per-subnet limit and local reputation raise the cost and visibility of that; they do not stop a well-funded attacker (cloud IPs across many ranges, or a botnet). Treat the network as untrusted regardless: every message, block, name record and credential is verified end to end and none of that depends on reputation.
+- **Reputation is a local heuristic.** It only reacts to misbehaviour this node verified, and an attacker can cause *you* to block a peer only by making it misbehave toward you, because nothing is taken on hearsay.
+- **Updates.** Verify releases with `frenet update verify --artifact FILE`, with trust roots you obtained out of band (project website over HTTPS *and* a second channel, compare the key fingerprints). Do not accept roots from the same place as the download. Until the maintainers publish release keys, there is nothing to verify against and unsigned builds must be built from source you reviewed.
+- **QUIC** is third-party native code (`@chainsafe/libp2p-quic`); disable with `--no-quic` if you do not want it.

@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import type { NameRecord } from './names.js'
+import type { PeerReputation } from './reputation.js'
 
 export interface StoredMessage {
   id: string
@@ -47,6 +48,8 @@ export class Store {
       CREATE TABLE IF NOT EXISTS group_events (community TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, author TEXT NOT NULL, ts INTEGER NOT NULL, body TEXT NOT NULL, sig TEXT NOT NULL, meta TEXT, PRIMARY KEY (community, id));
       CREATE INDEX IF NOT EXISTS group_events_ts ON group_events (community, kind, ts);
       CREATE TABLE IF NOT EXISTS credentials (id TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('issued','held')), issuer TEXT NOT NULL, subject TEXT NOT NULL, type TEXT NOT NULL, issued INTEGER NOT NULL, expires INTEGER, jwt TEXT NOT NULL, PRIMARY KEY (id, role));
+      CREATE TABLE IF NOT EXISTS reputation (peer TEXT PRIMARY KEY, score REAL NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL, strikes INTEGER NOT NULL, blocked_until INTEGER, last_reason TEXT NOT NULL, updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL, ts INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
@@ -192,6 +195,25 @@ export class Store {
   isRevoked (issuer: string, id: string): boolean { return !!this.db.prepare('SELECT 1 FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) }
   listRevocations (): Array<{ issuer: string, id: string, ts: number, jwt: string }> {
     return (this.db.prepare('SELECT * FROM revocations ORDER BY ts DESC').all() as any[]).map((r) => ({ issuer: r.issuer, id: r.id, ts: Number(r.ts), jwt: r.jwt }))
+  }
+
+  putReputation (r: PeerReputation): void {
+    this.db.prepare('INSERT OR REPLACE INTO reputation (peer, score, good, bad, strikes, blocked_until, last_reason, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.peer, r.score, r.good, r.bad, r.strikes, r.blockedUntil, r.lastReason, r.updated)
+  }
+  deleteReputation (peer: string): void { this.db.prepare('DELETE FROM reputation WHERE peer = ?').run(peer) }
+  listReputation (): PeerReputation[] {
+    return (this.db.prepare('SELECT * FROM reputation').all() as any[]).map((r) => ({ peer: r.peer, score: Number(r.score), good: Number(r.good), bad: Number(r.bad), strikes: Number(r.strikes), blockedUntil: r.blocked_until == null ? null : Number(r.blocked_until), lastReason: r.last_reason, updated: Number(r.updated) }))
+  }
+
+  /** Highest update manifest sequence accepted per channel (rollback protection). */
+  getUpdateState (channel: string): { seq: number, version: string, ts: number } | null {
+    const r = this.db.prepare('SELECT * FROM update_state WHERE channel = ?').get(channel) as any
+    return r ? { seq: Number(r.seq), version: r.version, ts: Number(r.ts) } : null
+  }
+  putUpdateState (channel: string, seq: number, version: string): void {
+    this.db.prepare('INSERT INTO update_state (channel, seq, version, ts) VALUES (?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET seq = excluded.seq, version = excluded.version, ts = excluded.ts WHERE excluded.seq > update_state.seq')
+      .run(channel, seq, version, Date.now())
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */

@@ -2,6 +2,8 @@ import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'no
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
+import { mineIdentity, identityWorkBits } from './sybil.js'
+import { privateKeyFromProtobuf, privateKeyToProtobuf } from '@libp2p/crypto/keys'
 import { combineShares, createBackup, describeKey, installKey, MAX_SHARES, MIN_PASSPHRASE, openBackup, readKeyFile, splitSecret } from './recovery.js'
 
 /**
@@ -11,6 +13,7 @@ import { combineShares, createBackup, describeKey, installKey, MAX_SHARES, MIN_P
 export const IDENTITY_COMMANDS = ['identity', 'backup', 'restore', 'recovery']
 
 const USAGE = `frenet identity [--data DIR]                         show peer ID and DID
+frenet identity mine --bits N [--data DIR] [--force]               grind a NEW key with N bits of work (Sybil cost); replaces nothing without --force
 frenet backup --out FILE [--data DIR] [--passphrase-file F]       write a passphrase-encrypted backup of the key
 frenet restore FILE [--data DIR] [--passphrase-file F] [--force]   restore the key from a backup
 frenet recovery split -k K -n N [--data DIR]                      split the key into N shares, any K recover it
@@ -59,6 +62,7 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
       force: { type: 'boolean', default: false },
       k: { type: 'string', short: 'k' },
       n: { type: 'string', short: 'n' },
+      bits: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false }
     }
   })
@@ -66,9 +70,23 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
   try {
     if (values.help) { console.log(USAGE); return 0 }
 
+    if (cmd === 'identity' && positionals[0] === 'mine') {
+      const bits = Number(values.bits)
+      if (!Number.isInteger(bits)) throw new Error('usage: frenet identity mine --bits N')
+      const t0 = Date.now()
+      const m = await mineIdentity(bits, { onProgress: (n) => process.stderr.write(`\r${n} keys tried...`) })
+      const r = installKey(data, privateKeyToProtobuf(m.key), { force: values.force })
+      process.stderr.write('\n')
+      console.log(`found a key with ${m.bits} bits of work after ${m.tries} tries (${Math.round((Date.now() - t0) / 1000)}s)`)
+      console.log(`Identity installed in ${data}: ${r.peerId}\nDID ${r.did}`)
+      if (r.replaced) console.log(`Previous key kept at ${r.replaced}`)
+      console.log('This is a NEW identity: different peer ID, DID and names. Tell your contacts out of band.')
+      return 0
+    }
+
     if (cmd === 'identity') {
       const i = describeKey(readKeyFile(data))
-      console.log(`peer ID ${i.peerId}\nDID     ${i.did}`)
+      console.log(`peer ID ${i.peerId}\nDID     ${i.did}\nwork    ${identityWorkBits(Buffer.from(readKeyPublicRaw(data)))} bits`)
       return 0
     }
 
@@ -129,4 +147,8 @@ function report (r: { peerId: string, did: string, replaced: string | null, unch
   console.log(`DID ${r.did}`)
   if (r.replaced) console.log(`Previous key kept at ${r.replaced}`)
   console.log('Start the node: names and other data signed by this key work again. Messages, blocks and credentials stored in the old data directory are not part of the key and are not restored.')
+}
+
+function readKeyPublicRaw (dataDir: string): Uint8Array {
+  return privateKeyFromProtobuf(readKeyFile(dataDir)).publicKey.raw
 }
