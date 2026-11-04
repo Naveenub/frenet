@@ -19,7 +19,7 @@ export function validSitePath (p: unknown): p is string {
   return p.split('/').every((s) => SEGMENT_RE.test(s) && s !== '.' && s !== '..')
 }
 
-function validCid (c: unknown): c is string {
+export function validCid (c: unknown): c is string {
   if (typeof c !== 'string' || c.length > 100) return false
   try { return CID.parse(c).toString() === c } catch { return false }
 }

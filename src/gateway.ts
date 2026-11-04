@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { CID } from 'multiformats/cid'
+import { NameNotFound, NAME_RE, validPub } from './names.js'
 import type { FrenetNode } from './node.js'
 
 /** Only types we are willing to render. Anything else is downloaded, never interpreted. */
@@ -24,6 +25,12 @@ export function siteFromHost (host: string | undefined): string | null {
   try { return CID.parse(m[1]).toString() === m[1] ? m[1] : null } catch { return null }
 }
 
+/** `<name>.<publisher-key>.localhost` — a mutable name; its own browser origin, independent of which site version it points at. */
+export function nameFromHost (host: string | undefined): { name: string, pub: string } | null {
+  const m = /^([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)\.([a-z2-7]{52})\.localhost(?::\d+)?$/.exec(host ?? '')
+  return m && NAME_RE.test(m[1]) && validPub(m[2]) ? { name: m[1], pub: m[2] } : null
+}
+
 /**
  * Block drive-by loads: a web page the user visits must not be able to make this node fetch
  * arbitrary CIDs via <img>/<iframe>/fetch. Browsers always send Sec-Fetch-*; plain clients (curl) send none.
@@ -42,13 +49,20 @@ function text (res: ServerResponse, code: number, msg: string): void {
 export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): Promise<{ server: Server, port: number }> {
   const server = createServer(async (req, res) => {
     try {
-      const siteCid = siteFromHost(req.headers.host)
-      if (!siteCid) return text(res, 404, 'Open a site at http://<site-id>.localhost:' + port + '/')
+      let siteCid = siteFromHost(req.headers.host)
+      const named = siteCid ? null : nameFromHost(req.headers.host)
+      if (!siteCid && !named) return text(res, 404, 'Open a site at http://<site-id>.localhost:' + port + '/ or http://<name>.<publisher-key>.localhost:' + port + '/')
       if (req.method !== 'GET' && req.method !== 'HEAD') return text(res, 405, 'method not allowed')
       if (!fetchAllowed(req)) return text(res, 403, 'blocked cross-site subresource request')
+      // Resolve only after the checks above, so a drive-by request cannot make this node run DHT lookups.
+      if (named) {
+        try { siteCid = (await n.names.resolve(named.name, named.pub)).target } catch (e) {
+          return text(res, e instanceof NameNotFound ? 404 : 502, (e as Error).message)
+        }
+      }
       let path: string
       try { path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname) } catch { return text(res, 400, 'bad path') }
-      const r = await n.sites.resolve(siteCid, path)
+      const r = await n.sites.resolve(siteCid!, path)
       if (!r) return text(res, 404, 'no such file in this site')
       const type = MIME[r.path.slice(r.path.lastIndexOf('.') + 1).toLowerCase()]
       res.writeHead(200, {

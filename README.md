@@ -20,7 +20,9 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | Decentralized sites: publish a static folder (<= 64 files, 32 MB), content-addressed, served by a local gateway on an isolated per-site origin (`<site-id>.localhost`) with a no-third-party CSP; dashboard Browser view | working, tested (publish on A, serve via B over the DHT) |
 | Voice/video, governance, node operator tools | **not built** (Phase 3) |
 | NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | working: relayed delivery tested on loopback; hole punching and UPnP depend on your NAT/router and are untested here |
-| QUIC, DIDs, Sybil resistance, site naming / search | **not built** (Phase 2+) |
+| Names + updates: `<name>.<publisher-key>`, signed by your identity key, higher `seq` replaces lower, so a site keeps its address when you republish | working, tested (publish on A, resolve + serve on B, update, forged/stale/tampered records rejected) |
+| Search: keyword search over names/titles/keywords that publishers announce on the DHT, every record signature-checked | working, tested; opt-in per site, unranked, spammable (see limits) |
+| QUIC, DIDs, Sybil resistance, human-memorable global names | **not built** (Phase 2+) |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -45,7 +47,26 @@ npm start -- --data /tmp/b --listen /ip4/127.0.0.1/tcp/4102 --api-port 7802 --no
 Publish a folder from the dashboard (**Decentralized Browser**) or via `POST /api/sites`, then share the `frenet-site://<id>` link.
 Sites are **public**: no encryption, anyone with the ID can read them. The ID is the hash of the site manifest, so the content cannot be swapped.
 Open `http://<site-id>.localhost:7778/` (the gateway fetches from peers and verifies hashes). Sites can only load their own files (no third-party requests, no framing)
-and each has its own browser origin. `--gateway-port N` / `--no-gateway`. Limits: static files only, no naming (IDs are hashes), no search, no updates (republish = new ID).
+and each has its own browser origin. `--gateway-port N` / `--no-gateway`. Limits: static files only.
+
+### Names, updates and search
+
+A site ID is a hash, so an update used to mean a new ID. Give the site a **name** and it keeps one address:
+
+```bash
+# publish (first time) and update (same name again) via the dashboard, or:
+curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
+  "name": "my-blog", "title": "My blog", "keywords": ["writing","notes"],
+  "files": [{"path": "index.html", "data": "<base64>"}] }'
+# -> name.link = frenet-name://my-blog.<your-publisher-key>, url = http://my-blog.<key>.localhost:7778/
+```
+
+- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that names are not globally human-memorable: the key is part of the address.
+- **Updates:** publishing again under the same name signs a record with `seq + 1`; resolvers take the highest valid `seq`. The immutable `frenet-site://<id>` link of each version keeps working.
+- **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
+- Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
+
+Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (no reputation / Sybil resistance yet); full-text search of page contents is not built; own names are re-announced every 6 h, but file and site blocks are not re-announced automatically yet, so keep the publishing node online; there is no name transfer or revocation (publish a new record pointing elsewhere).
 
 Behind NAT (home router, CGNAT)? Point the node at a relay that has a public address:
 

@@ -16,6 +16,7 @@ import { loadOrCreateIdentity } from './identity.js'
 import { Blocks } from './blocks.js'
 import { FileStore } from './files.js'
 import { Messaging } from './messaging.js'
+import { Names } from './names.js'
 import { Sites } from './sites.js'
 import { Store } from './store.js'
 
@@ -48,6 +49,7 @@ export interface FrenetNode {
   blocks: Blocks
   files: FileStore
   sites: Sites
+  names: Names
   startedAt: number
   stop: () => Promise<void>
 }
@@ -111,11 +113,13 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const blocks = new Blocks(libp2p, store, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
   const files = new FileStore(blocks, store)
   const sites = new Sites(blocks, files)
+  const names = new Names(libp2p, store, blocks, privateKey)
   store.sweep()
   const sweeper = setInterval(() => store.sweep(), 10 * 60 * 1000)
   sweeper.unref()
   await messaging.start()
   await blocks.start()
+  await names.start()
   await libp2p.start()
 
   // Auto-dial discovered peers (mDNS / bootstrap).
@@ -132,11 +136,13 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     blocks,
     files,
     sites,
+    names,
     startedAt: Date.now(),
     stop: async () => {
       clearInterval(sweeper)
       await messaging.stop()
       await blocks.stop()
+      await names.stop()
       await libp2p.stop()
       store.close()
     }

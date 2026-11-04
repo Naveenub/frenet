@@ -5,7 +5,8 @@ import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
 import { request } from 'node:http'
 import { startApi } from '../src/api.js'
-import { startGateway } from '../src/gateway.js'
+import { nameFromHost, startGateway } from '../src/gateway.js'
+import { pubToB32, signRecord, validateRecord, type NameRecord } from '../src/names.js'
 import { generateKeyPair } from '@libp2p/crypto/keys'
 import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import { MAX_BODY_BYTES, MSG_PROTOCOL, RateLimiter, ReplayGuard, signMessage, verifyMessage } from '../src/messaging.js'
@@ -220,6 +221,152 @@ describe('decentralized sites + gateway', () => {
       assert.equal((await n.sites.resolve(j.cid, '/'))!.data.toString(), '<p>hi</p>')
       const bad = await fetch(`http://127.0.0.1:${port}/api/sites`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ files: [{ path: '../x', data: 'eA==' }] }) })
       assert.equal(bad.status, 400)
+    } finally { server.close() }
+  })
+})
+
+describe('names, updates and search', () => {
+  const get = (port: number, host: string, path: string, headers: Record<string, string> = {}) =>
+    new Promise<{ status: number, body: Buffer }>((resolve, reject) => {
+      const r = request({ host: '127.0.0.1', port, path, method: 'GET', headers: { host, ...headers } }, (res) => {
+        const c: Buffer[] = []; res.on('data', (d) => c.push(d)); res.on('end', () => resolve({ status: res.statusCode!, body: Buffer.concat(c) }))
+      })
+      r.on('error', reject); r.end()
+    })
+  const page = (t: string) => [{ path: 'index.html', data: Buffer.from(t) }]
+  const pair = async () => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const b = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    await a.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    await new Promise((r) => setTimeout(r, 1500))
+    return { a, b }
+  }
+
+  it('gives a site a human-readable name that B resolves and serves, and an update keeps the same name', async () => {
+    const { a, b } = await pair()
+    const v1 = await a.sites.publish(page('<p>version one</p>'))
+    const n1 = await a.names.publish('blog', v1.cid, { title: 'My blog', keywords: ['writing'] })
+    assert.equal(n1.record.seq, 1)
+    assert.equal(n1.link, `frenet-name://blog.${a.names.publisherKey}`)
+    const gw = await startGateway(b, 0)
+    try {
+      const host = `blog.${a.names.publisherKey}.localhost:${gw.port}`
+      assert.deepEqual(nameFromHost(host), { name: 'blog', pub: a.names.publisherKey })
+      const r1 = await get(gw.port, host, '/')
+      assert.equal(r1.status, 200)
+      assert.equal(r1.body.toString(), '<p>version one</p>')
+
+      // update: publish new content under the SAME name; the site ID changes, the name does not
+      const v2 = await a.sites.publish(page('<p>version two</p>'))
+      assert.notEqual(v2.cid, v1.cid)
+      const n2 = await a.names.publish('blog', v2.cid, { title: 'My blog', keywords: ['writing'] })
+      assert.equal(n2.record.seq, 2)
+      assert.equal((await b.names.resolve('blog', a.names.publisherKey, { fresh: true })).seq, 2)
+      assert.equal((await get(gw.port, host, '/')).body.toString(), '<p>version two</p>')
+      // the old immutable site ID still serves the old bytes
+      assert.equal((await get(gw.port, `${v1.cid}.localhost:${gw.port}`, '/')).body.toString(), '<p>version one</p>')
+
+      // unknown name -> 404; drive-by subresource loads never trigger a lookup
+      assert.equal((await get(gw.port, `nope.${a.names.publisherKey}.localhost:${gw.port}`, '/')).status, 404)
+      assert.equal((await get(gw.port, host, '/', { 'sec-fetch-site': 'cross-site', 'sec-fetch-dest': 'image' })).status, 403)
+      // malformed name hosts are not names
+      assert.equal(nameFromHost(`-bad.${a.names.publisherKey}.localhost`), null)
+      assert.equal(nameFromHost(`Blog.${a.names.publisherKey}.localhost`), null)
+      assert.equal(nameFromHost(`blog.${a.names.publisherKey.slice(1)}.localhost`), null)
+      assert.equal(nameFromHost(`blog.${a.names.publisherKey}.evil.example`), null)
+    } finally { gw.server.close() }
+  })
+
+  it('names are self-certifying: forged, tampered, stale, future-dated and malformed records are rejected', async () => {
+    const { a } = await pair()
+    const site = await a.sites.publish(page('<p>x</p>'))
+    const mine = await a.names.publish('real', site.cid, { keywords: ['hello'] })
+    assert.ok(await validateRecord(mine.record))
+
+    const attacker = await generateKeyPair('Ed25519')
+    const base = { v: 1 as const, name: 'real', pub: a.names.publisherKey, target: site.cid, seq: 99, ts: Date.now(), keywords: [] as string[], title: '' }
+    // attacker signs a record that claims to be the victim's name
+    assert.equal(await validateRecord(await signRecord(attacker, base)), null)
+    // valid record with a field changed afterwards
+    assert.equal(await validateRecord({ ...mine.record, target: (await a.blocks.put(Buffer.from('other'))).cid }), null)
+    assert.equal(await validateRecord({ ...mine.record, seq: mine.record.seq + 1 }), null)
+    assert.equal(await validateRecord({ ...mine.record, title: 'changed' }), null)
+    // attacker's own name under their own key is of course fine, and cannot collide with ours
+    const theirs = await signRecord(attacker, { ...base, pub: pubToB32(attacker.publicKey.raw) })
+    assert.ok(await validateRecord(theirs))
+    // future-dated (could pin a name forever if seq/ts were trusted blindly), bad name, bad keyword, bad title, duplicate keywords
+    const k = (o: object) => signRecord(attacker, { ...base, pub: pubToB32(attacker.publicKey.raw), ...o })
+    assert.equal(await validateRecord(await k({ ts: Date.now() + 3_600_000 })), null)
+    assert.equal(await validateRecord(await k({ name: 'Bad Name' })), null)
+    assert.equal(await validateRecord(await k({ keywords: ['x'] })), null)
+    assert.equal(await validateRecord(await k({ keywords: ['ok', 'ok'] })), null)
+    assert.equal(await validateRecord(await k({ title: 'line\nbreak' })), null)
+    assert.equal(await validateRecord(await k({ target: 'not-a-cid' })), null)
+    assert.equal(await validateRecord(await k({ seq: 0 })), null)
+    assert.equal(await validateRecord('garbage'), null)
+    assert.equal(await validateRecord(null), null)
+
+    // a stale (lower-seq) valid record cannot roll a name back
+    const v2 = await a.names.publish('real', site.cid)
+    assert.equal(v2.record.seq, 2)
+    assert.equal(a.store.putName(mine.record as NameRecord, false), false)
+    assert.equal(a.store.getName('real', a.names.publisherKey)!.seq, 2)
+  })
+
+  it('rejects invalid names, titles and keywords at publish time', async () => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const site = await a.sites.publish(page('<p>x</p>'))
+    for (const bad of ['', 'UPPER', '-a', 'a-', 'a b', 'a.b', 'x'.repeat(64), '../x']) await assert.rejects(a.names.publish(bad, site.cid), /invalid name/, bad)
+    await assert.rejects(a.names.publish('ok', 'nope'), /invalid site id/)
+    await assert.rejects(a.names.publish('ok', site.cid, { keywords: ['a'] }), /invalid keyword/)
+    await assert.rejects(a.names.publish('ok', site.cid, { keywords: Array.from({ length: 9 }, (_, i) => `word${i}`) }), /too many keywords/)
+    await assert.rejects(a.names.publish('ok', site.cid, { title: 'x'.repeat(81) }), /invalid title/)
+  })
+
+  it('finds names by keyword across the network (and locally), requiring every query word to match', async () => {
+    const { a, b } = await pair()
+    const s1 = await a.sites.publish(page('<p>cooking</p>'))
+    await a.names.publish('kitchen', s1.cid, { title: 'Vegan recipes', keywords: ['vegan', 'recipes', 'food'] })
+    const s2 = await a.sites.publish(page('<p>cars</p>'))
+    await a.names.publish('garage', s2.cid, { title: 'Classic cars', keywords: ['cars', 'food'] })
+
+    const hits = await b.names.search('vegan recipes')
+    assert.deepEqual(hits.map((h) => h.name), ['kitchen'])
+    assert.equal(hits[0].pub, a.names.publisherKey)
+    assert.equal(hits[0].title, 'Vegan recipes')
+    assert.equal(hits[0].own, false)
+    assert.deepEqual((await b.names.search('food')).map((h) => h.name).sort(), ['garage', 'kitchen'])
+    assert.deepEqual(await b.names.search('vegan cars'), [])          // AND semantics
+    assert.deepEqual(await b.names.search('!!'), [])                 // no usable words
+    assert.deepEqual((await a.names.search('cars', { network: false })).map((h) => h.name), ['garage'])
+    assert.equal((await a.names.search('cars', { network: false }))[0].own, true)
+    // a hit can be opened: it resolves to the site it points at
+    assert.equal((await b.sites.resolve((await b.names.resolve(hits[0].name, hits[0].pub)).target, '/'))!.data.toString(), '<p>cooking</p>')
+  })
+
+  it('publishes a named site and updates it through the local API', async () => {
+    const n = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const { server, port } = await startApi(n, 0, '127.0.0.1', 7778)
+    const post = (b: object) => fetch(`http://127.0.0.1:${port}/api/sites`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(b) })
+    const files = (t: string) => [{ path: 'index.html', data: Buffer.from(t).toString('base64') }]
+    try {
+      const r1 = await (await post({ files: files('one'), name: 'home', title: 'Home', keywords: ['hello'] })).json() as any
+      assert.equal(r1.name.seq, 1)
+      assert.equal(r1.url, `http://home.${n.names.publisherKey}.localhost:7778/`)
+      const r2 = await (await post({ files: files('two'), name: 'home', title: 'Home', keywords: ['hello'] })).json() as any
+      assert.equal(r2.name.seq, 2)
+      assert.notEqual(r2.cid, r1.cid)
+      const res = await (await fetch(`http://127.0.0.1:${port}/api/names/resolve?name=home&pub=${n.names.publisherKey}`)).json() as any
+      assert.equal(res.target, r2.cid)
+      const s = await (await fetch(`http://127.0.0.1:${port}/api/search?q=hello`)).json() as any
+      assert.equal(s.results.length, 1)
+      assert.equal(s.results[0].link, `frenet-name://home.${n.names.publisherKey}`)
+      assert.equal((await fetch(`http://127.0.0.1:${port}/api/names/resolve?name=missing&pub=${n.names.publisherKey}`)).status, 404)
+      // a bad name is refused before anything is published
+      const before = n.store.listFiles().length
+      assert.equal((await post({ files: files('three'), name: 'Bad Name' })).status, 400)
+      assert.equal((await post({ files: files('three'), name: 'ok', keywords: ['x'] })).status, 400)
+      assert.equal(n.store.listFiles().length, before)
     } finally { server.close() }
   })
 })

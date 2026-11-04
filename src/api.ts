@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { DAY_MS } from './blocks.js'
+import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -87,8 +88,24 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         if (!Array.isArray(b.files)) throw new Error('files must be an array')
         const entries = b.files.map((f: any) => ({ path: String(f?.path), data: Buffer.from(String(f?.data ?? ''), 'base64') }))
         const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
+        // Validate the naming fields first so a bad name does not leave a published-but-unnamed site behind.
+        const name = b.name === undefined || b.name === '' ? null : String(b.name)
+        if (name !== null && !NAME_RE.test(name)) throw new Error('invalid name (1-63 chars: a-z, 0-9, hyphen; not starting/ending with a hyphen)')
+        const title = cleanTitle(b.title)
+        const keywords = cleanKeywords(b.keywords)
         const r = await n.sites.publish(entries, { ...(b.index ? { index: String(b.index) } : {}), ...(ttl ? { ttlMs: ttl } : {}) })
-        return json(res, 200, { ...r, url: gatewayPort ? `http://${r.cid}.localhost:${gatewayPort}/` : null })
+        const named = name ? await n.names.publish(name, r.cid, { title, keywords }) : null
+        const url = gatewayPort ? `http://${named ? `${name}.${named.record.pub}` : r.cid}.localhost:${gatewayPort}/` : null
+        return json(res, 200, { ...r, url, siteUrl: gatewayPort ? `http://${r.cid}.localhost:${gatewayPort}/` : null, name: named ? { link: named.link, seq: named.record.seq, announced: named.announced } : null })
+      }
+      if (req.method === 'GET' && url.pathname === '/api/names') return json(res, 200, { publisher: n.names.publisherKey, names: n.names.list() })
+      if (req.method === 'GET' && url.pathname === '/api/names/resolve') {
+        const r = await n.names.resolve(String(url.searchParams.get('name') ?? ''), String(url.searchParams.get('pub') ?? ''), { fresh: true }).catch((e) => { if (e instanceof NameNotFound) return null; throw e })
+        return r ? json(res, 200, r) : json(res, 404, { error: 'name not found' })
+      }
+      if (req.method === 'GET' && url.pathname === '/api/search') {
+        const q = String(url.searchParams.get('q') ?? '').slice(0, 200)
+        return json(res, 200, { query: q, results: await n.names.search(q) })
       }
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
@@ -168,6 +185,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
     messages: n.store.count(),
     blocks: { ...n.store.blockStats(), quotaBytes: n.blocks.retention.quotaBytes, replicaTtlDays: n.blocks.retention.replicaTtlMs / DAY_MS },
     files: n.files.list().length,
+    names: { publisher: n.names.publisherKey, known: n.names.list().length },
     privacy: {
       transportEncryption: 'Noise XX (ChaCha20-Poly1305), forward secret',
       identity: 'Ed25519, key stored locally only',

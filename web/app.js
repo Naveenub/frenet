@@ -174,39 +174,87 @@ async function storage (v) {
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Files you added'), files.length ? t : el('p', { className: 'dim' }, 'No files yet. Other peers may still hold copies of anything you shared.')))
 }
 
+const NAME_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
+const PUB_RE = /^[a-z2-7]{52}$/
+
+/** frenet-site://<id> or frenet-name://<name>.<key> -> gateway URL, or null if it is neither. */
+function gatewayUrl (gw, input) {
+  const t = input.trim()
+  const site = t.replace(/^frenet-site:\/\//, '').replace(/\/.*$/, '')
+  if (/^[a-z2-7]{20,63}$/.test(site)) return `http://${site}.localhost:${gw}/`
+  const m = /^(?:frenet-name:\/\/)?([a-z0-9-]{1,63})\.([a-z2-7]{52})(?:\/.*)?$/.exec(t)
+  if (m && NAME_RE.test(m[1]) && PUB_RE.test(m[2])) return `http://${m[1]}.${m[2]}.localhost:${gw}/`
+  return null
+}
+
 function browser (v) {
   const gw = state.status.gatewayPort
   if (!gw) { v.append(el('div', { className: 'card' }, el('h3', {}, 'Gateway is off'), el('p', { className: 'dim' }, 'Restart the node without --no-gateway to publish and open sites.'))); return }
   const pick = el('input', { type: 'file', multiple: true, webkitdirectory: true, 'aria-label': 'Site folder' })
   const ttl = el('input', { type: 'number', min: 1, placeholder: 'keep for N days (blank = until deleted)', 'aria-label': 'Retention in days' })
+  const name = el('input', { placeholder: 'name (optional, e.g. my-blog)', maxLength: 63, 'aria-label': 'Site name' })
+  const title = el('input', { placeholder: 'title for search (optional)', maxLength: 80, 'aria-label': 'Site title' })
+  const kws = el('input', { placeholder: 'keywords, comma separated (optional, max 8)', 'aria-label': 'Keywords' })
   const msg = el('p', { className: 'err' }); const out = el('div')
   const pub = el('button', { className: 'btn', type: 'button', onclick: async () => {
     msg.textContent = ''; out.replaceChildren()
     const fs = [...pick.files]
     if (!fs.length) { msg.textContent = 'Choose a folder containing index.html.'; return }
+    const nm = name.value.trim()
+    if (nm && !NAME_RE.test(nm)) { msg.textContent = 'Names use a-z, 0-9 and hyphens (not at the start or end), up to 63 characters.'; return }
     const prefix = fs[0].webkitRelativePath.split('/')[0] + '/'
     pub.disabled = true; msg.textContent = 'Publishing…'
     try {
       const files = []
       for (const f of fs) files.push({ path: (f.webkitRelativePath || f.name).replace(prefix, ''), data: b64(await f.arrayBuffer()) })
-      const r = await api('/api/sites', { files, ttlDays: ttl.value ? Number(ttl.value) : undefined })
+      const keywords = kws.value.split(',').map((k) => k.trim()).filter(Boolean)
+      const r = await api('/api/sites', { files, ttlDays: ttl.value ? Number(ttl.value) : undefined, ...(nm ? { name: nm, title: title.value.trim(), keywords } : {}) })
       msg.textContent = ''
-      out.append(el('p', {}, `Published ${r.files} files.`), el('div', { className: 'mono' }, r.link),
+      out.append(el('p', {}, r.name ? `Published ${r.files} files as version ${r.name.seq} of “${nm}”.` : `Published ${r.files} files.`))
+      if (r.name) out.append(el('div', { className: 'mono' }, r.name.link), el('p', { className: 'dim' }, 'Share this link: it keeps working when you update the site. Publish again with the same name to update it.'))
+      out.append(el('div', { className: 'mono' }, r.link),
         el('p', {}, el('a', { href: r.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open site')),
-        el('p', { className: 'dim' }, 'Sites are public: anyone with the site ID can read every file. Share the frenet-site:// link.'))
+        el('p', { className: 'dim' }, 'Sites are public: anyone with the link can read every file.' + (r.name ? ' The frenet-site:// link is this exact version and never changes.' : ' Without a name, the site ID is the only address and an update means a new ID.')))
     } catch (e) { msg.textContent = e.message } finally { pub.disabled = false }
   } }, 'Publish site')
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Publish a site'), el('p', { className: 'dim' }, 'Static files only (max 64 files, 32 MB). Each site gets its own isolated origin and can only load its own files: no third-party requests, no tracking.'), el('div', { className: 'row' }, pick), el('div', { className: 'row' }, ttl, pub), msg, out))
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Publish a site'), el('p', { className: 'dim' }, 'Static files only (max 64 files, 32 MB). Each site gets its own isolated origin and can only load its own files: no third-party requests, no tracking. A name is yours alone: it is tied to your identity key, signed, and can be updated by publishing again under the same name.'),
+    el('div', { className: 'row' }, pick), el('div', { className: 'row' }, name, title), el('div', { className: 'row' }, kws), el('div', { className: 'row' }, ttl, pub), msg, out))
 
-  const link = el('input', { placeholder: 'frenet-site://bafk…', 'aria-label': 'Site link' }); const omsg = el('p', { className: 'err' })
+  const link = el('input', { placeholder: 'frenet-name://my-blog.… or frenet-site://bafk…', 'aria-label': 'Site link' }); const omsg = el('p', { className: 'err' })
   const open = el('button', { className: 'btn', type: 'button', onclick: () => {
     omsg.textContent = ''
-    const cid = link.value.trim().replace(/^frenet-site:\/\//, '').replace(/\/.*$/, '')
-    if (!/^[a-z2-7]{20,63}$/.test(cid)) { omsg.textContent = 'That is not a valid site ID.'; return }
-    window.open(`http://${cid}.localhost:${gw}/`, '_blank', 'noopener,noreferrer')
-  } }, 'Open site')
+    const u = gatewayUrl(gw, link.value)
+    if (!u) { omsg.textContent = 'That is not a valid site or name link.'; return }
+    window.open(u, '_blank', 'noopener,noreferrer')
+  } }, 'Open')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Open a site'), el('div', { className: 'row' }, link, open), omsg,
-    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do).')))
+    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do).')))
+
+  const q = el('input', { placeholder: 'search names by keyword, e.g. vegan recipes', 'aria-label': 'Search' }); const smsg = el('p', { className: 'dim' }); const sres = el('div')
+  const doSearch = async () => {
+    sres.replaceChildren(); smsg.textContent = 'Searching peers…'
+    try {
+      const r = await api('/api/search?q=' + encodeURIComponent(q.value))
+      smsg.textContent = r.results.length ? '' : 'No named sites match. Only sites whose publisher added keywords can be found.'
+      for (const h of r.results) {
+        sres.append(el('div', { className: 'card' },
+          el('h3', {}, h.title || h.name),
+          el('p', {}, el('a', { href: `http://${h.name}.${h.pub}.localhost:${gw}/`, target: '_blank', rel: 'noopener noreferrer' }, h.name), h.own ? ' (yours)' : ''),
+          el('div', { className: 'mono' }, h.link),
+          el('p', { className: 'dim' }, `version ${h.seq} · ${h.keywords.join(', ')}`)))
+      }
+    } catch (e) { smsg.textContent = ''; sres.append(el('p', { className: 'err' }, e.message)) }
+  }
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Search'), el('div', { className: 'row' }, q, el('button', { className: 'btn', type: 'button', onclick: doSearch }, 'Search')), smsg,
+    el('p', { className: 'dim' }, 'Matches names, titles and keywords that publishers announced on the network, checking each record’s signature. There is no central index and no ranking, so treat results as unvetted: anyone can publish under any keyword.'), sres))
+
+  api('/api/names').then((r) => {
+    const mine = r.names.filter((n) => n.own)
+    if (!mine.length) return
+    const card = el('div', { className: 'card' }, el('h3', {}, 'Your names'))
+    for (const n of mine) card.append(el('p', {}, el('a', { href: `http://${n.name}.${n.pub}.localhost:${gw}/`, target: '_blank', rel: 'noopener noreferrer' }, n.name), ` · version ${n.seq}`), el('div', { className: 'mono' }, n.link))
+    v.append(card)
+  }).catch(() => {})
 }
 
 function identity (v) {

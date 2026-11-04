@@ -1,5 +1,6 @@
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
+import type { NameRecord } from './names.js'
 
 export interface StoredMessage {
   id: string
@@ -33,6 +34,7 @@ export class Store {
       );
       CREATE INDEX IF NOT EXISTS messages_peer_ts ON messages (peer, ts);
       CREATE TABLE IF NOT EXISTS blocks (cid TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL, expires INTEGER);
+      CREATE TABLE IF NOT EXISTS names (name TEXT NOT NULL, pub TEXT NOT NULL, seq INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL, record TEXT NOT NULL, PRIMARY KEY (name, pub));
       CREATE TABLE IF NOT EXISTS files (cid TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, chunks TEXT NOT NULL, encrypted INTEGER NOT NULL, created INTEGER NOT NULL, expires INTEGER);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
@@ -107,6 +109,31 @@ export class Store {
     const out = new Set<string>()
     for (const f of this.listFiles()) { out.add(f.cid); for (const c of f.chunks) out.add(c) }
     return out
+  }
+
+
+  /**
+   * Keep only the highest-seq record per (name, pub): a stale or replayed record never replaces a newer one.
+   * `own` is sticky. Foreign records are capped so a flood of valid-but-junk records cannot grow the DB forever.
+   */
+  putName (r: NameRecord, own: boolean): boolean {
+    const res = this.db.prepare(`INSERT INTO names (name, pub, seq, own, seen, record) VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(name, pub) DO UPDATE SET seq = excluded.seq, record = excluded.record, seen = excluded.seen, own = MAX(names.own, excluded.own)
+      WHERE excluded.seq > names.seq`).run(r.name, r.pub, r.seq, own ? 1 : 0, Date.now(), JSON.stringify(r))
+    if (!own) {
+      this.db.prepare('DELETE FROM names WHERE own = 0 AND rowid NOT IN (SELECT rowid FROM names WHERE own = 0 ORDER BY seen DESC LIMIT 5000)').run()
+    }
+    return Number(res.changes) > 0
+  }
+
+  getName (name: string, pub: string): { record: NameRecord, seq: number, own: boolean } | null {
+    const r = this.db.prepare('SELECT * FROM names WHERE name = ? AND pub = ?').get(name, pub) as any
+    return r ? { record: JSON.parse(r.record), seq: Number(r.seq), own: !!r.own } : null
+  }
+
+  listNames (ownOnly = false): Array<{ record: NameRecord, seq: number, own: boolean }> {
+    const rows = this.db.prepare(`SELECT * FROM names ${ownOnly ? 'WHERE own = 1' : ''} ORDER BY seen DESC`).all() as any[]
+    return rows.map((r) => ({ record: JSON.parse(r.record), seq: Number(r.seq), own: !!r.own }))
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */
