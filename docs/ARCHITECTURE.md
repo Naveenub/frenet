@@ -1,5 +1,7 @@
 # Architecture (Phase 1)
 
+**Stack.** Backend: Node.js >= 22.13, strict TypeScript (ESM), js-libp2p, `node:sqlite`. Frontend (`web/`): plain JavaScript ES modules, no framework, bundler or build step. This deliberately differs from the original spec (Next.js/React/TypeScript/Tailwind frontend, Go or Rust backend); see the README "Stack (as built)" table. The only Rust is inside the `@chainsafe/libp2p-quic` dependency.
+
 ```
 web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts          src/gateway.ts (sites, :7778)
                                                     |
