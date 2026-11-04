@@ -10,10 +10,10 @@ web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts
 ```
 
 ## Messaging protocol `/frenet/msg/1.0.0`
-- One stream per message: `{v:1,id,ts,body}` JSON, closed by sender.
+- One stream per message: `{v:2,id,ts,to,body,sig}` JSON, closed by sender. `sig` is Ed25519 (base64) over `frenet-msg/v2\nfrom\nto\nid\nts\nbody`, so it binds sender, recipient, id and timestamp, not just the body.
 - Sender identity = `connection.remotePeer` (authenticated by Noise). Claimed identity is never read from the payload.
 - Receiver checks: size <= 32 KB frame / 16 KB body, schema, timestamp within 5 min, unseen `(peer,id)`, token-bucket rate limit (burst 20, 2/s).
-- Messages are not yet signed at the application layer, so they are not verifiable by third parties; they are authenticated only per hop (direct connection).
+- Signed per message: the sender is `remotePeer` and the signature must verify under that peer's key (the public key is embedded in the Ed25519 peer ID) and name us as `to`. Unsigned (v1), wrong-recipient and bad-signature messages are dropped. Signature, sender and recipient are stored, so any third party can re-verify a stored message with `verifyMessage()`. Limits: no forwarding yet (signer must equal the connection peer); signing proves authorship and recipient, not that the recipient read it; no sender-deniability; old unsigned v1 nodes can no longer message this version.
 
 ## Blocks `/frenet/block/1.0.0`
 `put(bytes)` -> sha256 raw CIDv1, stored in SQLite, announced via DHT `provide`. `get(cid)` -> local, else `findProviders`, request the CID, verify sha256 before caching, then re-announce (replication). Cap 1 MB/block. Raw blocks are plaintext to anyone with the CID.

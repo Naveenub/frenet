@@ -7,6 +7,10 @@ export interface StoredMessage {
   direction: 'in' | 'out'
   ts: number
   body: string
+  /** Ed25519 signature (base64) over sender|recipient|id|ts|body; verifiable by anyone via verifyMessage(). */
+  sig?: string | null
+  sender?: string | null
+  recipient?: string | null
 }
 
 export interface FileRow { cid: string, name: string, size: number, chunks: string[], encrypted: boolean, created: number, expires: number | null }
@@ -32,11 +36,14 @@ export class Store {
       CREATE TABLE IF NOT EXISTS files (cid TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, chunks TEXT NOT NULL, encrypted INTEGER NOT NULL, created INTEGER NOT NULL, expires INTEGER);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
+    for (const c of ['sig', 'sender', 'recipient']) {
+      try { this.db.exec(`ALTER TABLE messages ADD COLUMN ${c} TEXT`) } catch { /* column already present */ }
+    }
   }
 
   add (m: StoredMessage): boolean {
-    const r = this.db.prepare('INSERT OR IGNORE INTO messages (id, peer, direction, ts, body) VALUES (?, ?, ?, ?, ?)')
-      .run(m.id, m.peer, m.direction, m.ts, m.body)
+    const r = this.db.prepare('INSERT OR IGNORE INTO messages (id, peer, direction, ts, body, sig, sender, recipient) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(m.id, m.peer, m.direction, m.ts, m.body, m.sig ?? null, m.sender ?? null, m.recipient ?? null)
     return Number(r.changes) > 0
   }
 

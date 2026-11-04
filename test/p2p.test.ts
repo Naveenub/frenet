@@ -4,7 +4,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { after, describe, it } from 'node:test'
 import { startApi } from '../src/api.js'
-import { MAX_BODY_BYTES, RateLimiter, ReplayGuard } from '../src/messaging.js'
+import { generateKeyPair } from '@libp2p/crypto/keys'
+import { peerIdFromPrivateKey } from '@libp2p/peer-id'
+import { MAX_BODY_BYTES, MSG_PROTOCOL, RateLimiter, ReplayGuard, signMessage, verifyMessage } from '../src/messaging.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
 
 const L = ['/ip4/127.0.0.1/tcp/0']
@@ -53,6 +55,57 @@ describe('real two-node network (loopback TCP + Noise + yamux)', () => {
     await waitFor(() => dropped.includes('rate-limited'))
     await new Promise((r) => setTimeout(r, 200))
     assert.ok(b.store.count().in <= 21 && b.store.count().in >= 20)
+  })
+})
+
+describe('per-message signatures', () => {
+  const send = async (from: FrenetNode, to: FrenetNode, wire: object) => {
+    const s = await from.libp2p.dialProtocol(to.libp2p.peerId, MSG_PROTOCOL)
+    s.send(Buffer.from(JSON.stringify(wire)))
+    await s.close()
+  }
+  const setup = async () => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    const b = await track({ dataDir: ':memory:', listen: L, mdns: false, nat: false })
+    await a.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    const dropped: string[] = []
+    b.messaging.on('dropped', (d) => dropped.push(d.reason))
+    return { a, b, dropped }
+  }
+
+  it('stores a signature that any third party can verify, and detects tampering', async () => {
+    const { a, b } = await setup()
+    const got: string[] = []
+    b.messaging.on('message', (m) => got.push(m.id))
+    await a.messaging.send(b.libp2p.peerId, 'signed hello')
+    await waitFor(() => got.length === 1)
+    for (const m of [...a.store.list(), ...b.store.list()]) {
+      const row = { sender: m.sender!, recipient: m.recipient!, id: m.id, ts: m.ts, body: m.body, sig: m.sig! }
+      assert.equal(row.sender, a.libp2p.peerId.toString())
+      assert.equal(row.recipient, b.libp2p.peerId.toString())
+      assert.equal(await verifyMessage(row), true)
+      assert.equal(await verifyMessage({ ...row, body: 'tampered' }), false)
+      assert.equal(await verifyMessage({ ...row, recipient: a.libp2p.peerId.toString() }), false)
+      assert.equal(await verifyMessage({ ...row, ts: row.ts + 1 }), false)
+    }
+  })
+
+  it('drops unsigned, forged-signer, wrong-recipient and bad-signature messages', async () => {
+    const { a, b, dropped } = await setup()
+    const aId = a.libp2p.peerId.toString(); const bId = b.libp2p.peerId.toString()
+    const ts = Date.now()
+    // unsigned v1
+    await send(a, b, { v: 1, id: 'u1', ts, body: 'x' })
+    // signed by a different key (C) but delivered over A's authenticated connection
+    const ckey = await generateKeyPair('Ed25519'); const cId = peerIdFromPrivateKey(ckey).toString()
+    await send(a, b, { v: 2, id: 'f1', ts, to: bId, body: 'x', sig: await signMessage(ckey, cId, bId, 'f1', ts, 'x') })
+    // addressed to someone else (rejected on recipient before the signature is even considered)
+    await send(a, b, { v: 2, id: 'w1', ts, to: cId, body: 'x', sig: await signMessage(ckey, aId, cId, 'w1', ts, 'x') })
+    // garbage signature
+    await send(a, b, { v: 2, id: 's1', ts, to: bId, body: 'x', sig: Buffer.alloc(64).toString('base64') })
+    await waitFor(() => dropped.length >= 4)
+    assert.deepEqual(dropped.sort(), ['bad-signature', 'bad-signature', 'malformed', 'wrong-recipient'].sort())
+    assert.equal(b.store.count().in, 0)
   })
 })
 

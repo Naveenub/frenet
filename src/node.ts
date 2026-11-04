@@ -105,7 +105,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   })
 
   const store = new Store(opts.dataDir)
-  const messaging = new Messaging(libp2p, store)
+  const messaging = new Messaging(libp2p, store, privateKey)
   const blocks = new Blocks(libp2p, store, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
   const files = new FileStore(blocks, store)
   store.sweep()
