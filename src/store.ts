@@ -14,6 +14,10 @@ export interface StoredMessage {
   recipient?: string | null
 }
 
+export type CommunityState = 'invited' | 'joined' | 'removed' | 'left'
+export interface CommunityRow { id: string, owner: string, name: string, seq: number, members: string[], state: CommunityState, updated: number }
+export interface GroupEventRow { community: string, id: string, kind: string, author: string, ts: number, body: string, sig: string, meta: string | null }
+
 export interface FileRow { cid: string, name: string, size: number, chunks: string[], encrypted: boolean, created: number, expires: number | null }
 
 /** Local-first message store (SQLite). Nothing here is ever uploaded. */
@@ -36,6 +40,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS blocks (cid TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL, expires INTEGER);
       CREATE TABLE IF NOT EXISTS names (name TEXT NOT NULL, pub TEXT NOT NULL, seq INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL, record TEXT NOT NULL, PRIMARY KEY (name, pub));
       CREATE TABLE IF NOT EXISTS files (cid TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, chunks TEXT NOT NULL, encrypted INTEGER NOT NULL, created INTEGER NOT NULL, expires INTEGER);
+      CREATE TABLE IF NOT EXISTS bans (peer TEXT PRIMARY KEY, reason TEXT NOT NULL, ts INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, seq INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('invited','joined','removed','left')), updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS group_events (community TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, author TEXT NOT NULL, ts INTEGER NOT NULL, body TEXT NOT NULL, sig TEXT NOT NULL, meta TEXT, PRIMARY KEY (community, id));
+      CREATE INDEX IF NOT EXISTS group_events_ts ON group_events (community, kind, ts);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     for (const c of ['sig', 'sender', 'recipient']) {
@@ -134,6 +142,29 @@ export class Store {
   listNames (ownOnly = false): Array<{ record: NameRecord, seq: number, own: boolean }> {
     const rows = this.db.prepare(`SELECT * FROM names ${ownOnly ? 'WHERE own = 1' : ''} ORDER BY seen DESC`).all() as any[]
     return rows.map((r) => ({ record: JSON.parse(r.record), seq: Number(r.seq), own: !!r.own }))
+  }
+
+  addBan (peer: string, reason: string): void { this.db.prepare('INSERT OR REPLACE INTO bans (peer, reason, ts) VALUES (?, ?, ?)').run(peer, reason, Date.now()) }
+  removeBan (peer: string): boolean { return Number(this.db.prepare('DELETE FROM bans WHERE peer = ?').run(peer).changes) > 0 }
+  listBans (): Array<{ peer: string, reason: string, ts: number }> { return (this.db.prepare('SELECT * FROM bans ORDER BY ts DESC').all() as any[]).map((r) => ({ peer: r.peer, reason: r.reason, ts: Number(r.ts) })) }
+
+  private community (r: any): CommunityRow { return { id: r.id, owner: r.owner, name: r.name, seq: Number(r.seq), members: JSON.parse(r.members), state: r.state, updated: Number(r.updated) } }
+  putCommunity (c: CommunityRow): void {
+    this.db.prepare('INSERT OR REPLACE INTO communities (id, owner, name, seq, members, state, updated) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(c.id, c.owner, c.name, c.seq, JSON.stringify(c.members), c.state, c.updated)
+  }
+  getCommunity (id: string): CommunityRow | null { const r = this.db.prepare('SELECT * FROM communities WHERE id = ?').get(id); return r ? this.community(r) : null }
+  listCommunities (): CommunityRow[] { return (this.db.prepare('SELECT * FROM communities ORDER BY updated DESC').all() as any[]).map((r) => this.community(r)) }
+  countCommunities (state: CommunityState): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM communities WHERE state = ?').get(state) as any).n) }
+
+  addGroupEvent (e: GroupEventRow): boolean {
+    const r = this.db.prepare('INSERT OR IGNORE INTO group_events (community, id, kind, author, ts, body, sig, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(e.community, e.id, e.kind, e.author, e.ts, e.body, e.sig, e.meta)
+    return Number(r.changes) > 0
+  }
+  getGroupEvent (community: string, id: string): GroupEventRow | null { return (this.db.prepare('SELECT * FROM group_events WHERE community = ? AND id = ?').get(community, id) as unknown as GroupEventRow) ?? null }
+  listGroupEvents (community: string, kind: string, limit = 200): GroupEventRow[] {
+    return (this.db.prepare('SELECT * FROM group_events WHERE community = ? AND kind = ? ORDER BY ts DESC LIMIT ?').all(community, kind, limit) as unknown as GroupEventRow[]).reverse()
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */
