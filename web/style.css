@@ -28,13 +28,19 @@ th{color:var(--dim);font-weight:500}
 .card{border:1px solid var(--line);border-radius:12px;background:var(--panel);padding:16px;margin-bottom:16px}
 .card h3{margin:0 0 8px;font-size:16px}
 .row{display:flex;gap:8px;flex-wrap:wrap;margin-top:10px}
-input,select{background:#0a0c1a;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font:inherit;min-width:0}
-input{flex:1}
+input,select,textarea{background:#0a0c1a;color:var(--text);border:1px solid var(--line);border-radius:8px;padding:9px 10px;font:inherit;min-width:0}
+input,textarea{flex:1}textarea{resize:vertical}
 button.btn{cursor:pointer;border:0;border-radius:8px;padding:9px 16px;color:#fff;font:inherit;background:linear-gradient(90deg,var(--blue),var(--violet))}
 .msgs{max-height:340px;overflow:auto;display:flex;flex-direction:column;gap:8px;margin:10px 0}
 .m{max-width:75%;padding:8px 12px;border-radius:12px;background:#151937;word-break:break-word}
 .m.out{align-self:flex-end;background:#26307a}
 .m small{display:block;color:var(--dim);font-size:11px}
 .dim{color:var(--dim)}.err{color:var(--bad);min-height:1.4em;margin:6px 0 0}
+#call{position:fixed;right:18px;bottom:18px;width:min(380px,calc(100vw - 36px));z-index:10;border:1px solid var(--line);border-radius:14px;background:var(--panel);padding:14px;box-shadow:0 10px 40px #000a}
+#call[hidden]{display:none}#call h3{margin:0 0 8px;font-size:16px}
+.vids{position:relative;margin-bottom:8px}.cv{width:100%;max-height:260px;border-radius:10px;background:#000;display:block}
+.vids .cv:last-child{position:absolute;right:8px;bottom:8px;width:34%;border:1px solid var(--line)}
+.bar{display:flex;height:10px;border-radius:5px;overflow:hidden;background:#151937;margin:8px 0}.bar i{display:block}
+button.btn:disabled{opacity:.55;cursor:default}
 @media(max-width:760px){body{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}nav{flex-direction:row;flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}

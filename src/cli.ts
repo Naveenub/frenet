@@ -17,6 +17,7 @@ const { values } = parseArgs({
     relay: { type: 'string', multiple: true },
     'relay-server': { type: 'boolean', default: false },
     announce: { type: 'string', multiple: true },
+    'ice-server': { type: 'string', multiple: true },
     'no-nat': { type: 'boolean', default: false },
     'gateway-port': { type: 'string', default: '7778' },
     'no-gateway': { type: 'boolean', default: false },
@@ -26,7 +27,7 @@ const { values } = parseArgs({
 })
 
 if (values.help) {
-  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--no-nat] [--gateway-port N] [--no-gateway] [--no-mdns]
+  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--gateway-port N] [--no-gateway] [--no-mdns]
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777`)
   process.exit(0)
 }
@@ -40,6 +41,7 @@ const node = await startFrenet({
   relays: values.relay,
   relayServer: values['relay-server'],
   announce: values.announce,
+  iceServers: values['ice-server'],
   quotaBytes: Number(values['quota-mb']) * 1024 * 1024,
   replicaTtlMs: Number(values['replica-ttl-days']) * 86_400_000
 })

@@ -32,6 +32,11 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
   n.libp2p.addEventListener('peer:disconnect', (e) => push('peer', { type: 'disconnect', peer: e.detail.toString() }))
   n.messaging.on('message', (m) => push('message', { ...m, direction: 'in' }))
   n.messaging.on('dropped', (d) => push('dropped', d))
+  n.calls.on('signal', (g) => push('signal', g))
+  n.calls.on('dropped', (d) => push('dropped', { peer: d.peer, reason: `call: ${d.reason}` }))
+  n.groups.on('community', (id) => push('community', { id }))
+  n.groups.on('event', (e) => push('group', e))
+  n.groups.on('dropped', (d) => push('dropped', { peer: d.peer, reason: `group: ${d.reason}` }))
 
   const root = webRoot()
 
@@ -113,6 +118,26 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         push('message', { ...r, peer: b.peer, body: b.body, direction: 'out' })
         return json(res, 200, r)
       }
+      if (req.method === 'POST' && url.pathname === '/api/call/signal') {
+        const b = await body(req)
+        await n.calls.send(peerIdFromString(String(b.peer)), String(b.call), String(b.kind), String(b.data ?? ''))
+        return json(res, 200, { ok: true })
+      }
+      if (req.method === 'GET' && url.pathname === '/api/operator') return json(res, 200, n.operator.snapshot())
+      if (req.method === 'POST' && url.pathname === '/api/operator/ban') { const b = await body(req); await n.operator.ban(b.peer, b.reason); return json(res, 200, { ok: true }) }
+      if (req.method === 'POST' && url.pathname === '/api/operator/unban') return json(res, 200, { removed: n.operator.unban((await body(req)).peer) })
+      if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }
+      if (req.method === 'POST' && url.pathname === '/api/operator/sweep') return json(res, 200, { removed: n.operator.sweep() })
+      if (req.method === 'GET' && url.pathname === '/api/communities') return json(res, 200, n.groups.list())
+      if (req.method === 'POST' && url.pathname === '/api/communities') { const b = await body(req); return json(res, 200, await n.groups.create(b.name, b.members ?? [])) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/members') { const b = await body(req); return json(res, 200, await n.groups.setMembers(String(b.id), b.members)) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/join') { n.groups.join(String((await body(req)).id)); return json(res, 200, { ok: true }) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/leave') { n.groups.leave(String((await body(req)).id)); return json(res, 200, { ok: true }) }
+      if (req.method === 'GET' && url.pathname === '/api/communities/messages') return json(res, 200, n.groups.messages(String(url.searchParams.get('id') ?? '')))
+      if (req.method === 'POST' && url.pathname === '/api/communities/post') { const b = await body(req); return json(res, 200, await n.groups.post(String(b.id), b.text)) }
+      if (req.method === 'GET' && url.pathname === '/api/communities/proposals') return json(res, 200, n.groups.proposals(String(url.searchParams.get('id') ?? '')))
+      if (req.method === 'POST' && url.pathname === '/api/communities/propose') { const b = await body(req); return json(res, 200, await n.groups.propose(String(b.id), b.title, b.text, Number(b.hours) * 3_600_000)) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/vote') { const b = await body(req); return json(res, 200, await n.groups.vote(String(b.id), b.proposal, b.choice)) }
       if (req.method === 'POST' && url.pathname === '/api/dial') {
         const b = await body(req)
         await n.libp2p.dial(multiaddr(String(b.addr)))
@@ -180,6 +205,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
       relayServer: !!(l.services as any).relay,
       relayedAddresses: l.getMultiaddrs().map(String).filter((a) => a.includes('/p2p-circuit'))
     },
+    calls: { iceServers: n.iceServers },
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),

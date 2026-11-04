@@ -14,9 +14,12 @@ import { createLibp2p } from 'libp2p'
 import type { Libp2p } from '@libp2p/interface'
 import { loadOrCreateIdentity } from './identity.js'
 import { Blocks } from './blocks.js'
+import { Calls } from './calls.js'
 import { FileStore } from './files.js'
+import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
 import { Names } from './names.js'
+import { Operator } from './operator.js'
 import { Sites } from './sites.js'
 import { Store } from './store.js'
 
@@ -36,6 +39,8 @@ export interface FrenetOptions {
   relayServer?: boolean
   /** Extra public multiaddrs to announce (e.g. a forwarded port or DNS name). */
   announce?: string[]
+  /** STUN servers (`stun:host[:port]`) handed to the dashboard's WebRTC calls. None by default: calls then work on LAN/public addresses only and no third party learns your IP. */
+  iceServers?: string[]
   quotaBytes?: number
   replicaTtlMs?: number
   /** Only meaningful with dataDir ':memory:' (tests). */
@@ -50,6 +55,10 @@ export interface FrenetNode {
   files: FileStore
   sites: Sites
   names: Names
+  calls: Calls
+  groups: Groups
+  operator: Operator
+  iceServers: string[]
   startedAt: number
   stop: () => Promise<void>
 }
@@ -63,6 +72,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     privateKey = (await loadOrCreateIdentity(opts.dataDir)).key
   }
 
+  const iceServers = opts.iceServers ?? []
+  for (const s of iceServers) if (!/^stuns?:[A-Za-z0-9.:[\]-]{1,200}$/.test(s)) throw new Error(`invalid ICE server "${s}" (use stun:host[:port] or stuns:host[:port])`)
+  const banned = new Set<string>()
   const peerDiscovery = []
   if (opts.mdns !== false) peerDiscovery.push(mdns())
 
@@ -104,6 +116,13 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     transports: [tcp(), ...(useNat || opts.relayServer ? [circuitRelayTransport()] : [])],
     connectionEncrypters: [noise()],   // Noise XX: authenticated, forward-secret
     streamMuxers: [yamux()],
+    // Operator ban list: refuse dials to, and encrypted connections from, banned peers (and their relay use).
+    connectionGater: {
+      denyDialPeer: (p) => banned.has(p.toString()),
+      denyInboundEncryptedConnection: (p) => banned.has(p.toString()),
+      denyOutboundEncryptedConnection: (p) => banned.has(p.toString()),
+      denyInboundRelayReservation: (p) => banned.has(p.toString())
+    },
     peerDiscovery,
     services
   })
@@ -114,10 +133,18 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const files = new FileStore(blocks, store)
   const sites = new Sites(blocks, files)
   const names = new Names(libp2p, store, blocks, privateKey)
+  const calls = new Calls(libp2p, privateKey)
+  const groups = new Groups(libp2p, store, privateKey)
+  const operator = new Operator(libp2p, store, banned)
+  messaging.on('dropped', (d) => operator.noteDrop('msg', d.reason))
+  calls.on('dropped', (d) => operator.noteDrop('call', d.reason))
+  groups.on('dropped', (d) => operator.noteDrop('group', d.reason))
   store.sweep()
   const sweeper = setInterval(() => store.sweep(), 10 * 60 * 1000)
   sweeper.unref()
   await messaging.start()
+  await calls.start()
+  await groups.start()
   await blocks.start()
   await names.start()
   await libp2p.start()
@@ -137,10 +164,16 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     files,
     sites,
     names,
+    calls,
+    groups,
+    operator,
+    iceServers,
     startedAt: Date.now(),
     stop: async () => {
       clearInterval(sweeper)
       await messaging.stop()
+      await calls.stop()
+      await groups.stop()
       await blocks.stop()
       await names.stop()
       await libp2p.stop()
