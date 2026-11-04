@@ -9,6 +9,7 @@ import { tcp } from '@libp2p/tcp'
 import { createLibp2p } from 'libp2p'
 import type { Libp2p } from '@libp2p/interface'
 import { loadOrCreateIdentity } from './identity.js'
+import { Blocks } from './blocks.js'
 import { Messaging } from './messaging.js'
 import { Store } from './store.js'
 
@@ -25,6 +26,7 @@ export interface FrenetNode {
   libp2p: Libp2p
   store: Store
   messaging: Messaging
+  blocks: Blocks
   startedAt: number
   stop: () => Promise<void>
 }
@@ -62,7 +64,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
 
   const store = new Store(opts.dataDir)
   const messaging = new Messaging(libp2p, store)
+  const blocks = new Blocks(libp2p, store)
   await messaging.start()
+  await blocks.start()
   await libp2p.start()
 
   // Auto-dial discovered peers (mDNS / bootstrap).
@@ -76,9 +80,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     libp2p,
     store,
     messaging,
+    blocks,
     startedAt: Date.now(),
     stop: async () => {
       await messaging.stop()
+      await blocks.stop()
       await libp2p.stop()
       store.close()
     }

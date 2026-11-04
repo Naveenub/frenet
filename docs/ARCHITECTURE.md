@@ -15,8 +15,11 @@ web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts
 - Receiver checks: size <= 32 KB frame / 16 KB body, schema, timestamp within 5 min, unseen `(peer,id)`, token-bucket rate limit (burst 20, 2/s).
 - Messages are not yet signed at the application layer, so they are not verifiable by third parties; they are authenticated only per hop (direct connection).
 
+## Blocks `/frenet/block/1.0.0`
+`put(bytes)` -> sha256 raw CIDv1, stored in SQLite, announced via DHT `provide`. `get(cid)` -> local, else `findProviders`, request the CID, verify sha256 before caching, then re-announce (replication). Cap 1 MB/block. No encryption, retention policy, or chunking of large files yet.
+
 ## Local API (127.0.0.1)
-`GET /api/status|peers|messages|events(SSE)`, `POST /api/send|dial`. Foreign `Host` headers (DNS rebinding) and cross-origin POSTs are rejected; JSON content-type required; strict CSP on static files.
+`GET /api/status|peers|messages|events(SSE)|blocks/<cid>`, `POST /api/send|dial|blocks` (base64 `data`). Foreign `Host` headers (DNS rebinding) and cross-origin POSTs are rejected; JSON content-type required; strict CSP on static files.
 
 ## Known limits
 - No NAT traversal or relays: peers must be directly reachable (LAN, public IP, or forwarded port). Firewalls are not modified.

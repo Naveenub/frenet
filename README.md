@@ -9,7 +9,8 @@ Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 M
 | Ed25519 identity, key stored locally (0600), never transmitted | working |
 | TCP + Noise (forward-secret) + yamux via libp2p | working |
 | Peer discovery: mDNS (LAN) + bootstrap list + manual dial | working (mDNS untested across hosts) |
-| Kademlia DHT service (`/frenet/kad/1.0.0`) | running; no content records yet |
+| Kademlia DHT (`/frenet/kad/1.0.0`) provider records | working, tested (3 nodes, A<->B<->C) |
+| Content-addressed blocks (sha256 CIDs, <=1 MB, hash-verified fetch, replicate-on-fetch) | working; **unencrypted, CID holders can read; client-side encryption not yet** |
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |

@@ -26,6 +26,7 @@ export class Store {
         PRIMARY KEY (id, direction)
       );
       CREATE INDEX IF NOT EXISTS messages_peer_ts ON messages (peer, ts);
+      CREATE TABLE IF NOT EXISTS blocks (cid TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL);
     `)
   }
 
@@ -47,6 +48,25 @@ export class Store {
     const out = { in: 0, out: 0 }
     for (const r of rows) out[r.direction as 'in' | 'out'] = Number(r.n)
     return out
+  }
+
+  putBlock (cid: string, data: Uint8Array): void {
+    this.db.prepare('INSERT OR IGNORE INTO blocks (cid, data, ts) VALUES (?, ?, ?)').run(cid, data, Date.now())
+  }
+
+  getBlock (cid: string): Uint8Array | null {
+    const r = this.db.prepare('SELECT data FROM blocks WHERE cid = ?').get(cid) as { data: Uint8Array } | undefined
+    return r ? new Uint8Array(r.data) : null
+  }
+
+  blockStats (): { count: number, bytes: number } {
+    const r = this.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(data)),0) AS b FROM blocks').get() as { n: number, b: number }
+    return { count: Number(r.n), bytes: Number(r.b) }
+  }
+
+  deleteBlock (cid: string): void {
+    this.db.prepare('DELETE FROM blocks WHERE cid = ?').run(cid)
+    this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */

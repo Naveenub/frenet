@@ -56,6 +56,16 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1'): Prom
         req.on('close', () => clients.delete(res))
         return
       }
+      if (req.method === 'POST' && url.pathname === '/api/blocks') {
+        const b = await body(req)
+        const r = await n.blocks.put(Buffer.from(String(b.data ?? ''), 'base64'))
+        return json(res, 200, r)
+      }
+      if (req.method === 'GET' && url.pathname.startsWith('/api/blocks/')) {
+        const data = await n.blocks.get(decodeURIComponent(url.pathname.slice('/api/blocks/'.length)))
+        if (!data) return json(res, 404, { error: 'no provider returned this block' })
+        return json(res, 200, { data: Buffer.from(data).toString('base64') })
+      }
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
         const r = await n.messaging.send(peerIdFromString(String(b.peer)), String(b.body ?? ''))
@@ -126,6 +136,7 @@ async function status (n: FrenetNode): Promise<unknown> {
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),
+    blocks: n.store.blockStats(),
     privacy: {
       transportEncryption: 'Noise XX (ChaCha20-Poly1305), forward secret',
       identity: 'Ed25519, key stored locally only',

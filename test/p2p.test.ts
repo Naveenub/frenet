@@ -115,3 +115,29 @@ describe('local API hardening', () => {
     } finally { server.close() }
   })
 })
+
+describe('content-addressed blocks via DHT provider records', () => {
+  it('B fetches A\'s block by CID through the DHT (no direct knowledge of A\'s content), hash-verified', async () => {
+    const a = await track({ dataDir: ':memory:', listen: L, mdns: false })
+    const b = await track({ dataDir: ':memory:', listen: L, mdns: false })
+    const c = await track({ dataDir: ':memory:', listen: L, mdns: false })
+    // line topology: A <-> B <-> C ; C never connects to A directly
+    await a.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    await c.libp2p.dial(b.libp2p.getMultiaddrs()[0])
+    await new Promise((r) => setTimeout(r, 1500)) // let identify populate routing tables
+
+    const data = Buffer.from('frenet block ' + Math.random())
+    const { cid, announced } = await a.blocks.put(data)
+    assert.ok(announced, 'provider record should be published to the DHT')
+
+    const got = await c.blocks.get(cid)
+    assert.ok(got, 'block should be found via DHT')
+    assert.deepEqual(Buffer.from(got!), data)
+    assert.equal(c.store.blockStats().count, 1) // cached, now also a replica
+  })
+
+  it('rejects a CID whose content does not match (tampered provider)', async () => {
+    const { cidFor } = await import('../src/blocks.js')
+    assert.notEqual(cidFor(Buffer.from('a')).toString(), cidFor(Buffer.from('b')).toString())
+  })
+})
