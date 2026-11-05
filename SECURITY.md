@@ -26,3 +26,11 @@ frenet restore ~/frenet.archive                 # also accepts a key-only backup
 **Credentials.** VC-JWTs are verified offline against the issuer's DID (or key log), with `alg` pinned to EdDSA, expiry honoured, and presentations bound to a verifier-supplied nonce. A credential proves what the issuer signed, not that the issuer is trustworthy: which DIDs to trust is the verifier's job.
 - **Revocation** is signed by the issuer, pushed to connected peers when issued, announced as DHT provider records, and pulled by verifiers (`verify` looks for it unless `offline`). *Absence is not proof:* a verifier that cannot reach a provider learns nothing, so "valid" means "not known revoked". The lookup tells DHT neighbours which credential you are checking; use `offline` to avoid that.
 - Share arithmetic uses table lookups (not constant time). Run split/restore on a machine you control. Running any of these with a node live on the same data directory is unsupported.
+
+## Known limits
+- **Unaudited crypto code:** the Shamir code and the key log have not been independently audited. That is a Phase 4 item (`docs/ROADMAP.md`, `docs/AUDIT.md`).
+- **Lost keys:** if you lose both the current key and the pre-committed next key, there is no recovery. A plain `did:key` without `rotation-init` still cannot be recovered from theft.
+- **Stolen-key signatures:** a stolen old key can still sign things dated before the rotation (`iat` is signer-claimed). Verifiers should use the `strict` option.
+- **Revocation lookup:** failing to find a revocation is not proof that none exists, and the lookup tells DHT neighbours which credential you are checking (use `offline` to avoid that).
+- **Names:** names and the peer ID change after a rotation, so names must be republished.
+- **File links:** file keys are only kept for files you chose to remember. Lose the link to any other file and the file is gone.
