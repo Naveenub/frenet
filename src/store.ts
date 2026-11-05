@@ -23,6 +23,12 @@ export interface CredentialRow { id: string, role: 'issued' | 'held', issuer: st
 
 export interface FileRow { cid: string, name: string, size: number, chunks: string[], encrypted: boolean, created: number, expires: number | null }
 
+/** `parent` is '' for an entry the operator added, else `<kind>:<target>` of the entry whose blocking pulled this one in. */
+export interface ContentBlockRow { kind: string, target: string, parent: string, reason: string, ts: number }
+export type ReportStatus = 'open' | 'blocked' | 'dismissed'
+/** A locally filed content report. The signature covers everything except `status`, which is local workflow state. */
+export interface ReportRow { id: string, kind: string, target: string, category: string, note: string, ts: number, reporter: string, sig: string, status: ReportStatus }
+
 /** Local-first message store (SQLite). Nothing here is ever uploaded. */
 export class Store {
   private db: DatabaseSync
@@ -51,6 +57,10 @@ export class Store {
       CREATE TABLE IF NOT EXISTS reputation (peer TEXT PRIMARY KEY, score REAL NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL, strikes INTEGER NOT NULL, blocked_until INTEGER, last_reason TEXT NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL, ts INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
+      CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL CHECK (kind IN ('cid','name','publisher')), target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, target, parent));
+      CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
+      CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','blocked','dismissed')));
+      CREATE INDEX IF NOT EXISTS reports_ts ON reports (ts);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     for (const c of ['sig', 'sender', 'recipient']) {
@@ -89,6 +99,16 @@ export class Store {
   getBlock (cid: string): Uint8Array | null {
     const r = this.db.prepare('SELECT data FROM blocks WHERE cid = ? AND (expires IS NULL OR expires > ?)').get(cid, Date.now()) as { data: Uint8Array } | undefined
     return r ? new Uint8Array(r.data) : null
+  }
+
+  hasBlock (cid: string): boolean { return !!this.db.prepare('SELECT 1 FROM blocks WHERE cid = ?').get(cid) }
+
+  /**
+   * CIDs of every block still held (not expired), pinned blocks first, for re-announcing on the DHT.
+   * Ids only: the data is not read.
+   */
+  listBlockCids (now = Date.now()): string[] {
+    return (this.db.prepare('SELECT cid FROM blocks WHERE expires IS NULL OR expires > ? ORDER BY (expires IS NULL) DESC, ts ASC').all(now) as Array<{ cid: string }>).map((r) => r.cid)
   }
 
   blockStats (): { count: number, bytes: number } {
@@ -149,6 +169,37 @@ export class Store {
   listNames (ownOnly = false): Array<{ record: NameRecord, seq: number, own: boolean }> {
     const rows = this.db.prepare(`SELECT * FROM names ${ownOnly ? 'WHERE own = 1' : ''} ORDER BY seen DESC`).all() as any[]
     return rows.map((r) => ({ record: JSON.parse(r.record), seq: Number(r.seq), own: !!r.own }))
+  }
+
+  deleteName (name: string, pub: string): void { this.db.prepare('DELETE FROM names WHERE name = ? AND pub = ?').run(name, pub) }
+
+  /** Operator content blocklist (see Moderation). Idempotent per (kind, target, parent). */
+  addContentBlock (kind: string, target: string, parent: string, reason: string): void {
+    this.db.prepare('INSERT OR IGNORE INTO content_blocks (kind, target, parent, reason, ts) VALUES (?, ?, ?, ?, ?)').run(kind, target, parent, reason, Date.now())
+  }
+  listContentBlocks (): ContentBlockRow[] {
+    return (this.db.prepare('SELECT * FROM content_blocks ORDER BY ts DESC').all() as any[]).map((r) => ({ kind: r.kind, target: r.target, parent: r.parent, reason: r.reason, ts: Number(r.ts) }))
+  }
+  /** Remove an entry the operator added together with everything it pulled in. True if the entry itself existed. */
+  removeContentBlock (kind: string, target: string): boolean {
+    const own = Number(this.db.prepare("DELETE FROM content_blocks WHERE kind = ? AND target = ? AND parent = ''").run(kind, target).changes) > 0
+    this.db.prepare('DELETE FROM content_blocks WHERE parent = ?').run(`${kind}:${target}`)
+    return own
+  }
+
+  addReport (r: ReportRow): void {
+    this.db.prepare('INSERT INTO reports (id, kind, target, category, note, ts, reporter, sig, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.id, r.kind, r.target, r.category, r.note, r.ts, r.reporter, r.sig, r.status)
+  }
+  private report (r: any): ReportRow { return { id: r.id, kind: r.kind, target: r.target, category: r.category, note: r.note, ts: Number(r.ts), reporter: r.reporter, sig: r.sig, status: r.status } }
+  getReport (id: string): ReportRow | null { const r = this.db.prepare('SELECT * FROM reports WHERE id = ?').get(id); return r ? this.report(r) : null }
+  listReports (limit = 500): ReportRow[] { return (this.db.prepare('SELECT * FROM reports ORDER BY ts DESC LIMIT ?').all(limit) as any[]).map((r) => this.report(r)) }
+  countReports (): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM reports').get() as any).n) }
+  setReportStatus (id: string, status: ReportStatus): boolean { return Number(this.db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, id).changes) > 0 }
+  /** Close every open report about this target (used when the target gets blocked). */
+  closeOpenReports (kind: string, target: string, status: ReportStatus): void { this.db.prepare("UPDATE reports SET status = ? WHERE kind = ? AND target = ? AND status = 'open'").run(status, kind, target) }
+  deleteOldestResolvedReports (n: number): void {
+    this.db.prepare("DELETE FROM reports WHERE id IN (SELECT id FROM reports WHERE status != 'open' ORDER BY ts ASC LIMIT ?)").run(n)
   }
 
   addBan (peer: string, reason: string): void { this.db.prepare('INSERT OR REPLACE INTO bans (peer, reason, ts) VALUES (?, ?, ?)').run(peer, reason, Date.now()) }

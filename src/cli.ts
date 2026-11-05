@@ -24,6 +24,7 @@ const { values } = parseArgs({
     'api-port': { type: 'string', default: '7777' },
     'quota-mb': { type: 'string', default: '1024' },
     'replica-ttl-days': { type: 'string', default: '7' },
+    'reannounce-hours': { type: 'string', default: '12' },
     relay: { type: 'string', multiple: true },
     'relay-server': { type: 'boolean', default: false },
     announce: { type: 'string', multiple: true },
@@ -41,8 +42,9 @@ const { values } = parseArgs({
 })
 
 if (values.help) {
-  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--no-quic] [--min-identity-bits N] [--max-peers-per-subnet N] [--no-auto-ban] [--gateway-port N] [--no-gateway] [--no-mdns]
+  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--reannounce-hours N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--no-quic] [--min-identity-bits N] [--max-peers-per-subnet N] [--no-auto-ban] [--gateway-port N] [--no-gateway] [--no-mdns]
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777
+  --reannounce-hours N: announce every stored block on the DHT again at start-up and every N hours (default 12, 0 = never).
   QUIC is on by default (udp, /quic-v1) next to TCP. --min-identity-bits N refuses peers whose key lacks N bits of work (see: frenet identity mine --bits N).
   secure updates: frenet update keygen | manifest | sign | verify   (frenet update --help)
   identity & recovery (node stopped): frenet identity | backup --out FILE | restore FILE | recovery split -k K -n N | recovery restore [SHARE...]   (frenet <cmd> --help)`)
@@ -64,7 +66,8 @@ const node = await startFrenet({
   announce: values.announce,
   iceServers: values['ice-server'],
   quotaBytes: Number(values['quota-mb']) * 1024 * 1024,
-  replicaTtlMs: Number(values['replica-ttl-days']) * 86_400_000
+  replicaTtlMs: Number(values['replica-ttl-days']) * 86_400_000,
+  reannounceMs: Number(values['reannounce-hours']) * 3_600_000
 })
 const gateway = values['no-gateway'] ? null : await startGateway(node, Number(values['gateway-port']))
 const api = await startApi(node, Number(values['api-port']), '127.0.0.1', gateway?.port)

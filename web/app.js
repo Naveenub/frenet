@@ -19,7 +19,7 @@ const SECTIONS = [
   ['overview', 'Network Overview'], ['peers', 'Connected Peers'], ['messages', 'Private Communications'],
   ['communities', 'Communities'], ['storage', 'Distributed Storage'], ['browser', 'Decentralized Browser'],
   ['identity', 'Identity and Keys'], ['nodes', 'Network Nodes'],
-  ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['governance', 'Community Governance']
+  ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['safety', 'Content Safety'], ['governance', 'Community Governance']
 ]
 const state = { view: 'overview', status: null, peers: [], dropped: [], chat: [], stop: null }
 
@@ -39,7 +39,7 @@ function go (id) {
   const v = $('#view'); v.replaceChildren()
   const meta = SECTIONS.find((s) => s[0] === id)
   if (meta[2]) return v.append(el('div', { className: 'card' }, el('h3', {}, 'Not built yet'), el('p', { className: 'dim' }, `This section is planned for ${meta[2]}. Nothing here is simulated.`)))
-  ;({ overview, peers, messages, communities, storage, browser, identity, nodes, privacy, security, governance })[id](v)
+  ;({ overview, peers, messages, communities, storage, browser, identity, nodes, privacy, security, safety, governance })[id](v)
 }
 
 function stat (label, value) { return el('div', { className: 'stat' }, el('b', {}, String(value)), el('span', {}, label)) }
@@ -129,7 +129,7 @@ const b64 = (buf) => { let s = ''; const u = new Uint8Array(buf); for (let i = 0
 
 async function storage (v) {
   const b = state.status.blocks
-  v.append(el('div', { className: 'grid' }, stat('Local blocks', b.count), stat('Used', mb(b.bytes) + ' of ' + mb(b.quotaBytes)), stat('Your files', state.status.files), stat('Replica lifetime', b.replicaTtlDays + ' days')))
+  v.append(el('div', { className: 'grid' }, stat('Local blocks', b.count), stat('Used', mb(b.bytes) + ' of ' + mb(b.quotaBytes)), stat('Your files', state.status.files), stat('Replica lifetime', b.replicaTtlDays + ' days'), stat('Last re-announce', b.lastReannounce ? ago(Date.now() - b.lastReannounce.at) + ' ago' : 'not yet')))
 
   const pick = el('input', { type: 'file', 'aria-label': 'File to add' })
   const enc = el('input', { type: 'checkbox', checked: true, id: 'enc' })
@@ -221,7 +221,8 @@ function browser (v) {
     } catch (e) { msg.textContent = e.message } finally { pub.disabled = false }
   } }, 'Publish site')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Publish a site'), el('p', { className: 'dim' }, 'Static files only (max 64 files, 32 MB). Each site gets its own isolated origin and can only load its own files: no third-party requests, no tracking. A name is yours alone: it is tied to your identity key, signed, and can be updated by publishing again under the same name.'),
-    el('div', { className: 'row' }, pick), el('div', { className: 'row' }, name, title), el('div', { className: 'row' }, kws), el('div', { className: 'row' }, ttl, pub), msg, out))
+    el('div', { className: 'row' }, pick), el('div', { className: 'row' }, name, title), el('div', { className: 'row' }, kws), el('div', { className: 'row' }, ttl, pub), msg, out,
+    el('p', { className: 'dim' }, 'What you publish is stored and served by other people’s nodes. Do not publish anything illegal or abusive: node operators can report it and block it (see Content Safety), and a block cannot be undone from your side.')))
 
   const link = el('input', { placeholder: 'frenet-name://my-blog.… or frenet-site://bafk…', 'aria-label': 'Site link' }); const omsg = el('p', { className: 'err' })
   const open = el('button', { className: 'btn', type: 'button', onclick: () => {
@@ -244,7 +245,8 @@ function browser (v) {
           el('h3', {}, h.title || h.name),
           el('p', {}, el('a', { href: `http://${h.name}.${h.pub}.localhost:${gw}/`, target: '_blank', rel: 'noopener noreferrer' }, h.name), h.own ? ' (yours)' : ''),
           el('div', { className: 'mono' }, h.link),
-          el('p', { className: 'dim' }, `version ${h.seq} · ${h.keywords.join(', ')}`)))
+          el('p', { className: 'dim' }, `version ${h.seq} · ${h.keywords.join(', ')}`),
+          h.own ? '' : el('button', { className: 'btn', type: 'button', onclick: () => { state.report = { kind: 'name', target: h.link }; go('safety') } }, 'Report')))
       }
     } catch (e) { smsg.textContent = ''; sres.append(el('p', { className: 'err' }, e.message)) }
   }
@@ -489,7 +491,9 @@ async function nodes (v) {
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Relay and retention'),
     el('p', {}, s.nat.relayServer ? 'Relay server: on (up to 64 reservations, 2 min / 2 MiB per relayed connection).' : 'Relay server: off. Start with --relay-server on a publicly reachable address to help NATed peers.'),
     el('p', { className: 'dim' }, `NAT traversal ${s.nat.enabled ? 'on' : 'off'} · ${s.nat.relayedAddresses.length} relayed address(es) · replicas expire after ${s.blocks.replicaTtlDays} days`),
-    el('div', { className: 'row' }, btn('Sweep expired data now', async () => { const r = await api('/api/operator/sweep', {}); $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'dim top' }, `Removed ${r.removed} expired block(s).`)) }))))
+    el('p', { className: 'dim' }, s.blocks.reannounceHours > 0 ? `Stored blocks are announced to the network again at start-up and every ${s.blocks.reannounceHours} h, so content stays findable after a restart or while its publisher is offline.` : 'Re-announcing is off (--reannounce-hours 0): content is only findable until the network forgets it.'),
+    el('div', { className: 'row' }, btn('Sweep expired data now', async () => { const r = await api('/api/operator/sweep', {}); $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'dim top' }, `Removed ${r.removed} expired block(s).`)) }),
+      btn('Re-announce stored blocks now', async () => { const r = await api('/api/operator/reannounce', {}); await refresh(); $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'dim top' }, `Announced ${r.ok} of ${r.total} stored block(s).`)) }))))
 
   const reason = el('input', { placeholder: 'ban reason (optional)', maxLength: 200, 'aria-label': 'Ban reason' })
   const t = el('table', {}, el('thead', {}, el('tr', {}, ...['Peer', 'Direction', 'Route', 'Latency', ''].map((h) => el('th', {}, h)))))
@@ -509,6 +513,61 @@ async function nodes (v) {
 
   const dk = Object.entries(o.drops)
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Rejected traffic (since start)'), dk.length ? el('table', {}, el('tbody', {}, ...dk.sort((a, b) => b[1] - a[1]).map(([k, n]) => el('tr', {}, el('td', {}, k), el('td', {}, String(n)))))) : el('p', { className: 'dim' }, 'Nothing rejected.')))
+}
+
+const CATEGORY_LABEL = { illegal: 'Illegal content', 'child-safety': 'Child safety', malware: 'Malware', phishing: 'Phishing or scam', harassment: 'Harassment', spam: 'Spam', other: 'Other' }
+const KIND_LABEL = { cid: 'File, site or block (content ID)', name: 'Name', publisher: 'Publisher key' }
+
+async function safety (v) {
+  const m = await api('/api/moderation')
+  if (state.note) { v.append(el('p', { className: 'dim' }, state.note)); state.note = '' }
+  v.append(el('div', { className: 'grid' }, stat('Blocklist entries', m.blocklist.length), stat('Open reports', m.reports.filter((r) => r.status === 'open').length)))
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'You host what you store'),
+    el('p', { className: 'dim' }, 'This node stores and serves content other people published, and nobody else can take it down for you. A block applies to this node only: it deletes the local copies, stops advertising them, and refuses to store, fetch, serve or open the same content again (matching is by exact hash, so an altered copy needs its own block). Nothing is sent anywhere: reports stay on this device. If you find illegal content, child sexual abuse material above all, also report it to your national hotline (see inhope.org) and to the authorities where the law requires it, and do not copy or forward the content itself.')))
+
+  const pre = state.report; state.report = null
+  const kind = el('select', { 'aria-label': 'What you are reporting' }, ...Object.entries(KIND_LABEL).map(([k, l]) => el('option', { value: k, selected: pre?.kind === k }, l)))
+  const cat = el('select', { 'aria-label': 'Category' }, ...m.categories.map((c) => el('option', { value: c }, CATEGORY_LABEL[c] ?? c)))
+  const target = el('input', { placeholder: 'frenet://…  frenet-site://…  frenet-name://name.key  or a publisher key', value: pre?.target ?? '', 'aria-label': 'Link or ID' })
+  const note = el('textarea', { rows: 2, maxLength: 500, placeholder: 'what you saw (optional). Do not paste decryption keys or the content itself.', 'aria-label': 'Note' })
+  const also = el('input', { type: 'checkbox', checked: true, style: 'flex:none' })
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Report content'),
+    el('div', { className: 'row' }, kind, cat), el('div', { className: 'row' }, target), el('div', { className: 'row' }, note),
+    el('label', { className: 'row' }, also, 'Also block it on this node now (deletes local copies, including the files of a site)'),
+    el('p', { className: 'dim' }, 'A file link’s #key part is dropped, so a decryption key is never saved. Reports are signed by this node’s identity, so you can pass one on and others can check it is genuine.'),
+    el('div', { className: 'row' }, btn('File report', async () => {
+      const r = await api('/api/moderation/report', { kind: kind.value, target: target.value, category: cat.value, note: note.value, block: also.checked })
+      state.note = r.purged === null ? 'Report filed.' : `Report filed and blocked: ${r.purged} stored block(s) deleted.`
+      go('safety')
+    }))))
+
+  const rt = el('table', {}, el('thead', {}, el('tr', {}, ...['When', 'Type', 'Target', 'Category', 'Note', 'Status', ''].map((h) => el('th', {}, h)))))
+  const rb = el('tbody'); rt.append(rb)
+  for (const r of m.reports) {
+    const acts = el('div', { className: 'row', style: 'margin:0' })
+    if (r.status === 'open') {
+      acts.append(
+        btn('Block', async () => {
+          if (!confirm('Block this on your node? Local copies are deleted and cannot be restored except by fetching them again after you unblock.')) return
+          const x = await api('/api/moderation/resolve', { id: r.id, action: 'block' })
+          state.note = `Blocked: ${x.purged} stored block(s) deleted.`; go('safety')
+        }),
+        btn('Dismiss', async () => { await api('/api/moderation/resolve', { id: r.id, action: 'dismiss' }); go('safety') }))
+    }
+    acts.append(el('button', { className: 'btn', type: 'button', onclick: async (e) => {
+      try { await navigator.clipboard.writeText(JSON.stringify(r, null, 2)); e.target.textContent = 'Copied' } catch { e.target.textContent = 'Copy failed' }
+    } }, 'Copy signed report'))
+    rb.append(el('tr', {}, el('td', {}, new Date(r.ts).toLocaleString()), el('td', {}, r.kind), el('td', { className: 'mono' }, r.target), el('td', {}, CATEGORY_LABEL[r.category] ?? r.category), el('td', {}, r.note || '–'), el('td', {}, r.status), el('td', {}, acts)))
+  }
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Reports'), m.reports.length ? rt : el('p', { className: 'dim' }, 'No reports. Use Report on a search result, or the form above.')))
+
+  const bt = el('table', {}, el('thead', {}, el('tr', {}, ...['Type', 'Blocked', 'Reason', 'Since', 'Also covers', ''].map((h) => el('th', {}, h)))))
+  const bb = el('tbody'); bt.append(bb)
+  for (const b of m.blocklist) {
+    bb.append(el('tr', {}, el('td', {}, b.kind), el('td', { className: 'mono' }, b.target), el('td', {}, b.reason || '–'), el('td', {}, new Date(b.ts).toLocaleString()), el('td', {}, b.derived ? `${b.derived} related item(s)` : '–'),
+      el('td', {}, btn('Unblock', async () => { await api('/api/moderation/unblock', { kind: b.kind, target: b.target }); go('safety') }))))
+  }
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Blocklist'), m.blocklist.length ? bt : el('p', { className: 'dim' }, 'Nothing blocked. The blocklist is stored on this node and survives restarts. Unblocking lifts the entry and everything it pulled in, but deleted data is gone until it is fetched again.')))
 }
 
 async function refresh () {

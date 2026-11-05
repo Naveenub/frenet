@@ -2,8 +2,9 @@ import { publicKeyFromRaw } from '@libp2p/crypto/keys'
 import type { Libp2p, PeerId, PrivateKey } from '@libp2p/interface'
 import { base32 } from 'multiformats/bases/base32'
 import { CID } from 'multiformats/cid'
-import { cidFor, type Blocks } from './blocks.js'
+import { cidFor, ContentBlocked, type Blocks } from './blocks.js'
 import { RateLimiter } from './messaging.js'
+import type { Moderation } from './moderation.js'
 import type { ReputationEvent } from './reputation.js'
 import { validCid } from './sites.js'
 import type { Store } from './store.js'
@@ -121,7 +122,7 @@ export class Names {
   /** Set by the node: told which provider served a valid or a forged record. */
   report: (peer: string, event: ReputationEvent, detail?: string) => void = () => {}
 
-  constructor (private node: Libp2p, private store: Store, private blocks: Blocks, private key: PrivateKey) {
+  constructor (private node: Libp2p, private store: Store, private blocks: Blocks, private key: PrivateKey, private moderation: Moderation) {
     this.publisherKey = pubToB32(key.publicKey.raw)
   }
 
@@ -135,9 +136,9 @@ export class Names {
         const req = JSON.parse(Buffer.concat(chunks).toString('utf8'))
         let out: unknown = null
         if (req?.k === 'name' && typeof req.name === 'string' && NAME_RE.test(req.name) && validPub(req.pub)) {
-          out = this.store.getName(req.name, req.pub)?.record ?? null
+          out = this.allowed(this.store.getName(req.name, req.pub)?.record)
         } else if (req?.k === 'kw' && typeof req.word === 'string' && KEYWORD_RE.test(req.word)) {
-          out = this.store.listNames().filter((r) => r.record.keywords.includes(req.word)).slice(0, KW_RESULTS).map((r) => r.record)
+          out = this.store.listNames().filter((r) => r.record.keywords.includes(req.word) && this.allowed(r.record)).slice(0, KW_RESULTS).map((r) => r.record)
         } else { stream.abort(new Error('bad request')); return }
         stream.send(Buffer.from(JSON.stringify(out)))
         await stream.close()
@@ -157,6 +158,7 @@ export class Names {
   async publish (name: string, target: string, opts: { title?: unknown, keywords?: unknown } = {}): Promise<{ record: NameRecord, link: string, announced: boolean }> {
     if (!NAME_RE.test(name)) throw new Error('invalid name (1-63 chars: a-z, 0-9, hyphen; not starting/ending with a hyphen)')
     if (!validCid(target)) throw new Error('invalid site id')
+    if (this.moderation.nameBlocked(name, this.publisherKey, target)) throw new ContentBlocked('this name or site')
     const title = cleanTitle(opts.title)
     const keywords = cleanKeywords(opts.keywords)
     const pub = this.publisherKey
@@ -177,13 +179,15 @@ export class Names {
   private async accept (x: unknown): Promise<NameRecord | null> {
     const rec = await validateRecord(x)
     if (!rec) return null
-    this.store.putName(rec, false)
+    // A valid record the operator has blocked is simply not kept (and not held against the peer that sent it).
+    if (!this.moderation.nameBlocked(rec.name, rec.pub, rec.target)) this.store.putName(rec, false)
     return rec
   }
 
   /** Latest record for a name. Asks the network (highest seq wins) and falls back to our cached copy. */
   async resolve (name: string, pub: string, opts: { fresh?: boolean } = {}): Promise<NameRecord> {
     if (!NAME_RE.test(name) || !validPub(pub)) throw new Error('invalid name')
+    if (this.moderation.nameBlocked(name, pub)) throw new ContentBlocked('this name')
     const k = `${name}.${pub}`
     const hit = this.cache.get(k)
     if (hit && !opts.fresh && Date.now() - hit.at < RESOLVE_CACHE_MS) return hit.rec
@@ -191,6 +195,7 @@ export class Names {
     const remote = pub === this.publisherKey ? null : await this.fetchFromNetwork(name, pub, 6000).catch(() => null)
     const best = remote && (!local || remote.seq > local.seq) ? remote : local
     if (!best) throw new NameNotFound()
+    if (this.moderation.nameBlocked(name, pub, best.target)) throw new ContentBlocked('the site this name points to')
     this.cache.set(k, { rec: best, at: Date.now() })
     return best
   }
@@ -225,6 +230,11 @@ export class Names {
     } catch { return null }
   }
 
+  /** The record itself if the operator has not blocked it (by name, publisher or target site), else null. */
+  private allowed (rec: NameRecord | null | undefined): NameRecord | null {
+    return rec && !this.moderation.nameBlocked(rec.name, rec.pub, rec.target) ? rec : null
+  }
+
   async announce (rec: NameRecord): Promise<boolean> {
     let ok = true
     for (const cid of [nameKeyCid(rec.name, rec.pub), ...rec.keywords.map(keywordCid)]) {
@@ -234,7 +244,7 @@ export class Names {
   }
 
   private async reannounceOwn (): Promise<void> {
-    for (const r of this.store.listNames(true)) await this.announce(r.record)
+    for (const r of this.store.listNames(true)) if (this.allowed(r.record)) await this.announce(r.record)
   }
 
   /**
@@ -259,7 +269,7 @@ export class Names {
             for (const x of list.slice(0, KW_RESULTS)) {
               const rec = await validateRecord(x)
               this.report(prov.id.toString(), rec?.keywords.includes(w) ? 'valid-record' : 'bad-record', 'keyword search')
-              if (rec?.keywords.includes(w)) this.store.putName(rec, false)
+              if (rec?.keywords.includes(w) && this.allowed(rec)) this.store.putName(rec, false)
             }
           }
         } catch { /* partial results are fine */ }
@@ -267,13 +277,13 @@ export class Names {
     }
     const hay = (r: NameRecord): string => `${r.name} ${r.title.toLowerCase()} ${r.keywords.join(' ')}`
     return this.store.listNames()
-      .filter((r) => words.every((w) => hay(r.record).includes(w)))
+      .filter((r) => this.allowed(r.record) && words.every((w) => hay(r.record).includes(w)))
       .sort((a, b) => Number(b.own) - Number(a.own) || b.record.ts - a.record.ts)
       .slice(0, 50)
       .map((r) => ({ ...r.record, link: nameLink(r.record.name, r.record.pub), own: r.own }))
   }
 
   list (): NameHit[] {
-    return this.store.listNames().map((r) => ({ ...r.record, link: nameLink(r.record.name, r.record.pub), own: r.own }))
+    return this.store.listNames().filter((r) => this.allowed(r.record)).map((r) => ({ ...r.record, link: nameLink(r.record.name, r.record.pub), own: r.own }))
   }
 }

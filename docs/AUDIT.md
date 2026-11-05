@@ -5,7 +5,7 @@
 ## What to commission
 1. **Protocol and cryptography review** of the signed wire formats and key handling: `src/messaging.ts`, `calls.ts`, `groups.ts`, `names.ts`, `channel.ts` (domain-separated Ed25519 signatures, replay/skew windows), `credentials.ts` and `did.ts` (VC-JWT, algorithm pinning), `recovery.ts` (scrypt backup, hand-written Shamir over GF(2^8); the SECURITY.md notes it is not constant time), `updates.ts` (threshold signatures, rollback/freeze rules).
 2. **Network abuse and denial of service**: rate limiters, frame caps, store growth caps (names 5000, reputation 10,000, invitations 50), the connection gater (`node.ts`), reputation, subnet limits and proof-of-work (`sybil.ts`, `reputation.ts`). Include an eclipse-attack and Sybil analysis of the DHT usage (provider records only, no value store).
-3. **Local attack surface**: the loopback HTTP API and dashboard (`api.ts`, `web/`) for DNS rebinding, CSRF, XSS; the site gateway (`gateway.ts`, `sites.ts`) for origin isolation, CSP and path handling.
+3. **Local attack surface**: the loopback HTTP API and dashboard (`api.ts`, `web/`) for DNS rebinding, CSRF, XSS; the site gateway (`gateway.ts`, `sites.ts`) for origin isolation, CSP and path handling; the content blocklist (`moderation.ts`) for paths that store, fetch, serve, announce or render blocked content despite an entry, and for manifest-driven cascade bounds.
 4. **Dependency and supply-chain review**, notably the native QUIC module `@chainsafe/libp2p-quic`, `libp2p` and its transports, and `node:sqlite`.
 5. **Build and release process** once release signing keys exist (key ceremony, who holds what, reproducible builds).
 

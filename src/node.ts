@@ -21,6 +21,7 @@ import { Credentials } from './credentials.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
+import { Moderation } from './moderation.js'
 import { Names } from './names.js'
 import { Operator } from './operator.js'
 import { Reputation, type ReputationEvent, type ReputationOptions } from './reputation.js'
@@ -57,6 +58,10 @@ export interface FrenetOptions {
   reputation?: Partial<ReputationOptions>
   quotaBytes?: number
   replicaTtlMs?: number
+  /** Announce every stored block on the DHT again this often, ms (default 12 h, 0 = never). See RetentionOptions. */
+  reannounceMs?: number
+  /** Delay before the first re-announce after start, ms (default 30 s). */
+  reannounceDelayMs?: number
   /** Only meaningful with dataDir ':memory:' (tests, embedding): use this key instead of a fresh random one. */
   privateKey?: PrivateKey
 }
@@ -72,6 +77,7 @@ export interface FrenetNode {
   calls: Calls
   groups: Groups
   operator: Operator
+  moderation: Moderation
   reputation: Reputation
   sybil: SybilGuard
   credentials: Credentials
@@ -91,6 +97,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     privateKey = (await loadOrCreateIdentity(opts.dataDir)).key
   }
 
+  if (opts.reannounceMs !== undefined && !(Number.isFinite(opts.reannounceMs) && opts.reannounceMs >= 0)) throw new Error('reannounceMs must be a number >= 0 (0 turns re-announcing off)')
   const iceServers = opts.iceServers ?? []
   for (const s of iceServers) if (!/^stuns?:[A-Za-z0-9.:[\]-]{1,200}$/.test(s)) throw new Error(`invalid ICE server "${s}" (use stun:host[:port] or stuns:host[:port])`)
   const banned = new Set<string>()
@@ -165,10 +172,16 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
 
   self = libp2p
   const messaging = new Messaging(libp2p, store, privateKey)
-  const blocks = new Blocks(libp2p, store, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
+  const moderation = new Moderation(store, libp2p, privateKey)
+  const blocks = new Blocks(libp2p, store, moderation, {
+    ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}),
+    ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}),
+    ...(opts.reannounceMs !== undefined ? { reannounceMs: opts.reannounceMs } : {}),
+    ...(opts.reannounceDelayMs !== undefined ? { reannounceDelayMs: opts.reannounceDelayMs } : {})
+  })
   const files = new FileStore(blocks, store)
   const sites = new Sites(blocks, files)
-  const names = new Names(libp2p, store, blocks, privateKey)
+  const names = new Names(libp2p, store, blocks, privateKey, moderation)
   const calls = new Calls(libp2p, privateKey)
   const groups = new Groups(libp2p, store, privateKey)
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
@@ -220,6 +233,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     calls,
     groups,
     operator,
+    moderation,
     reputation,
     sybil,
     credentials,

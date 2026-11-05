@@ -1,5 +1,6 @@
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { CID } from 'multiformats/cid'
+import { ContentBlocked } from './blocks.js'
 import { NameNotFound, NAME_RE, validPub } from './names.js'
 import type { FrenetNode } from './node.js'
 
@@ -46,6 +47,9 @@ function text (res: ServerResponse, code: number, msg: string): void {
   res.end(msg)
 }
 
+/** 451: the operator of this node has chosen not to serve this content (see Moderation). */
+const blocked = (res: ServerResponse): void => text(res, 451, 'This content is blocked by the operator of this node.')
+
 export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): Promise<{ server: Server, port: number }> {
   const server = createServer(async (req, res) => {
     try {
@@ -54,11 +58,16 @@ export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): 
       if (!siteCid && !named) return text(res, 404, 'Open a site at http://<site-id>.localhost:' + port + '/ or http://<name>.<publisher-key>.localhost:' + port + '/')
       if (req.method !== 'GET' && req.method !== 'HEAD') return text(res, 405, 'method not allowed')
       if (!fetchAllowed(req)) return text(res, 403, 'blocked cross-site subresource request')
+      // A blocked name or site is refused before any lookup: no DHT traffic for content the operator has refused.
+      if (named && n.moderation.nameBlocked(named.name, named.pub)) return blocked(res)
+      if (siteCid && n.moderation.isBlocked('cid', siteCid)) return blocked(res)
       // Resolve only after the checks above, so a drive-by request cannot make this node run DHT lookups.
       if (named) {
         try { siteCid = (await n.names.resolve(named.name, named.pub)).target } catch (e) {
+          if (e instanceof ContentBlocked) return blocked(res)
           return text(res, e instanceof NameNotFound ? 404 : 502, (e as Error).message)
         }
+        if (n.moderation.isBlocked('cid', siteCid)) return blocked(res)
       }
       let path: string
       try { path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname) } catch { return text(res, 400, 'bad path') }
@@ -79,6 +88,7 @@ export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): 
       })
       res.end(req.method === 'HEAD' ? undefined : r.data)
     } catch (err) {
+      if (err instanceof ContentBlocked) return blocked(res)   // e.g. one blocked file inside an otherwise fine site
       text(res, 502, (err as Error).message)
     }
   })

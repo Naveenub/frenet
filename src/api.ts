@@ -5,9 +5,10 @@ import { dirname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
-import { DAY_MS } from './blocks.js'
+import { ContentBlocked, DAY_MS } from './blocks.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
+import { REPORT_CATEGORIES } from './moderation.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
 
@@ -158,6 +159,18 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/operator/unban') return json(res, 200, { removed: n.operator.unban((await body(req)).peer) })
       if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/sweep') return json(res, 200, { removed: n.operator.sweep() })
+      if (req.method === 'POST' && url.pathname === '/api/operator/reannounce') return json(res, 200, await n.blocks.reannounce())
+      // Content safety: local reports and the operator's blocklist (see Moderation).
+      if (req.method === 'GET' && url.pathname === '/api/moderation') return json(res, 200, { categories: REPORT_CATEGORIES, blocklist: n.moderation.list(), reports: n.moderation.listReports() })
+      if (req.method === 'POST' && url.pathname === '/api/moderation/report') {
+        const b = await body(req)
+        const report = await n.moderation.report(b)
+        const blocked = b.block === true ? n.moderation.resolve(report.id, 'block') : null
+        return json(res, 200, { report: blocked?.report ?? report, purged: blocked?.purged ?? null })
+      }
+      if (req.method === 'POST' && url.pathname === '/api/moderation/resolve') { const b = await body(req); return json(res, 200, n.moderation.resolve(b.id, b.action, b.reason)) }
+      if (req.method === 'POST' && url.pathname === '/api/moderation/block') { const b = await body(req); return json(res, 200, n.moderation.block(b.kind, b.target, b.reason)) }
+      if (req.method === 'POST' && url.pathname === '/api/moderation/unblock') { const b = await body(req); return json(res, 200, { removed: n.moderation.unblock(b.kind, b.target) }) }
       if (req.method === 'GET' && url.pathname === '/api/communities') return json(res, 200, n.groups.list())
       if (req.method === 'POST' && url.pathname === '/api/communities') { const b = await body(req); return json(res, 200, await n.groups.create(b.name, b.members ?? [])) }
       if (req.method === 'POST' && url.pathname === '/api/communities/members') { const b = await body(req); return json(res, 200, await n.groups.setMembers(String(b.id), b.members)) }
@@ -191,7 +204,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       }
       json(res, 405, { error: 'method not allowed' })
     } catch (err) {
-      json(res, 400, { error: (err as Error).message })
+      json(res, err instanceof ContentBlocked ? 451 : 400, { error: (err as Error).message })
     }
   })
 
@@ -240,7 +253,8 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),
-    blocks: { ...n.store.blockStats(), quotaBytes: n.blocks.retention.quotaBytes, replicaTtlDays: n.blocks.retention.replicaTtlMs / DAY_MS },
+    blocks: { ...n.store.blockStats(), quotaBytes: n.blocks.retention.quotaBytes, replicaTtlDays: n.blocks.retention.replicaTtlMs / DAY_MS, reannounceHours: n.blocks.retention.reannounceMs / 3_600_000, lastReannounce: n.blocks.lastReannounce },
+    moderation: n.moderation.counts(),
     files: n.files.list().length,
     names: { publisher: n.names.publisherKey, known: n.names.list().length },
     privacy: {

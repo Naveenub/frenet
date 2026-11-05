@@ -24,6 +24,8 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Content-addressed blocks (sha256 CIDs, <=1 MB, hash-verified fetch, replicate-on-fetch) | working; raw blocks are readable by CID holders |
 | Files: 256 KB chunks, AES-256-GCM client-side encryption, encrypted manifest, key only in the share link | working, tested (<= 16 MB/file) |
 | Retention: per-file TTL, replicas expire (default 7 d), byte quota (default 1 GiB), sweeper, local delete | working, tested |
+| Re-announcement: every block held locally (own files and sites first, then replicas) is announced on the DHT again at start-up and every 12 h (`--reannounce-hours`), so content stays findable across restarts and while its publisher is offline | working, tested (restart, schedule, blocked/expired skipped); only helps while some node still holds the content |
+| Content safety: signed local content reports, operator blocklist for content IDs, names and publisher keys, purge of local copies, refusal to store/fetch/serve/announce/render blocked content (HTTP 451 at the gateway), dashboard view | working, tested; **local to each node**: nothing is shared or scanned automatically, matching is by exact hash (see Content safety) |
 | Dashboard: Distributed Storage (add, share link, download, delete) | working |
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
@@ -95,7 +97,27 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 - **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
-Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h, but file and site blocks are not re-announced automatically yet, so keep the publishing node online; there is no name transfer or revocation (publish a new record pointing elsewhere).
+Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
+
+### Content safety (reports and blocking)
+
+A node stores and serves other people's data, and there is no central operator who can take anything down, so the tools are per node. Dashboard: **Content Safety** (or **Report** on a search result); API: `/api/moderation/*`.
+
+```bash
+# file a report (stored locally, signed by your node identity); add "block": true to block at the same time
+curl -s localhost:7777/api/moderation/report -H 'content-type: application/json' \
+  -d '{"kind":"cid","target":"frenet-site://bafk...","category":"phishing","note":"fake bank login","block":true}'
+# or block directly: kind is cid (a file, site or block), name (frenet-name://label.key) or publisher (a 52-char key)
+curl -s localhost:7777/api/moderation/block   -H 'content-type: application/json' -d '{"kind":"publisher","target":"<key>","reason":"repeat abuse"}'
+curl -s localhost:7777/api/moderation/unblock -H 'content-type: application/json' -d '{"kind":"publisher","target":"<key>"}'
+curl -s localhost:7777/api/moderation                      # blocklist + reports; GET /api/moderation, POST .../resolve {id, action: block|dismiss}
+```
+
+- **Blocking** deletes this node's copies, stops advertising them, and then refuses to store, fetch, serve, announce or render the same content again. The gateway answers **451**. Blocking a site also blocks its files and chunks that this node holds or can read from a held manifest; blocking a name also blocks the site it points to; blocking a publisher blocks all its names and their sites. Unblocking lifts an entry and everything it pulled in (deleted data is not restored).
+- **Reports** hold identifiers, a category and a short note (max 500 chars), never content bytes and never a file's `#key` (it is stripped from links). Each is signed with the node identity (`verifyReport` in `src/moderation.ts` checks one), so you can hand it to a hotline, a publisher or another operator and they can confirm it is genuine and unaltered. Categories: illegal, child-safety, malware, phishing, harassment, spam, other.
+- **If you find illegal content, child sexual abuse material above all,** also report it to your national hotline (see inhope.org) and to the authorities where the law requires it, and do not copy or forward the content. This tool records and blocks on your node; it does not notify anyone.
+
+Limits: local only (nothing is sent anywhere, no shared or gossiped blocklists, no automatic scanning or detection); matching is by **exact hash**, so a copy with one byte changed is a different CID and needs its own entry; for an encrypted file the hosting node cannot read its content and, unless it published the file itself, cannot list its chunks (they expire with the replica TTL, and the manifest, the only way to find them, is refused); blocking does not remove copies on other nodes, and their provider records for it live up to 48 h; `block`, `unblock` and `resolve` act on this node's own state only and are loopback-only like the rest of the API. This is a safeguard for operators, not legal advice or a compliance programme.
 
 ### Identity, credentials and recovery
 
@@ -131,7 +153,7 @@ capacity-limited (relay default: 2 min / 2 MiB per connection); peers try to upg
 connection with DCUtR hole punching, and UPnP opens a port when the router allows it.
 Use `--announce MULTIADDR` for a manually forwarded port or DNS name, `--no-nat` to disable all of this.
 
-Flags: `--ice-server stun:HOST[:PORT]` (repeatable; for calls across NATs, none by default so no third party learns your IP), `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--gateway-port N`, `--no-gateway`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
+Flags: `--ice-server stun:HOST[:PORT]` (repeatable; for calls across NATs, none by default so no third party learns your IP), `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--gateway-port N`, `--no-gateway`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--reannounce-hours N` (12, 0 = never), `--no-mdns`.
 
 ## Test
 
