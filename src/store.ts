@@ -19,15 +19,29 @@ export type CommunityState = 'invited' | 'joined' | 'removed' | 'left'
 export interface CommunityRow { id: string, owner: string, name: string, seq: number, members: string[], state: CommunityState, updated: number }
 export interface GroupEventRow { community: string, id: string, kind: string, author: string, ts: number, body: string, sig: string, meta: string | null }
 
+/** What the full archive carries: column -> 's' string, 'n' number, trailing '?' nullable. Anything else stays out. */
+const ARCHIVE_TABLES: Record<string, { cols: Record<string, string>, where?: string }> = {
+  messages: { cols: { id: 's', peer: 's', direction: 's', ts: 'n', body: 's', sig: 's?', sender: 's?', recipient: 's?' } },
+  files: { cols: { cid: 's', name: 's', size: 'n', chunks: 's', encrypted: 'n', created: 'n', expires: 'n?' } },
+  file_links: { cols: { cid: 's', link: 's', created: 'n' } },
+  names: { cols: { name: 's', pub: 's', seq: 'n', own: 'n', seen: 'n', record: 's' }, where: 'own = 1' },
+  communities: { cols: { id: 's', owner: 's', name: 's', seq: 'n', members: 's', state: 's', updated: 'n' } },
+  group_events: { cols: { community: 's', id: 's', kind: 's', author: 's', ts: 'n', body: 's', sig: 's', meta: 's?' } },
+  credentials: { cols: { id: 's', role: 's', issuer: 's', subject: 's', type: 's', issued: 'n', expires: 'n?', jwt: 's' } },
+  revocations: { cols: { issuer: 's', id: 's', ts: 'n', own: 'n', jwt: 's' } },
+  identity_logs: { cols: { id: 's', seq: 'n', own: 'n', updated: 'n', events: 's' }, where: 'own = 1' },
+  bans: { cols: { peer: 's', reason: 's', ts: 'n' } }
+}
+
+export type ReportStatus = 'open' | 'dismissed' | 'blocked'
+export interface ReportRow { id: string, kind: string, target: string, category: string, note: string, ts: number, reporter: string, sig: string, status: ReportStatus }
+/** parent '' = added by the operator; otherwise 'kind:target' of the entry this row was pulled in by. */
+export interface ContentBlockRow { kind: string, target: string, parent: string, reason: string, ts: number }
+export interface UpdateStateRow { channel: string, seq: number, version: string }
+
 export interface CredentialRow { id: string, role: 'issued' | 'held', issuer: string, subject: string, type: string, issued: number, expires: number | null, jwt: string }
 
 export interface FileRow { cid: string, name: string, size: number, chunks: string[], encrypted: boolean, created: number, expires: number | null }
-
-/** `parent` is '' for an entry the operator added, else `<kind>:<target>` of the entry whose blocking pulled this one in. */
-export interface ContentBlockRow { kind: string, target: string, parent: string, reason: string, ts: number }
-export type ReportStatus = 'open' | 'blocked' | 'dismissed'
-/** A locally filed content report. The signature covers everything except `status`, which is local workflow state. */
-export interface ReportRow { id: string, kind: string, target: string, category: string, note: string, ts: number, reporter: string, sig: string, status: ReportStatus }
 
 /** Local-first message store (SQLite). Nothing here is ever uploaded. */
 export class Store {
@@ -54,13 +68,15 @@ export class Store {
       CREATE TABLE IF NOT EXISTS group_events (community TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, author TEXT NOT NULL, ts INTEGER NOT NULL, body TEXT NOT NULL, sig TEXT NOT NULL, meta TEXT, PRIMARY KEY (community, id));
       CREATE INDEX IF NOT EXISTS group_events_ts ON group_events (community, kind, ts);
       CREATE TABLE IF NOT EXISTS credentials (id TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('issued','held')), issuer TEXT NOT NULL, subject TEXT NOT NULL, type TEXT NOT NULL, issued INTEGER NOT NULL, expires INTEGER, jwt TEXT NOT NULL, PRIMARY KEY (id, role));
-      CREATE TABLE IF NOT EXISTS reputation (peer TEXT PRIMARY KEY, score REAL NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL, strikes INTEGER NOT NULL, blocked_until INTEGER, last_reason TEXT NOT NULL, updated INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL, ts INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
-      CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL CHECK (kind IN ('cid','name','publisher')), target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, target, parent));
+      CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
+      CREATE TABLE IF NOT EXISTS file_links (cid TEXT PRIMARY KEY, link TEXT NOT NULL, created INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS identity_logs (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL, events TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL, target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL, PRIMARY KEY (kind, target));
       CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
-      CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','blocked','dismissed')));
-      CREATE INDEX IF NOT EXISTS reports_ts ON reports (ts);
+      CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('open','dismissed','blocked')));
+      CREATE INDEX IF NOT EXISTS reports_target ON reports (kind, target, status);
+      CREATE TABLE IF NOT EXISTS reputation (peer TEXT PRIMARY KEY, score REAL NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL, strikes INTEGER NOT NULL, blocked_until INTEGER, last_reason TEXT NOT NULL, updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     for (const c of ['sig', 'sender', 'recipient']) {
@@ -101,20 +117,18 @@ export class Store {
     return r ? new Uint8Array(r.data) : null
   }
 
-  hasBlock (cid: string): boolean { return !!this.db.prepare('SELECT 1 FROM blocks WHERE cid = ?').get(cid) }
-
-  /**
-   * CIDs of every block still held (not expired), pinned blocks first, for re-announcing on the DHT.
-   * Ids only: the data is not read.
-   */
-  listBlockCids (now = Date.now()): string[] {
-    return (this.db.prepare('SELECT cid FROM blocks WHERE expires IS NULL OR expires > ? ORDER BY (expires IS NULL) DESC, ts ASC').all(now) as Array<{ cid: string }>).map((r) => r.cid)
-  }
-
   blockStats (): { count: number, bytes: number } {
     const r = this.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(data)),0) AS b FROM blocks').get() as { n: number, b: number }
     return { count: Number(r.n), bytes: Number(r.b) }
   }
+
+  /** CIDs of every live (unexpired) block, kept-until-deleted ones first. */
+  listBlockCids (now = Date.now()): string[] {
+    return (this.db.prepare('SELECT cid FROM blocks WHERE expires IS NULL OR expires > ? ORDER BY (expires IS NULL) DESC, ts ASC').all(now) as Array<{ cid: string }>).map((r) => r.cid)
+  }
+
+  /** True if a row exists for this CID, expired or not (what a purge actually has to delete). */
+  hasBlock (cid: string): boolean { return !!this.db.prepare('SELECT 1 FROM blocks WHERE cid = ?').get(cid) }
 
   deleteBlock (cid: string, compact = true): void {
     this.db.prepare('DELETE FROM blocks WHERE cid = ?').run(cid)
@@ -171,36 +185,7 @@ export class Store {
     return rows.map((r) => ({ record: JSON.parse(r.record), seq: Number(r.seq), own: !!r.own }))
   }
 
-  deleteName (name: string, pub: string): void { this.db.prepare('DELETE FROM names WHERE name = ? AND pub = ?').run(name, pub) }
-
-  /** Operator content blocklist (see Moderation). Idempotent per (kind, target, parent). */
-  addContentBlock (kind: string, target: string, parent: string, reason: string): void {
-    this.db.prepare('INSERT OR IGNORE INTO content_blocks (kind, target, parent, reason, ts) VALUES (?, ?, ?, ?, ?)').run(kind, target, parent, reason, Date.now())
-  }
-  listContentBlocks (): ContentBlockRow[] {
-    return (this.db.prepare('SELECT * FROM content_blocks ORDER BY ts DESC').all() as any[]).map((r) => ({ kind: r.kind, target: r.target, parent: r.parent, reason: r.reason, ts: Number(r.ts) }))
-  }
-  /** Remove an entry the operator added together with everything it pulled in. True if the entry itself existed. */
-  removeContentBlock (kind: string, target: string): boolean {
-    const own = Number(this.db.prepare("DELETE FROM content_blocks WHERE kind = ? AND target = ? AND parent = ''").run(kind, target).changes) > 0
-    this.db.prepare('DELETE FROM content_blocks WHERE parent = ?').run(`${kind}:${target}`)
-    return own
-  }
-
-  addReport (r: ReportRow): void {
-    this.db.prepare('INSERT INTO reports (id, kind, target, category, note, ts, reporter, sig, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(r.id, r.kind, r.target, r.category, r.note, r.ts, r.reporter, r.sig, r.status)
-  }
-  private report (r: any): ReportRow { return { id: r.id, kind: r.kind, target: r.target, category: r.category, note: r.note, ts: Number(r.ts), reporter: r.reporter, sig: r.sig, status: r.status } }
-  getReport (id: string): ReportRow | null { const r = this.db.prepare('SELECT * FROM reports WHERE id = ?').get(id); return r ? this.report(r) : null }
-  listReports (limit = 500): ReportRow[] { return (this.db.prepare('SELECT * FROM reports ORDER BY ts DESC LIMIT ?').all(limit) as any[]).map((r) => this.report(r)) }
-  countReports (): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM reports').get() as any).n) }
-  setReportStatus (id: string, status: ReportStatus): boolean { return Number(this.db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, id).changes) > 0 }
-  /** Close every open report about this target (used when the target gets blocked). */
-  closeOpenReports (kind: string, target: string, status: ReportStatus): void { this.db.prepare("UPDATE reports SET status = ? WHERE kind = ? AND target = ? AND status = 'open'").run(status, kind, target) }
-  deleteOldestResolvedReports (n: number): void {
-    this.db.prepare("DELETE FROM reports WHERE id IN (SELECT id FROM reports WHERE status != 'open' ORDER BY ts ASC LIMIT ?)").run(n)
-  }
+  deleteName (name: string, pub: string): boolean { return Number(this.db.prepare('DELETE FROM names WHERE name = ? AND pub = ?').run(name, pub).changes) > 0 }
 
   addBan (peer: string, reason: string): void { this.db.prepare('INSERT OR REPLACE INTO bans (peer, reason, ts) VALUES (?, ?, ?)').run(peer, reason, Date.now()) }
   removeBan (peer: string): boolean { return Number(this.db.prepare('DELETE FROM bans WHERE peer = ?').run(peer).changes) > 0 }
@@ -240,37 +225,158 @@ export class Store {
   deleteCredential (id: string, role: 'issued' | 'held'): boolean { return Number(this.db.prepare('DELETE FROM credentials WHERE id = ? AND role = ?').run(id, role).changes) > 0 }
   private credential (r: any): CredentialRow { return { id: r.id, role: r.role, issuer: r.issuer, subject: r.subject, type: r.type, issued: Number(r.issued), expires: r.expires == null ? null : Number(r.expires), jwt: r.jwt } }
 
-  addRevocation (issuer: string, id: string, jwt: string): boolean {
-    return Number(this.db.prepare('INSERT OR IGNORE INTO revocations (issuer, id, ts, jwt) VALUES (?, ?, ?, ?)').run(issuer, id, Date.now(), jwt).changes) > 0
+  /** Foreign statements are capped (oldest dropped) so a flood of valid statements cannot grow the DB forever. */
+  addRevocation (issuer: string, id: string, jwt: string, own = false): boolean {
+    const r = this.db.prepare('INSERT OR IGNORE INTO revocations (issuer, id, ts, own, jwt) VALUES (?, ?, ?, ?, ?)').run(issuer, id, Date.now(), own ? 1 : 0, jwt)
+    if (!own) this.db.prepare('DELETE FROM revocations WHERE own = 0 AND rowid NOT IN (SELECT rowid FROM revocations WHERE own = 0 ORDER BY ts DESC LIMIT 10000)').run()
+    return Number(r.changes) > 0
   }
+  getRevocation (issuer: string, id: string): string | null { return ((this.db.prepare('SELECT jwt FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) as any)?.jwt as string | undefined) ?? null }
   isRevoked (issuer: string, id: string): boolean { return !!this.db.prepare('SELECT 1 FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) }
   listRevocations (): Array<{ issuer: string, id: string, ts: number, jwt: string }> {
     return (this.db.prepare('SELECT * FROM revocations ORDER BY ts DESC').all() as any[]).map((r) => ({ issuer: r.issuer, id: r.id, ts: Number(r.ts), jwt: r.jwt }))
   }
 
-  putReputation (r: PeerReputation): void {
-    this.db.prepare('INSERT OR REPLACE INTO reputation (peer, score, good, bad, strikes, blocked_until, last_reason, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
-      .run(r.peer, r.score, r.good, r.bad, r.strikes, r.blockedUntil, r.lastReason, r.updated)
+  /** Identity (key event) logs: a log only ever grows; foreign logs are capped. */
+  putIdentityLog (id: string, seq: number, events: string, own: boolean): void {
+    this.db.prepare(`INSERT INTO identity_logs (id, seq, own, updated, events) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET seq = excluded.seq, events = excluded.events, updated = excluded.updated, own = MAX(identity_logs.own, excluded.own)
+      WHERE excluded.seq > identity_logs.seq`).run(id, seq, own ? 1 : 0, Date.now(), events)
+    if (!own) this.db.prepare('DELETE FROM identity_logs WHERE own = 0 AND rowid NOT IN (SELECT rowid FROM identity_logs WHERE own = 0 ORDER BY updated DESC LIMIT 2000)').run()
   }
-  deleteReputation (peer: string): void { this.db.prepare('DELETE FROM reputation WHERE peer = ?').run(peer) }
-  listReputation (): PeerReputation[] {
-    return (this.db.prepare('SELECT * FROM reputation').all() as any[]).map((r) => ({ peer: r.peer, score: Number(r.score), good: Number(r.good), bad: Number(r.bad), strikes: Number(r.strikes), blockedUntil: r.blocked_until == null ? null : Number(r.blocked_until), lastReason: r.last_reason, updated: Number(r.updated) }))
+  getIdentityLog (id: string): { id: string, seq: number, own: boolean, events: any[] } | null {
+    const r = this.db.prepare('SELECT * FROM identity_logs WHERE id = ?').get(id) as any
+    return r ? { id: r.id, seq: Number(r.seq), own: !!r.own, events: JSON.parse(r.events) } : null
+  }
+  listIdentityLogs (ownOnly = false): Array<{ id: string, seq: number, own: boolean }> {
+    return (this.db.prepare(`SELECT id, seq, own FROM identity_logs ${ownOnly ? 'WHERE own = 1' : ''} ORDER BY updated DESC`).all() as any[]).map((r) => ({ id: r.id, seq: Number(r.seq), own: !!r.own }))
   }
 
-  /** Highest update manifest sequence accepted per channel (rollback protection). */
-  getUpdateState (channel: string): { seq: number, version: string, ts: number } | null {
-    const r = this.db.prepare('SELECT * FROM update_state WHERE channel = ?').get(channel) as any
-    return r ? { seq: Number(r.seq), version: r.version, ts: Number(r.ts) } : null
+  /** Opt-in: a file's full link (including its decryption key) kept locally so it survives a restore from archive. */
+  addFileLink (cid: string, link: string): void { this.db.prepare('INSERT OR REPLACE INTO file_links (cid, link, created) VALUES (?, ?, ?)').run(cid, link, Date.now()) }
+  getFileLink (cid: string): string | null { return ((this.db.prepare('SELECT link FROM file_links WHERE cid = ?').get(cid) as any)?.link as string | undefined) ?? null }
+  deleteFileLink (cid: string): void { this.db.prepare('DELETE FROM file_links WHERE cid = ?').run(cid) }
+
+  /** Own, non-recoverable-elsewhere data for the full archive. Columns are an explicit allow-list per table. */
+  exportTables (): Record<string, Array<Record<string, string | number | null>>> {
+    const out: Record<string, Array<Record<string, string | number | null>>> = {}
+    for (const [t, spec] of Object.entries(ARCHIVE_TABLES)) {
+      out[t] = this.db.prepare(`SELECT ${Object.keys(spec.cols).join(', ')} FROM ${t}${spec.where ? ' WHERE ' + spec.where : ''}`).all() as any
+    }
+    return out
   }
-  putUpdateState (channel: string, seq: number, version: string): void {
-    this.db.prepare('INSERT INTO update_state (channel, seq, version, ts) VALUES (?, ?, ?, ?) ON CONFLICT(channel) DO UPDATE SET seq = excluded.seq, version = excluded.version, ts = excluded.ts WHERE excluded.seq > update_state.seq')
-      .run(channel, seq, version, Date.now())
+
+  /**
+   * Merge archived rows (duplicates skipped: existing data wins) in one transaction. Every row is type-checked against the
+   * allow-list and the table's own constraints; any bad row rolls back everything. Returns rows added per table.
+   */
+  importTables (tables: unknown): Record<string, number> {
+    if (typeof tables !== 'object' || tables === null) throw new Error('corrupt archive: no tables')
+    const added: Record<string, number> = {}
+    this.db.exec('BEGIN')
+    try {
+      for (const [t, spec] of Object.entries(ARCHIVE_TABLES)) {
+        const rows = (tables as any)[t]
+        if (rows === undefined) continue
+        if (!Array.isArray(rows)) throw new Error(`corrupt archive: ${t}`)
+        const cols = Object.keys(spec.cols)
+        // ON CONFLICT DO NOTHING skips duplicates only; OR IGNORE would also silently swallow CHECK/NOT NULL violations
+        const stmt = this.db.prepare(`INSERT INTO ${t} (${cols.join(', ')}) VALUES (${cols.map(() => '?').join(', ')}) ON CONFLICT DO NOTHING`)
+        let n = 0
+        for (const r of rows) {
+          if (typeof r !== 'object' || r === null) throw new Error(`corrupt archive: ${t} row`)
+          const vals = cols.map((c) => {
+            const v = r[c]; const kind = spec.cols[c]!
+            if (v === null || v === undefined) { if (!kind.endsWith('?')) throw new Error(`corrupt archive: ${t}.${c} missing`); return null }
+            if (kind.startsWith('s') ? typeof v !== 'string' : (typeof v !== 'number' || !Number.isFinite(v))) throw new Error(`corrupt archive: ${t}.${c} has the wrong type`)
+            return v as string | number
+          })
+          n += Number(stmt.run(...vals).changes)
+        }
+        added[t] = n
+      }
+      this.db.exec('COMMIT')
+    } catch (e) { try { this.db.exec('ROLLBACK') } catch { /* already rolled back */ } throw e }
+    return added
+  }
+
+  /** Blocks worth archiving: kept-until-deleted ones and every chunk/manifest of a local file (not mere replicas). */
+  ownBlocks (): Array<{ cid: string, data: Uint8Array, expires: number | null }> {
+    const keep = this.referencedChunks()
+    for (const f of this.listFiles()) keep.add(f.cid)
+    return (this.db.prepare('SELECT cid, data, expires FROM blocks').all() as any[])
+      .filter((b) => b.expires == null || keep.has(b.cid))
+      .map((b) => ({ cid: b.cid, data: new Uint8Array(b.data), expires: b.expires == null ? null : Number(b.expires) }))
   }
 
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */
   deletePeer (peer: string): void {
     this.db.prepare('DELETE FROM messages WHERE peer = ?').run(peer)
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
+  }
+
+  /**
+   * Blocklist. An operator entry has parent ''; rows it pulled in carry 'kind:target' of that entry. Adding an entry
+   * directly upgrades a row that was only derived; a derived add never downgrades an operator entry.
+   */
+  addContentBlock (kind: string, target: string, parent: string, reason: string): void {
+    this.db.prepare(`INSERT INTO content_blocks (kind, target, parent, reason, ts) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(kind, target) DO UPDATE SET parent = '', reason = excluded.reason, ts = excluded.ts WHERE excluded.parent = ''`)
+      .run(kind, target, parent, reason, Date.now())
+  }
+  /** Newest first. */
+  listContentBlocks (): ContentBlockRow[] {
+    return (this.db.prepare('SELECT kind, target, parent, reason, ts FROM content_blocks ORDER BY ts DESC, rowid DESC').all() as any[])
+      .map((r) => ({ kind: r.kind, target: r.target, parent: r.parent, reason: r.reason, ts: Number(r.ts) }))
+  }
+  /** Lift an operator entry and every row it pulled in. False if there was no such operator entry. */
+  removeContentBlock (kind: string, target: string): boolean {
+    const r = this.db.prepare("DELETE FROM content_blocks WHERE kind = ? AND target = ? AND parent = ''").run(kind, target)
+    if (Number(r.changes) === 0) return false
+    this.db.prepare('DELETE FROM content_blocks WHERE parent = ?').run(`${kind}:${target}`)
+    return true
+  }
+
+  addReport (r: ReportRow): void {
+    this.db.prepare('INSERT INTO reports (id, kind, target, category, note, ts, reporter, sig, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.id, r.kind, r.target, r.category, r.note, r.ts, r.reporter, r.sig, r.status)
+  }
+  getReport (id: string): ReportRow | null { return (this.db.prepare('SELECT * FROM reports WHERE id = ?').get(id) as unknown as ReportRow | undefined) ?? null }
+  /** Newest first. */
+  listReports (limit = 1000): ReportRow[] {
+    return (this.db.prepare('SELECT * FROM reports ORDER BY ts DESC, rowid DESC LIMIT ?').all(limit) as any[]).map((r) => ({ ...r, ts: Number(r.ts) }) as ReportRow)
+  }
+  countReports (): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM reports').get() as any).n) }
+  setReportStatus (id: string, status: ReportStatus): boolean { return Number(this.db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, id).changes) > 0 }
+  /** Close every open report about a target. Returns how many were closed. */
+  closeOpenReports (kind: string, target: string, status: Exclude<ReportStatus, 'open'>): number {
+    return Number(this.db.prepare("UPDATE reports SET status = ? WHERE kind = ? AND target = ? AND status = 'open'").run(status, kind, target).changes)
+  }
+  /** Drop the n oldest resolved (not open) reports. Returns how many were dropped. */
+  deleteOldestResolvedReports (n: number): number {
+    return Number(this.db.prepare("DELETE FROM reports WHERE id IN (SELECT id FROM reports WHERE status != 'open' ORDER BY ts ASC, rowid ASC LIMIT ?)").run(n).changes)
+  }
+
+  listReputation (): PeerReputation[] {
+    return (this.db.prepare('SELECT * FROM reputation').all() as any[]).map((r) => ({
+      peer: r.peer, score: Number(r.score), good: Number(r.good), bad: Number(r.bad), strikes: Number(r.strikes),
+      blockedUntil: r.blocked_until == null ? null : Number(r.blocked_until), lastReason: r.last_reason, updated: Number(r.updated)
+    }))
+  }
+  putReputation (r: PeerReputation): void {
+    this.db.prepare('INSERT OR REPLACE INTO reputation (peer, score, good, bad, strikes, blocked_until, last_reason, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.peer, r.score, r.good, r.bad, r.strikes, r.blockedUntil, r.lastReason, r.updated)
+  }
+  deleteReputation (peer: string): void { this.db.prepare('DELETE FROM reputation WHERE peer = ?').run(peer) }
+
+  /** Highest accepted release per channel; a lower seq never overwrites it. */
+  getUpdateState (channel: string): UpdateStateRow | null {
+    const r = this.db.prepare('SELECT * FROM update_state WHERE channel = ?').get(channel) as any
+    return r ? { channel: r.channel, seq: Number(r.seq), version: r.version } : null
+  }
+  putUpdateState (channel: string, seq: number, version: string): void {
+    this.db.prepare(`INSERT INTO update_state (channel, seq, version) VALUES (?, ?, ?)
+      ON CONFLICT(channel) DO UPDATE SET seq = excluded.seq, version = excluded.version WHERE excluded.seq >= update_state.seq`).run(channel, seq, version)
   }
 
   close (): void { this.db.close() }

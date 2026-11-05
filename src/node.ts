@@ -1,8 +1,8 @@
 import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
-import { quic } from '@chainsafe/libp2p-quic'
 import { autoNAT } from '@libp2p/autonat'
 import { bootstrap } from '@libp2p/bootstrap'
+import { quic } from '@chainsafe/libp2p-quic'
 import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 import { dcutr } from '@libp2p/dcutr'
 import { identify } from '@libp2p/identify'
@@ -12,22 +12,26 @@ import { ping } from '@libp2p/ping'
 import { tcp } from '@libp2p/tcp'
 import { uPnPNAT } from '@libp2p/upnp-nat'
 import { createLibp2p } from 'libp2p'
+import { base32 } from 'multiformats/bases/base32'
 import { peerIdFromString } from '@libp2p/peer-id'
-import type { Libp2p, PrivateKey } from '@libp2p/interface'
+import type { Libp2p, PeerId, PrivateKey } from '@libp2p/interface'
 import { loadOrCreateIdentity } from './identity.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
 import { Credentials } from './credentials.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
+import { IdentityLogs, verifyLog, type IdentityState } from './identity-log.js'
+import { Reputation, type ReputationOptions } from './reputation.js'
+import { Revocations } from './revocations.js'
+import { readIdentityLog } from './recovery.js'
 import { Messaging } from './messaging.js'
 import { Moderation } from './moderation.js'
 import { Names } from './names.js'
 import { Operator } from './operator.js'
-import { Reputation, type ReputationEvent, type ReputationOptions } from './reputation.js'
 import { Sites } from './sites.js'
 import { Store } from './store.js'
-import { meetsIdentityWork, SybilGuard } from './sybil.js'
+import { MAX_IDENTITY_BITS, meetsIdentityWork, SybilGuard } from './sybil.js'
 
 export interface FrenetOptions {
   dataDir: string | ':memory:'
@@ -47,23 +51,23 @@ export interface FrenetOptions {
   announce?: string[]
   /** STUN servers (`stun:host[:port]`) handed to the dashboard's WebRTC calls. None by default: calls then work on LAN/public addresses only and no third party learns your IP. */
   iceServers?: string[]
-  /** QUIC transport (UDP, `/quic-v1`) next to TCP. Default true. When `listen` is not given, a QUIC listener is added. */
-  quic?: boolean
-  /** Refuse peers whose key lacks this many bits of identity proof-of-work (see `frenet identity mine`). Default 0 (off). */
-  minIdentityBits?: number
-  /** At most this many distinct peers per IPv4 /24 (IPv6 /48) at once; loopback/LAN/relayed are exempt. Default 8, 0 disables. */
-  maxPeersPerSubnet?: number
-  /** Block peers whose reputation falls below the threshold. Default true; false still scores peers but never blocks. */
-  autoBan?: boolean
-  reputation?: Partial<ReputationOptions>
   quotaBytes?: number
   replicaTtlMs?: number
-  /** Announce every stored block on the DHT again this often, ms (default 12 h, 0 = never). See RetentionOptions. */
-  reannounceMs?: number
-  /** Delay before the first re-announce after start, ms (default 30 s). */
-  reannounceDelayMs?: number
-  /** Only meaningful with dataDir ':memory:' (tests, embedding): use this key instead of a fresh random one. */
+  /** Only meaningful with dataDir ':memory:' (tests). */
+  ephemeralIdentity?: boolean
+  /** Identity key to run with. Only meaningful with dataDir ':memory:' (tests); a data directory always uses its own stored key. */
   privateKey?: PrivateKey
+  /** Listen and dial over QUIC (quic-v1) as well as TCP. Default true. */
+  quic?: boolean
+  /** Refuse peers whose identity key carries fewer than this many bits of proof-of-work (see sybil.ts). 0 = off (default). */
+  minIdentityBits?: number
+  /** At most this many distinct connected peers per IPv4 /24 (IPv6 /48); loopback, LAN and relayed addresses are exempt. Default 8. */
+  maxPerSubnet?: number
+  /** How often every held block is announced on the DHT again; 0 turns it off. Default 12 h. */
+  reannounceMs?: number
+  /** Wait this long after start before the first re-announce. Default 30 s. */
+  reannounceDelayMs?: number
+  reputation?: Partial<ReputationOptions>
 }
 
 export interface FrenetNode {
@@ -74,22 +78,38 @@ export interface FrenetNode {
   files: FileStore
   sites: Sites
   names: Names
-  calls: Calls
-  groups: Groups
-  operator: Operator
   moderation: Moderation
   reputation: Reputation
   sybil: SybilGuard
+  calls: Calls
+  groups: Groups
+  operator: Operator
   credentials: Credentials
-  /** did:key of this node's identity (same key as the peer ID). */
+  identityLogs: IdentityLogs
+  revocations: Revocations
+  /** Key event log of a rotatable identity (did:frenet), if one was set up with `frenet identity rotation-init`. */
+  identity: IdentityState | null
+  /** Primary DID: did:frenet if the identity has a key log, else the did:key of the identity key. */
   did: string
+  /** did:key of the current identity key (same key as the peer ID). */
+  keyDid: string
   iceServers: string[]
   startedAt: number
   stop: () => Promise<void>
 }
 
+/** Peer ID at the end of a multiaddr (`.../p2p/<id>`), if any. */
+const peerOf = (addr: string): string | null => /\/p2p\/([^/]+)(?:\/p2p-circuit)?$/.exec(addr)?.[1] ?? null
+
 export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
-  let privateKey
+  for (const k of ['reannounceMs', 'reannounceDelayMs'] as const) {
+    const v = opts[k]
+    if (v !== undefined && (typeof v !== 'number' || !Number.isFinite(v) || v < 0)) throw new Error(`${k} must be a number >= 0 (0 turns re-announcing off)`)
+  }
+  const minBits = opts.minIdentityBits ?? 0
+  if (!Number.isInteger(minBits) || minBits < 0 || minBits > MAX_IDENTITY_BITS) throw new Error(`minIdentityBits must be an integer 0..${MAX_IDENTITY_BITS}`)
+
+  let privateKey: PrivateKey
   if (opts.dataDir === ':memory:') {
     const { generateKeyPair } = await import('@libp2p/crypto/keys')
     privateKey = opts.privateKey ?? await generateKeyPair('Ed25519')
@@ -97,22 +117,30 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     privateKey = (await loadOrCreateIdentity(opts.dataDir)).key
   }
 
-  if (opts.reannounceMs !== undefined && !(Number.isFinite(opts.reannounceMs) && opts.reannounceMs >= 0)) throw new Error('reannounceMs must be a number >= 0 (0 turns re-announcing off)')
+  // Optional key event log (rotatable did:frenet identity). It must end in the key this node runs with.
+  let identity: IdentityState | null = null
+  if (opts.dataDir !== ':memory:') {
+    const events = readIdentityLog(opts.dataDir)
+    if (events) {
+      identity = await verifyLog(events)
+      if (identity.key !== base32.baseEncode(privateKey.publicKey.raw)) {
+        throw new Error('identity-log.json does not end in this node\'s identity key: restore the matching key (or the log) before starting')
+      }
+    }
+  }
+
   const iceServers = opts.iceServers ?? []
   for (const s of iceServers) if (!/^stuns?:[A-Za-z0-9.:[\]-]{1,200}$/.test(s)) throw new Error(`invalid ICE server "${s}" (use stun:host[:port] or stuns:host[:port])`)
   const banned = new Set<string>()
+  const useQuic = opts.quic !== false
+  const sybil = new SybilGuard({ maxPerSubnet: opts.maxPerSubnet ?? 8, clusterSize: 6, windowMs: 3_600_000 })
   const store = new Store(opts.dataDir)
-  const reputation = new Reputation(store, { ...(opts.autoBan === false ? { banThreshold: -Infinity } : {}), ...opts.reputation })
-  const minBits = opts.minIdentityBits ?? 0
-  const maxPerSubnet = opts.maxPeersPerSubnet ?? 8
-  const sybil = new SybilGuard({ maxPerSubnet: maxPerSubnet > 0 ? maxPerSubnet : Infinity, clusterSize: 6, windowMs: 3_600_000 })
-  let self: Libp2p | null = null
+  const reputation = new Reputation(store, opts.reputation)
   const peerDiscovery = []
   if (opts.mdns !== false) peerDiscovery.push(mdns())
 
   const useNat = opts.nat !== false
   const relays = opts.relays ?? []
-  const useQuic = opts.quic !== false
   const listen = [...(opts.listen ?? ['/ip4/0.0.0.0/tcp/0', ...(useQuic ? ['/ip4/0.0.0.0/udp/0/quic-v1'] : [])])]
   // Reserve a slot on each configured relay; with none configured, let libp2p
   // discover relays among connected peers that run the hop protocol.
@@ -120,10 +148,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   if (useNat && relays.length === 0) listen.push('/p2p-circuit')
   // Bootstrap peers and relays are dialed at startup (relays so the reservation can be made).
   const boot = [...(opts.bootstrap ?? []), ...relays]
-  // Operator-chosen bootstrap/relay peers are exempt from the proof-of-work rule and from auto-blocking (still scored).
-  for (const a of boot) { const m = /\/p2p\/([^/]+)/.exec(a); if (m) reputation.trusted.add(m[1]!) }
-  const refused = (p: { toString: () => string }): boolean => banned.has(p.toString()) || reputation.isBlocked(p.toString())
-  const workOk = (p: { toString: () => string, publicKey?: { raw: Uint8Array } }): boolean => reputation.trusted.has(p.toString()) || meetsIdentityWork(p.publicKey?.raw, minBits)
+  for (const a of boot) { const p = peerOf(a); if (p) reputation.trusted.add(p) }   // operator-chosen peers are scored but never auto-blocked
   if (boot.length) peerDiscovery.push(bootstrap({ list: boot }))
 
   const services: Record<string, any> = {
@@ -147,30 +172,36 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     })
   }
 
-  const libp2p = await createLibp2p({
-    privateKey,
-    addresses: { listen, ...(opts.announce?.length ? { announce: opts.announce } : {}) },
-    transports: [tcp(), ...(useQuic ? [quic()] : []), ...(useNat || opts.relayServer ? [circuitRelayTransport()] : [])],
-    connectionEncrypters: [noise()],   // Noise XX: authenticated, forward-secret
-    streamMuxers: [yamux()],
-    // Refuse banned or auto-blocked peers, peers whose identity lacks the required proof-of-work, and (inbound)
-    // peers beyond the per-subnet diversity limit. The peer ID is known only after the handshake.
-    connectionGater: {
-      denyDialPeer: (p) => refused(p),
-      denyInboundEncryptedConnection: (p, c) => {
-        if (refused(p) || !workOk(p)) return true
-        if (reputation.trusted.has(p.toString())) return false
-        const inbound = (self?.getConnections() ?? []).filter((x) => x.direction === 'inbound').map((x) => ({ peer: x.remotePeer.toString(), addr: x.remoteAddr.toString() }))
-        return !sybil.admit(p.toString(), c.remoteAddr.toString(), inbound)
-      },
-      denyOutboundEncryptedConnection: (p) => refused(p) || !workOk(p),
-      denyInboundRelayReservation: (p) => refused(p)
-    },
-    peerDiscovery,
-    services
-  })
+  // One verdict for every gate: operator ban, reputation block, or an identity key that is too cheap.
+  const libp2pRef: { current: Libp2p | null } = { current: null }
+  const refused = (p: PeerId): boolean => banned.has(p.toString()) || reputation.isBlocked(p.toString()) || !meetsIdentityWork((p as any).publicKey?.raw, minBits)
+  const connected = (): Array<{ peer: string, addr: string }> => libp2pRef.current?.getConnections().map((c) => ({ peer: c.remotePeer.toString(), addr: c.remoteAddr.toString() })) ?? []
+  const crowded = (p: PeerId, addr: { toString: () => string }): boolean => !sybil.admit(p.toString(), addr.toString(), connected())
 
-  self = libp2p
+  let libp2p: Libp2p
+  try {
+    libp2p = await createLibp2p({
+      privateKey,
+      addresses: { listen, ...(opts.announce?.length ? { announce: opts.announce } : {}) },
+      transports: [tcp(), ...(useQuic ? [quic()] : []), ...(useNat || opts.relayServer ? [circuitRelayTransport()] : [])],
+      connectionEncrypters: [noise()],   // Noise XX: authenticated, forward-secret (QUIC brings its own TLS 1.3)
+      streamMuxers: [yamux()],
+      // Refuse dials to, and connections from, banned or blocked peers, cheap identities and crowded subnets (and relay use).
+      // QUIC skips the encrypter/muxer upgrade, so the "upgraded" hooks are what cover it.
+      connectionGater: {
+        denyDialPeer: (p) => refused(p),
+        denyInboundEncryptedConnection: (p, m) => refused(p) || crowded(p, m.remoteAddr),
+        denyOutboundEncryptedConnection: (p) => refused(p),
+        denyInboundUpgradedConnection: (p, m) => refused(p) || crowded(p, m.remoteAddr),
+        denyOutboundUpgradedConnection: (p) => refused(p),
+        denyInboundRelayReservation: (p) => refused(p)
+      },
+      peerDiscovery,
+      services
+    })
+  } catch (e) { store.close(); throw e }
+  libp2pRef.current = libp2p
+
   const messaging = new Messaging(libp2p, store, privateKey)
   const moderation = new Moderation(store, libp2p, privateKey)
   const blocks = new Blocks(libp2p, store, moderation, {
@@ -185,25 +216,29 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const calls = new Calls(libp2p, privateKey)
   const groups = new Groups(libp2p, store, privateKey)
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
-  const credentials = new Credentials(store, privateKey)
-  // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
-  const report = (peer: string, ev: ReputationEvent, detail = ''): void => {
-    if (reputation.record(peer, ev, detail)) { void libp2p.hangUp(peerIdFromString(peer)).catch(() => {}) }
-  }
-  const dropped = (proto: string) => (d: { peer: string, reason: string }): void => {
-    operator.noteDrop(proto, d.reason)
-    if (reputation.noteDrop(d.peer, d.reason)) void libp2p.hangUp(peerIdFromString(d.peer)).catch(() => {})
-  }
-  messaging.on('dropped', dropped('msg'))
-  calls.on('dropped', dropped('call'))
-  groups.on('dropped', dropped('group'))
-  messaging.on('message', (m) => report(m.peer, 'valid-message'))
-  blocks.report = report
-  names.report = report
+  const identityLogs = new IdentityLogs(libp2p, store)
+  if (identity) await identityLogs.adopt(identity.events, true)
+  // Credentials and Revocations need each other's verification, so the network side is attached after both exist.
+  const revocationsRef: { current: Revocations | null } = { current: null }
+  const credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, get revocations () { return revocationsRef.current ?? undefined } })
+  const revocations = new Revocations(libp2p, store, credentials.checkRevocation)
+  revocationsRef.current = revocations
+  // Reputation: only misbehaviour this node can prove is scored. A peer that crosses the threshold is disconnected here
+  // and refused by the connection gater from then on.
+  const hangUp = (peer: string): void => { void libp2p.hangUp(peerIdFromString(peer)).catch(() => {}) }
+  const score = (peer: string, event: Parameters<Reputation['record']>[1], detail?: string): void => { if (reputation.record(peer, event, detail)) hangUp(peer) }
+  const punish = (peer: string, reason: string): void => { if (reputation.noteDrop(peer, reason)) hangUp(peer) }
+  blocks.report = score
+  names.report = score
+  messaging.on('message', (m) => score(m.peer, 'valid-message'))
+  messaging.on('dropped', (d) => { operator.noteDrop('msg', d.reason); punish(d.peer, d.reason) })
+  calls.on('dropped', (d) => { operator.noteDrop('call', d.reason); punish(d.peer, d.reason) })
+  groups.on('dropped', (d) => { operator.noteDrop('group', d.reason); punish(d.peer, d.reason) })
+  // Belt and braces for transports whose upgrade path skips a gater hook: close any connection that should have been refused.
   libp2p.addEventListener('connection:open', (evt) => {
     const c = evt.detail
-    if (c.direction !== 'inbound') return
-    for (const p of sybil.observe(c.remotePeer.toString(), c.remoteAddr.toString())) report(p, 'sybil-cluster', 'many identities from one network range')
+    if (refused(c.remotePeer)) { void c.close().catch(() => {}); return }
+    for (const p of sybil.observe(c.remotePeer.toString(), c.remoteAddr.toString())) score(p, 'sybil-cluster', 'many identities from one network')
   })
   store.sweep()
   const sweeper = setInterval(() => store.sweep(), 10 * 60 * 1000)
@@ -213,6 +248,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   await groups.start()
   await blocks.start()
   await names.start()
+  await identityLogs.start()
+  await revocations.start()
   await libp2p.start()
 
   // Auto-dial discovered peers (mDNS / bootstrap).
@@ -230,14 +267,18 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     files,
     sites,
     names,
-    calls,
-    groups,
-    operator,
     moderation,
     reputation,
     sybil,
+    calls,
+    groups,
+    operator,
     credentials,
+    identityLogs,
+    revocations,
+    identity,
     did: credentials.did,
+    keyDid: credentials.keyDid,
     iceServers,
     startedAt: Date.now(),
     stop: async () => {
@@ -247,6 +288,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
       await groups.stop()
       await blocks.stop()
       await names.stop()
+      await identityLogs.stop()
+      await revocations.stop()
       await libp2p.stop()
       store.close()
     }
