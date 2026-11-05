@@ -38,7 +38,7 @@ export class FileStore {
   chunkBytes = CHUNK_BYTES
   constructor (private blocks: Blocks, private store: Store) {}
 
-  async add (name: string, data: Uint8Array, opts: { encrypt?: boolean, ttlMs?: number } = {}): Promise<AddedFile> {
+  async add (name: string, data: Uint8Array, opts: { encrypt?: boolean, ttlMs?: number, remember?: boolean } = {}): Promise<AddedFile> {
     if (data.byteLength === 0) throw new Error('empty file')
     if (data.byteLength > MAX_FILE_BYTES) throw new Error(`file exceeds ${MAX_FILE_BYTES} bytes`)
     const encrypt = opts.encrypt !== false
@@ -55,8 +55,12 @@ export class FileStore {
       const mcid = this.blocks.putLocal(key ? seal(key, m, 'm') : m, opts.ttlMs)
       cids.push(mcid)
       this.store.addFile({ cid: mcid.toString(), name: name.slice(0, 255), size: data.byteLength, chunks, encrypted: encrypt, created: Date.now(), expires: opts.ttlMs === undefined ? null : Date.now() + opts.ttlMs })
+      const link = `frenet://${mcid}${key ? '#' + b64u(key) : ''}`
+      // Opt-in only: by default the key lives nowhere on this node. With `remember` the link is kept in the local
+      // database (and so in full archives) so the file stays readable after a restore.
+      if (opts.remember && key) this.store.addFileLink(mcid.toString(), link)
       const announced = await this.blocks.announceAll(cids)
-      return { cid: mcid.toString(), key: key ? b64u(key) : null, link: `frenet://${mcid}${key ? '#' + b64u(key) : ''}`, chunks: chunks.length, size: data.byteLength, announced }
+      return { cid: mcid.toString(), key: key ? b64u(key) : null, link, chunks: chunks.length, size: data.byteLength, announced }
     } catch (e) {
       for (const c of cids) this.store.deleteBlock(c.toString())  // roll back partial writes (e.g. quota)
       throw e
@@ -85,11 +89,15 @@ export class FileStore {
 
   list () { return this.store.listFiles() }
 
+  /** The remembered link of a file added with `remember`, else null. */
+  rememberedLink (cid: string): string | null { return this.store.getFileLink(cid) }
+
   /** Delete the local copies of a file (manifest + chunks not shared with another local file). */
   remove (cid: string): boolean {
     const f = this.store.getFile(cid)
     if (!f) return false
     this.store.deleteFileRow(cid)
+    this.store.deleteFileLink(cid)
     const shared = this.store.referencedChunks()
     for (const c of f.chunks) if (!shared.has(c)) this.store.deleteBlock(c, false)
     this.store.deleteBlock(cid, false)

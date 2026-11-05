@@ -44,3 +44,6 @@ button.btn{cursor:pointer;border:0;border-radius:8px;padding:9px 16px;color:#fff
 button.btn:disabled{opacity:.55;cursor:default}
 @media(max-width:760px){body{grid-template-columns:1fr}aside{border-right:0;border-bottom:1px solid var(--line)}nav{flex-direction:row;flex-wrap:wrap}}
 @media(prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+.card>textarea{width:100%;display:block;margin:8px 0}
+input[type=checkbox]{flex:none;align-self:center}
+select{max-width:100%}

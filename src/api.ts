@@ -5,10 +5,9 @@ import { dirname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
-import { ContentBlocked, DAY_MS } from './blocks.js'
-import { isPeerId } from './channel.js'
-import { didDocument, resolveDid, toDid } from './did.js'
-import { REPORT_CATEGORIES } from './moderation.js'
+import { DAY_MS } from './blocks.js'
+import { didDocument, frenetId, isFrenetDid, resolveDid, toDid } from './did.js'
+import { didDocumentFor } from './identity-log.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
 
@@ -76,11 +75,12 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         if (!data) return json(res, 404, { error: 'no provider returned this block' })
         return json(res, 200, { data: Buffer.from(data).toString('base64') })
       }
-      if (req.method === 'GET' && url.pathname === '/api/files') return json(res, 200, n.files.list())
+      if (req.method === 'GET' && url.pathname === '/api/files') return json(res, 200, n.files.list().map((f) => ({ ...f, remembered: n.files.rememberedLink(f.cid) !== null })))
+      if (req.method === 'GET' && url.pathname === '/api/files/link') return json(res, 200, { link: n.files.rememberedLink(String(url.searchParams.get('cid') ?? '')) })
       if (req.method === 'POST' && url.pathname === '/api/files') {
         const b = await body(req, 24 * 1024 * 1024)
         const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
-        return json(res, 200, await n.files.add(String(b.name ?? 'file').slice(0, 255), Buffer.from(String(b.data ?? ''), 'base64'), { encrypt: b.encrypt !== false, ttlMs: ttl }))
+        return json(res, 200, await n.files.add(String(b.name ?? 'file').slice(0, 255), Buffer.from(String(b.data ?? ''), 'base64'), { encrypt: b.encrypt !== false, ttlMs: ttl, remember: b.remember === true }))
       }
       if (req.method === 'POST' && url.pathname === '/api/files/get') {
         const b = await body(req)
@@ -115,10 +115,30 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         const q = String(url.searchParams.get('q') ?? '').slice(0, 200)
         return json(res, 200, { query: q, results: await n.names.search(q) })
       }
-      if (req.method === 'GET' && url.pathname === '/api/identity') return json(res, 200, { peerId: n.libp2p.peerId.toString(), did: n.did, document: didDocument(n.did) })
+      if (req.method === 'GET' && url.pathname === '/api/identity') {
+        const st = n.identity
+        return json(res, 200, {
+          peerId: n.libp2p.peerId.toString(),
+          did: n.did,
+          keyDid: n.keyDid,
+          document: st ? didDocumentFor(st) : didDocument(n.keyDid),
+          rotation: st ? { enabled: true, seq: st.seq, events: st.events.length, nextKeyDigest: st.next } : { enabled: false }
+        })
+      }
+      if (req.method === 'GET' && url.pathname === '/api/identity/log') {
+        // Public, self-certifying key log of a did:frenet (ours by default). Save it with your next-key backup.
+        const id = url.searchParams.get('id') ?? n.identity?.id ?? ''
+        const st = await n.identityLogs.resolve(id)
+        return st ? json(res, 200, st.events) : json(res, 404, { error: 'no key log known for this identity' })
+      }
       if (req.method === 'GET' && url.pathname === '/api/did/resolve') {
-        // Accepts a DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network.
+        // Accepts a DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network; did:frenet uses its key log.
         const q = String(url.searchParams.get('did') ?? url.searchParams.get('peer') ?? '')
+        const bare = q.split('#')[0]!
+        if (isFrenetDid(bare)) {
+          const st = await n.identityLogs.resolve(frenetId(bare))
+          return st ? json(res, 200, didDocumentFor(st)) : json(res, 404, { error: 'no key log known for this identity' })
+        }
         return json(res, 200, resolveDid(q.startsWith('did:') ? q : toDid(q)).document)
       }
       if (req.method === 'GET' && url.pathname === '/api/credentials') return json(res, 200, { did: n.did, credentials: n.credentials.list(), revocations: n.store.listRevocations().length })
@@ -127,7 +147,11 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         const ttl = b.ttlDays === undefined || b.ttlDays === null || b.ttlDays === '' ? undefined : Number(b.ttlDays) * DAY_MS
         return json(res, 200, await n.credentials.issue(String(b.subject ?? ''), String(b.type ?? ''), b.claims, ttl === undefined ? {} : { ttlMs: ttl }))
       }
-      if (req.method === 'POST' && url.pathname === '/api/credentials/verify') return json(res, 200, await n.credentials.verify((await body(req, 20 * 1024)).jwt))
+      if (req.method === 'POST' && url.pathname === '/api/credentials/verify') {
+        // online (default): also looks for revocations / key rotations on the network; offline: local knowledge only. strict: refuse superseded keys.
+        const b = await body(req, 20 * 1024)
+        return json(res, 200, await n.credentials.verify(b.jwt, { online: b.offline !== true, strict: b.strict === true }))
+      }
       if (req.method === 'POST' && url.pathname === '/api/credentials/import') return json(res, 200, { credential: await n.credentials.hold((await body(req, 20 * 1024)).jwt) })
       if (req.method === 'POST' && url.pathname === '/api/credentials/delete') { const b = await body(req); return json(res, 200, { deleted: n.credentials.remove(String(b.id), b.role === 'issued' ? 'issued' : 'held') }) }
       if (req.method === 'POST' && url.pathname === '/api/credentials/revoke') return json(res, 200, await n.credentials.revoke(String((await body(req)).id)))
@@ -139,7 +163,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       }
       if (req.method === 'POST' && url.pathname === '/api/presentations/verify') {
         const b = await body(req, 100 * 1024)
-        return json(res, 200, await n.credentials.verifyPresentation(b.jwt, String(b.nonce ?? ''), b.audience === undefined ? undefined : String(b.audience)))
+        return json(res, 200, await n.credentials.verifyPresentation(b.jwt, String(b.nonce ?? ''), b.audience === undefined ? undefined : String(b.audience), { online: b.offline !== true, strict: b.strict === true }))
       }
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
@@ -153,24 +177,10 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         return json(res, 200, { ok: true })
       }
       if (req.method === 'GET' && url.pathname === '/api/operator') return json(res, 200, n.operator.snapshot())
-      if (req.method === 'GET' && url.pathname === '/api/reputation') return json(res, 200, { threshold: n.reputation.opts.banThreshold, blocked: n.reputation.blockedCount(), peers: n.reputation.list(200), clusters: n.sybil.clusters() })
-      if (req.method === 'POST' && url.pathname === '/api/reputation/reset') { const b = await body(req); if (!isPeerId(b.peer)) return json(res, 400, { error: 'invalid peer ID' }); return json(res, 200, { removed: n.reputation.reset(b.peer) }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/ban') { const b = await body(req); await n.operator.ban(b.peer, b.reason); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/unban') return json(res, 200, { removed: n.operator.unban((await body(req)).peer) })
       if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/sweep') return json(res, 200, { removed: n.operator.sweep() })
-      if (req.method === 'POST' && url.pathname === '/api/operator/reannounce') return json(res, 200, await n.blocks.reannounce())
-      // Content safety: local reports and the operator's blocklist (see Moderation).
-      if (req.method === 'GET' && url.pathname === '/api/moderation') return json(res, 200, { categories: REPORT_CATEGORIES, blocklist: n.moderation.list(), reports: n.moderation.listReports() })
-      if (req.method === 'POST' && url.pathname === '/api/moderation/report') {
-        const b = await body(req)
-        const report = await n.moderation.report(b)
-        const blocked = b.block === true ? n.moderation.resolve(report.id, 'block') : null
-        return json(res, 200, { report: blocked?.report ?? report, purged: blocked?.purged ?? null })
-      }
-      if (req.method === 'POST' && url.pathname === '/api/moderation/resolve') { const b = await body(req); return json(res, 200, n.moderation.resolve(b.id, b.action, b.reason)) }
-      if (req.method === 'POST' && url.pathname === '/api/moderation/block') { const b = await body(req); return json(res, 200, n.moderation.block(b.kind, b.target, b.reason)) }
-      if (req.method === 'POST' && url.pathname === '/api/moderation/unblock') { const b = await body(req); return json(res, 200, { removed: n.moderation.unblock(b.kind, b.target) }) }
       if (req.method === 'GET' && url.pathname === '/api/communities') return json(res, 200, n.groups.list())
       if (req.method === 'POST' && url.pathname === '/api/communities') { const b = await body(req); return json(res, 200, await n.groups.create(b.name, b.members ?? [])) }
       if (req.method === 'POST' && url.pathname === '/api/communities/members') { const b = await body(req); return json(res, 200, await n.groups.setMembers(String(b.id), b.members)) }
@@ -204,7 +214,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       }
       json(res, 405, { error: 'method not allowed' })
     } catch (err) {
-      json(res, err instanceof ContentBlocked ? 451 : 400, { error: (err as Error).message })
+      json(res, 400, { error: (err as Error).message })
     }
   })
 
@@ -241,6 +251,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
   return {
     peerId: l.peerId.toString(),
     did: n.did,
+    keyDid: n.keyDid,
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
     gatewayPort: gatewayPort ?? null,
@@ -253,8 +264,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),
-    blocks: { ...n.store.blockStats(), quotaBytes: n.blocks.retention.quotaBytes, replicaTtlDays: n.blocks.retention.replicaTtlMs / DAY_MS, reannounceHours: n.blocks.retention.reannounceMs / 3_600_000, lastReannounce: n.blocks.lastReannounce },
-    moderation: n.moderation.counts(),
+    blocks: { ...n.store.blockStats(), quotaBytes: n.blocks.retention.quotaBytes, replicaTtlDays: n.blocks.retention.replicaTtlMs / DAY_MS },
     files: n.files.list().length,
     names: { publisher: n.names.publisherKey, known: n.names.list().length },
     privacy: {

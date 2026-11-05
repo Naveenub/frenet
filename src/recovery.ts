@@ -44,6 +44,26 @@ export function readKeyFile (dataDir: string): Uint8Array {
   return bytes
 }
 
+export const LOG_FILE = 'identity-log.json'
+
+/** The identity's public key event log (rotatable did:frenet), if one was set up. Unverified: callers verifyLog(). */
+export function readIdentityLog (dataDir: string): unknown[] | null {
+  const file = join(dataDir, LOG_FILE)
+  if (!existsSync(file)) return null
+  const x = JSON.parse(readFileSync(file, 'utf8'))
+  if (!Array.isArray(x)) throw new Error(`${file} is not an identity log`)
+  return x
+}
+
+/** Atomic write (the log is public, but a torn file would lock the identity out). */
+export function writeIdentityLog (dataDir: string, events: unknown[]): void {
+  mkdirSync(dataDir, { recursive: true, mode: 0o700 })
+  const file = join(dataDir, LOG_FILE)
+  const tmp = `${file}.tmp-${randomBytes(4).toString('hex')}`
+  writeFileSync(tmp, JSON.stringify(events, null, 1) + '\n', { mode: 0o600, flag: 'wx' })
+  renameSync(tmp, file)
+}
+
 /**
  * Install a recovered key as `<dataDir>/identity.key` (0600). An existing, different key is never overwritten silently:
  * it needs `force` and is kept next to the new one as `identity.key.replaced-<time>`. Stop the node before restoring.
@@ -76,21 +96,21 @@ export function installKey (dataDir: string, protobuf: Uint8Array, opts: { force
 
 const BACKUP_PREFIX = 'frenet-backup:v1:'
 export const MIN_PASSPHRASE = 12
-const SCRYPT_N = 2 ** 17
-const SCRYPT_MAX_N = 2 ** 18   // a backup file is untrusted input: cap the work it can ask for
-const SCRYPT_R = 8
-const SCRYPT_P = 1
+export const SCRYPT_N = 2 ** 17
+export const SCRYPT_MAX_N = 2 ** 18   // a backup file is untrusted input: cap the work it can ask for
+export const SCRYPT_R = 8
+export const SCRYPT_P = 1
 
 interface BackupDoc { v: 1, kdf: 'scrypt', N: number, r: number, p: number, salt: string, nonce: string, ct: string, peer: string }
 
 const aad = (d: Pick<BackupDoc, 'peer' | 'N' | 'r' | 'p' | 'salt'>): Buffer => Buffer.from(`frenet-backup/v1\n${d.peer}\n${d.N}\n${d.r}\n${d.p}\n${d.salt}`, 'utf8')
 
-function checkPassphrase (pw: unknown): string {
+export function checkPassphrase (pw: unknown): string {
   if (typeof pw !== 'string' || [...pw].length < MIN_PASSPHRASE) throw new Error(`passphrase must be at least ${MIN_PASSPHRASE} characters`)
   return pw.normalize('NFKC')
 }
 
-const derive = (pw: string, salt: Buffer, N: number, r: number, p: number): Promise<Buffer> =>
+export const derive = (pw: string, salt: Buffer, N: number, r: number, p: number): Promise<Buffer> =>
   scryptAsync(pw, salt, 32, { N, r, p, maxmem: 256 * N * r + 1024 * 1024 })
 
 /** Seal the key bytes under a passphrase. The result is one printable line, safe to store anywhere you keep backups. */

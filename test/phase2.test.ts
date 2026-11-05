@@ -235,6 +235,32 @@ describe('account recovery: Shamir shares', () => {
     assert.throws(() => gfDiv(1, 0))
   })
 
+  it('agrees with an independent implementation: table-free GF multiply (exhaustive) and Gauss-Jordan recovery', () => {
+    // Russian-peasant multiply modulo 0x11b: shares no code or tables with src/recovery.ts
+    const mulBit = (a: number, b: number): number => { let p = 0; while (b) { if (b & 1) p ^= a; a <<= 1; if (a & 0x100) a ^= 0x11b; b >>= 1 } return p }
+    for (let a = 0; a < 256; a++) for (let b = 0; b < 256; b++) assert.equal(gfMul(a, b), mulBit(a, b), `${a}*${b}`)
+    const inv = (a: number): number => { let r = 1; for (let i = 0; i < 254; i++) r = mulBit(r, a); return r }   // a^254 = a^-1
+    for (const [k, n] of [[2, 3], [3, 5], [5, 9], [8, 12]] as const) {
+      const secret = Buffer.from(Array.from({ length: 40 }, (_, i) => (i * 37 + k) & 0xff))
+      const shares = splitSecret(secret, k, n).map(parseShare)
+      const pick = shares.filter((_, i) => i % 2 === 0 || i < k).slice(0, k).reverse()   // a scrambled k-subset
+      const framed = Buffer.alloc(pick[0]!.data.length)
+      for (let byte = 0; byte < framed.length; byte++) {
+        // solve V c = y for the polynomial's coefficients; c[0] is the secret byte
+        const m = pick.map((s) => { const row: number[] = []; let pw = 1; for (let j = 0; j < k; j++) { row.push(pw); pw = mulBit(pw, s.x) } row.push(s.data[byte]!); return row })
+        for (let col = 0; col < k; col++) {
+          const piv = m.findIndex((r, i) => i >= col && r[col] !== 0); assert.notEqual(piv, -1)
+          ;[m[col], m[piv]] = [m[piv]!, m[col]!]
+          const f = inv(m[col]![col]!); m[col] = m[col]!.map((v) => mulBit(v, f))
+          for (let r = 0; r < k; r++) if (r !== col && m[r]![col] !== 0) { const g = m[r]![col]!; m[r] = m[r]!.map((v, c) => v ^ mulBit(g, m[col]![c]!)) }
+        }
+        framed[byte] = m[0]![k]!
+      }
+      assert.deepEqual(framed.subarray(0, 40), secret, `k=${k} n=${n}`)
+      assert.deepEqual(new Uint8Array(combineShares(pick.map((s) => `frenet-share:1:${k}:${s.set}:${s.x}:${s.data.toString('base64url')}:${createHash('sha256').update(`frenet-share:1:${k}:${s.set}:${s.x}:${s.data.toString('base64url')}`).digest('hex').slice(0, 8)}`))), new Uint8Array(secret))
+    }
+  })
+
   it('any k of n shares recover a real identity key; k-1 do not', async () => {
     const key = await generateKeyPair('Ed25519')
     const bytes = privateKeyToProtobuf(key)

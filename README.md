@@ -2,17 +2,6 @@
 
 Decentralized, privacy-first peer-to-peer internet. This repo is the **Phase 1 MVP node**: a real libp2p peer with a local dashboard.
 
-## Stack (as built)
-
-This is the actual stack. It differs from the original spec, which assumed Next.js/React/TypeScript/Tailwind for the frontend and Go or Rust for the backend.
-
-| Layer | What is used | Not used (despite the spec) |
-|---|---|---|
-| Frontend (`web/`) | Plain JavaScript ES modules (`web/app.js`), hand-written HTML and CSS, no framework, no bundler, no build step (`scripts/copy-web.mjs` only copies the files into `dist/`). Talks to the node over loopback HTTP + SSE. | Next.js, React, TypeScript, Tailwind |
-| Backend (`src/`) | Node.js >= 22.13 + strict TypeScript (ESM, `tsc`, run with `tsx`), js-libp2p, `node:sqlite` | Go, Rust |
-
-The one Rust component is a dependency, not our code: the QUIC transport `@chainsafe/libp2p-quic` is a native binding over `quinn`. All FRENET source is TypeScript.
-
 ## Status (what is real)
 
 | Feature | State |
@@ -24,8 +13,6 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Content-addressed blocks (sha256 CIDs, <=1 MB, hash-verified fetch, replicate-on-fetch) | working; raw blocks are readable by CID holders |
 | Files: 256 KB chunks, AES-256-GCM client-side encryption, encrypted manifest, key only in the share link | working, tested (<= 16 MB/file) |
 | Retention: per-file TTL, replicas expire (default 7 d), byte quota (default 1 GiB), sweeper, local delete | working, tested |
-| Re-announcement: every block held locally (own files and sites first, then replicas) is announced on the DHT again at start-up and every 12 h (`--reannounce-hours`), so content stays findable across restarts and while its publisher is offline | working, tested (restart, schedule, blocked/expired skipped); only helps while some node still holds the content |
-| Content safety: signed local content reports, operator blocklist for content IDs, names and publisher keys, purge of local copies, refusal to store/fetch/serve/announce/render blocked content (HTTP 451 at the gateway), dashboard view | working, tested; **local to each node**: nothing is shared or scanned automatically, matching is by exact hash (see Content safety) |
 | Dashboard: Distributed Storage (add, share link, download, delete) | working |
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
@@ -38,24 +25,13 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | working: relayed delivery tested on loopback; hole punching and UPnP depend on your NAT/router and are untested here |
 | Names + updates: `<name>.<publisher-key>`, signed by your identity key, higher `seq` replaces lower, so a site keeps its address when you republish | working, tested (publish on A, resolve + serve on B, update, forged/stale/tampered records rejected) |
 | Search: keyword search over names/titles/keywords that publishers announce on the DHT, every record signature-checked | working, tested; opt-in per site, unranked, spammable (see limits) |
-| DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID | working, tested (spec test vector) |
-| Verifiable credentials: issue/verify W3C VC-JWTs signed by your identity key, holder presentations bound to a verifier nonce, issuer-signed revocation | working, tested (tamper, alg-confusion, replay, wrong-holder cases); revocation is pull-only, no trust registry |
-| Account recovery: passphrase-encrypted key backup and k-of-n Shamir recovery shares, CLI only | working, tested end to end; recovers the *same* key, cannot help if the key is stolen (see SECURITY.md) |
-| QUIC transport (`/udp/…/quic-v1`) next to TCP, on by default (`--no-quic` to disable); ban list and all other gating apply to it | working, tested on loopback (connect, messaging, ban); behaviour behind real NATs/firewalls untested; depends on the third-party native module `@chainsafe/libp2p-quic` |
-| Sybil resistance: optional identity proof-of-work (`--min-identity-bits N`, `frenet identity mine`), per-subnet peer limits, cluster flagging | working, tested; **raises the cost of fake identities, does not prevent them** (see ARCHITECTURE.md) |
-| Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
-| Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
-| Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
-| Human-memorable global names, key rotation | **not built** |
+| DIDs: your identity key is also a `did:key` (Ed25519); resolves offline. Optional `did:frenet`: a rotatable identity (hash-chained key log, pre-committed next key) | working, tested (spec vector, forged/forked/backdated logs, rotation across restarts and peers) |
+| Verifiable credentials: issue/verify W3C VC-JWTs, holder presentations bound to a verifier nonce, issuer-signed revocation pushed to peers and pulled over the DHT | working, tested (tamper, alg-confusion, replay, wrong-holder, forged-revocation cases); "valid" means "not known revoked" |
+| Account recovery: full encrypted archive (key + messages, files, remembered file links, names, communities, credentials, optional blocks), key-only backup, k-of-n Shamir shares, key rotation after loss or theft | working, tested end to end incl. CLI; Shamir cross-checked against the SLIP-39 reference, not independently audited (see SECURITY.md) |
+| Dashboard: identity, rotation status, credentials (issue, verify, present, revoke), remembered file links | working, exercised in a real browser |
+| QUIC, Sybil resistance, human-memorable global names | **not built** |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
-
-## Scope: deliberately not built
-
-These are **not in the spec's feature list**, so their absence is not a gap or a to-do:
-
-- **General web browsing.** The Decentralized Browser section is only the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`). It does not browse the public web, so there is no HTTPS browsing, no tracker blocking and no permission manager. (Published sites are already locked down by a no-third-party CSP and a deny-all `Permissions-Policy`; that is site hardening, not a browser feature.)
-- **Encrypted group messaging.** Community chat is signed by its author and travels over the Noise-encrypted link to each member, but there is no group key and no end-to-end encryption beyond that link. Stored events stay signed and plaintext on each member's device.
 
 ## Run
 
@@ -97,38 +73,21 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 - **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
-Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
-
-### Content safety (reports and blocking)
-
-A node stores and serves other people's data, and there is no central operator who can take anything down, so the tools are per node. Dashboard: **Content Safety** (or **Report** on a search result); API: `/api/moderation/*`.
-
-```bash
-# file a report (stored locally, signed by your node identity); add "block": true to block at the same time
-curl -s localhost:7777/api/moderation/report -H 'content-type: application/json' \
-  -d '{"kind":"cid","target":"frenet-site://bafk...","category":"phishing","note":"fake bank login","block":true}'
-# or block directly: kind is cid (a file, site or block), name (frenet-name://label.key) or publisher (a 52-char key)
-curl -s localhost:7777/api/moderation/block   -H 'content-type: application/json' -d '{"kind":"publisher","target":"<key>","reason":"repeat abuse"}'
-curl -s localhost:7777/api/moderation/unblock -H 'content-type: application/json' -d '{"kind":"publisher","target":"<key>"}'
-curl -s localhost:7777/api/moderation                      # blocklist + reports; GET /api/moderation, POST .../resolve {id, action: block|dismiss}
-```
-
-- **Blocking** deletes this node's copies, stops advertising them, and then refuses to store, fetch, serve, announce or render the same content again. The gateway answers **451**. Blocking a site also blocks its files and chunks that this node holds or can read from a held manifest; blocking a name also blocks the site it points to; blocking a publisher blocks all its names and their sites. Unblocking lifts an entry and everything it pulled in (deleted data is not restored).
-- **Reports** hold identifiers, a category and a short note (max 500 chars), never content bytes and never a file's `#key` (it is stripped from links). Each is signed with the node identity (`verifyReport` in `src/moderation.ts` checks one), so you can hand it to a hotline, a publisher or another operator and they can confirm it is genuine and unaltered. Categories: illegal, child-safety, malware, phishing, harassment, spam, other.
-- **If you find illegal content, child sexual abuse material above all,** also report it to your national hotline (see inhope.org) and to the authorities where the law requires it, and do not copy or forward the content. This tool records and blocks on your node; it does not notify anyone.
-
-Limits: local only (nothing is sent anywhere, no shared or gossiped blocklists, no automatic scanning or detection); matching is by **exact hash**, so a copy with one byte changed is a different CID and needs its own entry; for an encrypted file the hosting node cannot read its content and, unless it published the file itself, cannot list its chunks (they expire with the replica TTL, and the manifest, the only way to find them, is refused); blocking does not remove copies on other nodes, and their provider records for it live up to 48 h; `block`, `unblock` and `resolve` act on this node's own state only and are loopback-only like the rest of the API. This is a safeguard for operators, not legal advice or a compliance programme.
+Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (no reputation / Sybil resistance yet); full-text search of page contents is not built; own names are re-announced every 6 h, but file and site blocks are not re-announced automatically yet, so keep the publishing node online; there is no name transfer or revocation (publish a new record pointing elsewhere).
 
 ### Identity, credentials and recovery
 
 ```bash
 frenet identity                              # peer ID + DID (did:key:z6Mk...)
-frenet backup --out ~/frenet.backup          # passphrase-encrypted key backup (node stopped)
+frenet backup --full --out ~/frenet.archive  # everything: key, messages, files, file links, names, credentials (node stopped; --blocks adds own blocks)
+frenet backup --out ~/frenet.backup          # key only
 frenet recovery split -k 3 -n 5              # 5 shares, any 3 recover the key
-frenet restore ~/frenet.backup               # or: frenet recovery restore SHARE SHARE SHARE
+frenet identity rotation-init --next-out ~/next-key.backup   # make the identity rotatable; keep that file off this machine
+frenet identity rotate --next-key ~/next-key.backup --next-out ~/next-key2.backup   # after a lost or stolen key: the DID stays
+frenet restore ~/frenet.archive              # archive or key backup; or: frenet recovery restore SHARE SHARE SHARE
 ```
 
-Back the key up **now**: losing it loses the identity, and a stolen key cannot be revoked (see `SECURITY.md`).
+Set up recovery **now**: with only a key backup you get the same key back; with `rotation-init` you can also recover from a *stolen* key (see `SECURITY.md`).
 Credentials go through the local API; subjects are DIDs or peer IDs:
 
 ```bash
@@ -136,7 +95,8 @@ curl -s localhost:7777/api/credentials/issue -H 'content-type: application/json'
   -d '{"subject":"<did or peer id>","type":"Membership","claims":{"club":"frenet"},"ttlDays":365}'   # -> {id, jwt}
 # holder: POST /api/credentials/import {jwt}; present: POST /api/presentations/create {credentials:[id], nonce, audience}
 # verifier: POST /api/credentials/verify {jwt}  and  POST /api/presentations/verify {jwt, nonce, audience}
-# issuer revokes: POST /api/credentials/revoke {id} -> {jwt}; verifiers import it with POST /api/credentials/revocations {jwt}
+# issuer revokes: POST /api/credentials/revoke {id} -> {jwt, pushed}; connected peers get it immediately, verifiers pull it from the DHT, or import it with POST /api/credentials/revocations {jwt}
+# the dashboard's Identity and Keys section does all of this; upload files with {"remember": true} to keep their link for archives
 ```
 
 Behind NAT (home router, CGNAT)? Point the node at a relay that has a public address:
@@ -153,7 +113,7 @@ capacity-limited (relay default: 2 min / 2 MiB per connection); peers try to upg
 connection with DCUtR hole punching, and UPnP opens a port when the router allows it.
 Use `--announce MULTIADDR` for a manually forwarded port or DNS name, `--no-nat` to disable all of this.
 
-Flags: `--ice-server stun:HOST[:PORT]` (repeatable; for calls across NATs, none by default so no third party learns your IP), `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--gateway-port N`, `--no-gateway`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--reannounce-hours N` (12, 0 = never), `--no-mdns`.
+Flags: `--ice-server stun:HOST[:PORT]` (repeatable; for calls across NATs, none by default so no third party learns your IP), `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--gateway-port N`, `--no-gateway`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--no-mdns`.
 
 ## Test
 

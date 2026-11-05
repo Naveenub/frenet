@@ -2,9 +2,10 @@ import { closeSync, existsSync, openSync, readFileSync, writeFileSync } from 'no
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
-import { mineIdentity, identityWorkBits } from './sybil.js'
-import { privateKeyFromProtobuf, privateKeyToProtobuf } from '@libp2p/crypto/keys'
-import { combineShares, createBackup, describeKey, installKey, MAX_SHARES, MIN_PASSPHRASE, openBackup, readKeyFile, splitSecret } from './recovery.js'
+import { createArchive, isArchive, restoreArchive } from './archive.js'
+import { verifyLog } from './identity-log.js'
+import { combineShares, createBackup, describeKey, installKey, MAX_SHARES, MIN_PASSPHRASE, openBackup, readIdentityLog, readKeyFile, splitSecret } from './recovery.js'
+import { initRotation, rotateIdentity } from './rotation.js'
 
 /**
  * `frenet identity | backup | restore | recovery split|restore`. Key material only ever moves through files, the
@@ -12,10 +13,13 @@ import { combineShares, createBackup, describeKey, installKey, MAX_SHARES, MIN_P
  */
 export const IDENTITY_COMMANDS = ['identity', 'backup', 'restore', 'recovery']
 
-const USAGE = `frenet identity [--data DIR]                         show peer ID and DID
-frenet identity mine --bits N [--data DIR] [--force]               grind a NEW key with N bits of work (Sybil cost); replaces nothing without --force
-frenet backup --out FILE [--data DIR] [--passphrase-file F]       write a passphrase-encrypted backup of the key
-frenet restore FILE [--data DIR] [--passphrase-file F] [--force]   restore the key from a backup
+const USAGE = `frenet identity [--data DIR]                         show peer ID and DID(s)
+frenet identity rotation-init --next-out FILE [--passphrase-file F]   make the identity rotatable (did:frenet); writes the offline NEXT-key backup
+frenet identity rotate --next-key FILE --next-out FILE2 [--log F] [--passphrase-file F] [--next-passphrase-file F]   rotate to the next key (also the recovery path for a lost/stolen key)
+frenet identity log [--data DIR]                                  print the public key log (keep a copy with your next-key backup)
+frenet backup --out FILE [--data DIR] [--passphrase-file F]       write a passphrase-encrypted backup of the key only
+frenet backup --full --out FILE [--blocks] [--data DIR]           key + messages, files, file links, names, communities, credentials (+ own blocks with --blocks)
+frenet restore FILE [--data DIR] [--passphrase-file F] [--force]   restore a key backup or a full archive (detected automatically)
 frenet recovery split -k K -n N [--data DIR]                      split the key into N shares, any K recover it
 frenet recovery restore [SHARE...] [--file F] [--data DIR] [--force]   rebuild the key from K shares (args, file, stdin, or prompt)`
 
@@ -58,11 +62,16 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
       data: { type: 'string', default: defaultData() },
       out: { type: 'string' },
       'passphrase-file': { type: 'string' },
+      'next-passphrase-file': { type: 'string' },
+      'next-out': { type: 'string' },
+      'next-key': { type: 'string' },
+      log: { type: 'string' },
       file: { type: 'string' },
       force: { type: 'boolean', default: false },
+      full: { type: 'boolean', default: false },
+      blocks: { type: 'boolean', default: false },
       k: { type: 'string', short: 'k' },
       n: { type: 'string', short: 'n' },
-      bits: { type: 'string' },
       help: { type: 'boolean', short: 'h', default: false }
     }
   })
@@ -70,32 +79,58 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
   try {
     if (values.help) { console.log(USAGE); return 0 }
 
-    if (cmd === 'identity' && positionals[0] === 'mine') {
-      const bits = Number(values.bits)
-      if (!Number.isInteger(bits)) throw new Error('usage: frenet identity mine --bits N')
-      const t0 = Date.now()
-      const m = await mineIdentity(bits, { onProgress: (n) => process.stderr.write(`\r${n} keys tried...`) })
-      const r = installKey(data, privateKeyToProtobuf(m.key), { force: values.force })
-      process.stderr.write('\n')
-      console.log(`found a key with ${m.bits} bits of work after ${m.tries} tries (${Math.round((Date.now() - t0) / 1000)}s)`)
-      console.log(`Identity installed in ${data}: ${r.peerId}\nDID ${r.did}`)
-      if (r.replaced) console.log(`Previous key kept at ${r.replaced}`)
-      console.log('This is a NEW identity: different peer ID, DID and names. Tell your contacts out of band.')
-      return 0
-    }
-
     if (cmd === 'identity') {
+      const sub = positionals[0]
+      if (sub === 'rotation-init') {
+        if (!values['next-out']) throw new Error('--next-out FILE is required (the offline backup of the next key)')
+        process.stderr.write('Choose a passphrase for the NEXT key (the recovery key). Store its backup file OFF this machine.\n')
+        const { state, nextBackup } = await initRotation(data, await passphrase(values['passphrase-file'], !values['passphrase-file']))
+        writeNew(values['next-out'], nextBackup)
+        console.log(`Identity is now rotatable.\nDID ${state.did}\nNext-key backup written to ${values['next-out']}`)
+        console.log('Move that file (and a copy of `frenet identity log`) somewhere other than this machine. Anyone with the file and its passphrase can take over the identity on the next rotation; without it you cannot rotate.')
+        console.log('Restart the node: credentials are now issued under the did:frenet.')
+        return 0
+      }
+      if (sub === 'rotate') {
+        if (!values['next-key'] || !values['next-out']) throw new Error('usage: frenet identity rotate --next-key FILE --next-out FILE2 [--log FILE]')
+        const logEvents = values.log ? JSON.parse(readFileSync(values.log, 'utf8')) as unknown[] : undefined
+        const pw = await passphrase(values['passphrase-file'], false)
+        const pw2 = values['next-passphrase-file'] ? await passphrase(values['next-passphrase-file'], false) : values['passphrase-file'] ? pw : await (async () => { process.stderr.write('Choose a passphrase for the NEW next key.\n'); return await passphrase(undefined, true) })()
+        const r = await rotateIdentity(data, readFileSync(values['next-key'], 'utf8'), pw, pw2, logEvents ? { logEvents } : {})
+        writeNew(values['next-out'], r.nextBackup)
+        console.log(`Rotated to key #${r.state.seq}. DID unchanged: ${r.did}\nNew peer ID: ${r.peerId}`)
+        if (r.replaced) console.log(`Previous key kept at ${r.replaced}`)
+        console.log(`New next-key backup written to ${values['next-out']}. The old next-key backup is now useless: destroy it.`)
+        console.log('Start the node. Site names (<name>.<key>) belong to the old key and must be republished; peers learn of the rotation from the key log. If the old key was stolen, assume everything signed with it after the theft is suspect.')
+        return 0
+      }
+      if (sub === 'log') {
+        const ev = readIdentityLog(data)
+        if (!ev) throw new Error('this identity has no key log (run: frenet identity rotation-init)')
+        await verifyLog(ev)
+        console.log(JSON.stringify(ev, null, 1))
+        return 0
+      }
+      if (sub !== undefined) { console.error(USAGE); return 2 }
       const i = describeKey(readKeyFile(data))
-      console.log(`peer ID ${i.peerId}\nDID     ${i.did}\nwork    ${identityWorkBits(Buffer.from(readKeyPublicRaw(data)))} bits`)
+      const ev = readIdentityLog(data)
+      console.log(`peer ID ${i.peerId}`)
+      if (ev) { const st = await verifyLog(ev); console.log(`DID     ${st.did}   (rotatable, key #${st.seq})\nkey DID ${i.did}`) } else console.log(`DID     ${i.did}   (fixed key: run \`frenet identity rotation-init\` to make it rotatable)`)
       return 0
     }
 
     if (cmd === 'backup') {
       if (!values.out) throw new Error('--out FILE is required')
+      if (values.full) {
+        const a = await createArchive(data, await passphrase(values['passphrase-file'], !values['passphrase-file']), { blocks: values.blocks })
+        writeNew(values.out, a.bytes)
+        console.log(`Full archive of ${a.peerId} written to ${values.out}: ${Object.entries(a.counts).filter(([, n]) => n > 0).map(([t, n]) => `${n} ${t}`).join(', ') || 'no data yet'}${values.blocks ? `, ${a.blocks} blocks` : ''}`)
+        console.log('It holds your private key and your private data. Keep the file and the passphrase apart; test the restore once. File keys are included only for files uploaded with "remember".')
+        return 0
+      }
       const key = readKeyFile(data)
       const text = await createBackup(key, await passphrase(values['passphrase-file'], !values['passphrase-file']))
-      const fd = openSync(values.out, 'wx', 0o600)   // never overwrite an existing file
-      try { writeFileSync(fd, text + '\n') } finally { closeSync(fd) }
+      writeNew(values.out, text + '\n')
       console.log(`Backup of ${describeKey(key).peerId} written to ${values.out}`)
       console.log('Anyone with this file AND the passphrase has your identity. Keep them apart; test the restore once.')
       return 0
@@ -105,7 +140,15 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
       const file = positionals[0]
       if (!file) throw new Error('usage: frenet restore FILE')
       if (!existsSync(file)) throw new Error(`no such file: ${file}`)
-      const b = await openBackup(readFileSync(file, 'utf8'), await passphrase(values['passphrase-file'], false))
+      const raw = readFileSync(file)
+      if (isArchive(raw)) {
+        const r = await restoreArchive(data, raw, await passphrase(values['passphrase-file'], false), { force: values.force })
+        report(r, data)
+        const rows = Object.entries(r.added).filter(([, n]) => n > 0).map(([t, n]) => `${n} ${t}`).join(', ')
+        console.log(`Restored data: ${rows || 'nothing new (already present)'}${r.blocks ? `, ${r.blocks} blocks` : ''}${r.identityLog === 'written' ? '; key log restored' : ''}`)
+        return 0
+      }
+      const b = await openBackup(raw.toString('utf8'), await passphrase(values['passphrase-file'], false))
       report(installKey(data, b.protobuf, { force: values.force }), data)
       return 0
     }
@@ -142,13 +185,15 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
   }
 }
 
+/** Write a new file (0600) and never overwrite an existing one. */
+function writeNew (file: string, data: string | Buffer): void {
+  const fd = openSync(file, 'wx', 0o600)
+  try { writeFileSync(fd, typeof data === 'string' && !data.endsWith('\n') ? data + '\n' : data) } finally { closeSync(fd) }
+}
+
 function report (r: { peerId: string, did: string, replaced: string | null, unchanged: boolean }, data: string): void {
   console.log(r.unchanged ? `Identity already present in ${data}: ${r.peerId}` : `Identity restored to ${data}: ${r.peerId}`)
   console.log(`DID ${r.did}`)
   if (r.replaced) console.log(`Previous key kept at ${r.replaced}`)
-  console.log('Start the node: names and other data signed by this key work again. Messages, blocks and credentials stored in the old data directory are not part of the key and are not restored.')
-}
-
-function readKeyPublicRaw (dataDir: string): Uint8Array {
-  return privateKeyFromProtobuf(readKeyFile(dataDir)).publicKey.raw
+  console.log('Start the node: names and other data signed by this key work again. A key backup restores the key only; use a full archive (frenet backup --full) to carry messages, files, credentials and the rest.')
 }

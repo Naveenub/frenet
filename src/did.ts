@@ -1,6 +1,7 @@
 import { publicKeyFromRaw } from '@libp2p/crypto/keys'
 import type { PublicKey } from '@libp2p/interface'
 import { peerIdFromPublicKey, peerIdFromString } from '@libp2p/peer-id'
+import { base32 } from 'multiformats/bases/base32'
 import { base58btc } from 'multiformats/bases/base58'
 
 /**
@@ -8,8 +9,9 @@ import { base58btc } from 'multiformats/bases/base58'
  * so its DID is derived from the same key as its peer ID: `did:key:z` + base58btc(0xed 0x01 || 32-byte public key).
  * The DID is self-certifying (no registry, nothing to capture) and resolves offline.
  *
- * Limits: a did:key cannot be rotated or revoked; the DID *is* the key. Losing the key is handled by
- * restoring it (src/recovery.ts), not by changing the DID.
+ * Limits: a did:key cannot be rotated or revoked; the DID *is* the key. For an identity that can survive a lost or
+ * stolen key use `did:frenet` (src/identity-log.ts); losing the key without that is handled by restoring it
+ * (src/recovery.ts, src/archive.ts), not by changing the DID.
  */
 const ED25519_PREFIX = Uint8Array.of(0xed, 0x01)
 const DID_RE = /^did:key:(z[1-9A-HJ-NP-Za-km-z]{40,60})$/
@@ -57,9 +59,23 @@ export function parseDidKey (did: unknown): { did: string, raw: Uint8Array, publ
   return { did, raw, publicKey: publicKeyFromRaw(raw), keyId: multibase }
 }
 
-/** Accept a DID, a peer ID, or null-ish input and return the canonical DID. Anything else throws. */
+const FRENET_DID_RE = /^did:frenet:([a-z2-7]{52})$/
+
+/** 52-char base32 of exactly 32 bytes, round-trip checked so non-canonical encodings are rejected. */
+export function validB32 (s: unknown): s is string {
+  if (typeof s !== 'string' || !/^[a-z2-7]{52}$/.test(s)) return false
+  try { const raw = base32.baseDecode(s); return raw.length === 32 && base32.baseEncode(raw) === s } catch { return false }
+}
+
+/** `did:frenet:<id>`: a rotatable identity whose id is the digest of its inception event (src/identity-log.ts). */
+export const isFrenetDid = (s: unknown): boolean => typeof s === 'string' && FRENET_DID_RE.test(s) && validB32(s.slice('did:frenet:'.length))
+export const frenetDid = (id: string): string => { if (!validB32(id)) throw new Error('invalid identity id'); return `did:frenet:${id}` }
+export const frenetId = (did: string): string => { if (!isFrenetDid(did)) throw new Error('invalid did:frenet'); return did.slice('did:frenet:'.length) }
+
+/** Accept a DID (did:key or did:frenet), a peer ID, or null-ish input and return the canonical DID. Anything else throws. */
 export function toDid (subject: unknown): string {
   if (typeof subject !== 'string' || subject === '') throw new Error('missing DID or peer ID')
+  if (isFrenetDid(subject)) return subject
   if (subject.startsWith('did:')) return parseDidKey(subject).did
   return didFromPeerId(subject)
 }
