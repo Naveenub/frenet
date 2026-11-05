@@ -1,6 +1,7 @@
 import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import type { NameRecord } from './names.js'
+import type { PeerReputation } from './reputation.js'
 
 export interface StoredMessage {
   id: string
@@ -31,6 +32,12 @@ const ARCHIVE_TABLES: Record<string, { cols: Record<string, string>, where?: str
   identity_logs: { cols: { id: 's', seq: 'n', own: 'n', updated: 'n', events: 's' }, where: 'own = 1' },
   bans: { cols: { peer: 's', reason: 's', ts: 'n' } }
 }
+
+export type ReportStatus = 'open' | 'dismissed' | 'blocked'
+export interface ReportRow { id: string, kind: string, target: string, category: string, note: string, ts: number, reporter: string, sig: string, status: ReportStatus }
+/** parent '' = added by the operator; otherwise 'kind:target' of the entry this row was pulled in by. */
+export interface ContentBlockRow { kind: string, target: string, parent: string, reason: string, ts: number }
+export interface UpdateStateRow { channel: string, seq: number, version: string }
 
 export interface CredentialRow { id: string, role: 'issued' | 'held', issuer: string, subject: string, type: string, issued: number, expires: number | null, jwt: string }
 
@@ -64,6 +71,12 @@ export class Store {
       CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
       CREATE TABLE IF NOT EXISTS file_links (cid TEXT PRIMARY KEY, link TEXT NOT NULL, created INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS identity_logs (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, updated INTEGER NOT NULL, events TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL, target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL DEFAULT '', ts INTEGER NOT NULL, PRIMARY KEY (kind, target));
+      CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
+      CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL CHECK (status IN ('open','dismissed','blocked')));
+      CREATE INDEX IF NOT EXISTS reports_target ON reports (kind, target, status);
+      CREATE TABLE IF NOT EXISTS reputation (peer TEXT PRIMARY KEY, score REAL NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL, strikes INTEGER NOT NULL, blocked_until INTEGER, last_reason TEXT NOT NULL, updated INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     for (const c of ['sig', 'sender', 'recipient']) {
@@ -108,6 +121,14 @@ export class Store {
     const r = this.db.prepare('SELECT COUNT(*) AS n, COALESCE(SUM(LENGTH(data)),0) AS b FROM blocks').get() as { n: number, b: number }
     return { count: Number(r.n), bytes: Number(r.b) }
   }
+
+  /** CIDs of every live (unexpired) block, kept-until-deleted ones first. */
+  listBlockCids (now = Date.now()): string[] {
+    return (this.db.prepare('SELECT cid FROM blocks WHERE expires IS NULL OR expires > ? ORDER BY (expires IS NULL) DESC, ts ASC').all(now) as Array<{ cid: string }>).map((r) => r.cid)
+  }
+
+  /** True if a row exists for this CID, expired or not (what a purge actually has to delete). */
+  hasBlock (cid: string): boolean { return !!this.db.prepare('SELECT 1 FROM blocks WHERE cid = ?').get(cid) }
 
   deleteBlock (cid: string, compact = true): void {
     this.db.prepare('DELETE FROM blocks WHERE cid = ?').run(cid)
@@ -163,6 +184,8 @@ export class Store {
     const rows = this.db.prepare(`SELECT * FROM names ${ownOnly ? 'WHERE own = 1' : ''} ORDER BY seen DESC`).all() as any[]
     return rows.map((r) => ({ record: JSON.parse(r.record), seq: Number(r.seq), own: !!r.own }))
   }
+
+  deleteName (name: string, pub: string): boolean { return Number(this.db.prepare('DELETE FROM names WHERE name = ? AND pub = ?').run(name, pub).changes) > 0 }
 
   addBan (peer: string, reason: string): void { this.db.prepare('INSERT OR REPLACE INTO bans (peer, reason, ts) VALUES (?, ?, ?)').run(peer, reason, Date.now()) }
   removeBan (peer: string): boolean { return Number(this.db.prepare('DELETE FROM bans WHERE peer = ?').run(peer).changes) > 0 }
@@ -290,6 +313,70 @@ export class Store {
   deletePeer (peer: string): void {
     this.db.prepare('DELETE FROM messages WHERE peer = ?').run(peer)
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
+  }
+
+  /**
+   * Blocklist. An operator entry has parent ''; rows it pulled in carry 'kind:target' of that entry. Adding an entry
+   * directly upgrades a row that was only derived; a derived add never downgrades an operator entry.
+   */
+  addContentBlock (kind: string, target: string, parent: string, reason: string): void {
+    this.db.prepare(`INSERT INTO content_blocks (kind, target, parent, reason, ts) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(kind, target) DO UPDATE SET parent = '', reason = excluded.reason, ts = excluded.ts WHERE excluded.parent = ''`)
+      .run(kind, target, parent, reason, Date.now())
+  }
+  /** Newest first. */
+  listContentBlocks (): ContentBlockRow[] {
+    return (this.db.prepare('SELECT kind, target, parent, reason, ts FROM content_blocks ORDER BY ts DESC, rowid DESC').all() as any[])
+      .map((r) => ({ kind: r.kind, target: r.target, parent: r.parent, reason: r.reason, ts: Number(r.ts) }))
+  }
+  /** Lift an operator entry and every row it pulled in. False if there was no such operator entry. */
+  removeContentBlock (kind: string, target: string): boolean {
+    const r = this.db.prepare("DELETE FROM content_blocks WHERE kind = ? AND target = ? AND parent = ''").run(kind, target)
+    if (Number(r.changes) === 0) return false
+    this.db.prepare('DELETE FROM content_blocks WHERE parent = ?').run(`${kind}:${target}`)
+    return true
+  }
+
+  addReport (r: ReportRow): void {
+    this.db.prepare('INSERT INTO reports (id, kind, target, category, note, ts, reporter, sig, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.id, r.kind, r.target, r.category, r.note, r.ts, r.reporter, r.sig, r.status)
+  }
+  getReport (id: string): ReportRow | null { return (this.db.prepare('SELECT * FROM reports WHERE id = ?').get(id) as unknown as ReportRow | undefined) ?? null }
+  /** Newest first. */
+  listReports (limit = 1000): ReportRow[] {
+    return (this.db.prepare('SELECT * FROM reports ORDER BY ts DESC, rowid DESC LIMIT ?').all(limit) as any[]).map((r) => ({ ...r, ts: Number(r.ts) }) as ReportRow)
+  }
+  countReports (): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM reports').get() as any).n) }
+  setReportStatus (id: string, status: ReportStatus): boolean { return Number(this.db.prepare('UPDATE reports SET status = ? WHERE id = ?').run(status, id).changes) > 0 }
+  /** Close every open report about a target. Returns how many were closed. */
+  closeOpenReports (kind: string, target: string, status: Exclude<ReportStatus, 'open'>): number {
+    return Number(this.db.prepare("UPDATE reports SET status = ? WHERE kind = ? AND target = ? AND status = 'open'").run(status, kind, target).changes)
+  }
+  /** Drop the n oldest resolved (not open) reports. Returns how many were dropped. */
+  deleteOldestResolvedReports (n: number): number {
+    return Number(this.db.prepare("DELETE FROM reports WHERE id IN (SELECT id FROM reports WHERE status != 'open' ORDER BY ts ASC, rowid ASC LIMIT ?)").run(n).changes)
+  }
+
+  listReputation (): PeerReputation[] {
+    return (this.db.prepare('SELECT * FROM reputation').all() as any[]).map((r) => ({
+      peer: r.peer, score: Number(r.score), good: Number(r.good), bad: Number(r.bad), strikes: Number(r.strikes),
+      blockedUntil: r.blocked_until == null ? null : Number(r.blocked_until), lastReason: r.last_reason, updated: Number(r.updated)
+    }))
+  }
+  putReputation (r: PeerReputation): void {
+    this.db.prepare('INSERT OR REPLACE INTO reputation (peer, score, good, bad, strikes, blocked_until, last_reason, updated) VALUES (?, ?, ?, ?, ?, ?, ?, ?)')
+      .run(r.peer, r.score, r.good, r.bad, r.strikes, r.blockedUntil, r.lastReason, r.updated)
+  }
+  deleteReputation (peer: string): void { this.db.prepare('DELETE FROM reputation WHERE peer = ?').run(peer) }
+
+  /** Highest accepted release per channel; a lower seq never overwrites it. */
+  getUpdateState (channel: string): UpdateStateRow | null {
+    const r = this.db.prepare('SELECT * FROM update_state WHERE channel = ?').get(channel) as any
+    return r ? { channel: r.channel, seq: Number(r.seq), version: r.version } : null
+  }
+  putUpdateState (channel: string, seq: number, version: string): void {
+    this.db.prepare(`INSERT INTO update_state (channel, seq, version) VALUES (?, ?, ?)
+      ON CONFLICT(channel) DO UPDATE SET seq = excluded.seq, version = excluded.version WHERE excluded.seq >= update_state.seq`).run(channel, seq, version)
   }
 
   close (): void { this.db.close() }

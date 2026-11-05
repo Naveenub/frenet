@@ -23,6 +23,7 @@ import { IdentityLogs, verifyLog, type IdentityState } from './identity-log.js'
 import { Revocations } from './revocations.js'
 import { readIdentityLog } from './recovery.js'
 import { Messaging } from './messaging.js'
+import { Moderation } from './moderation.js'
 import { Names } from './names.js'
 import { Operator } from './operator.js'
 import { Sites } from './sites.js'
@@ -60,6 +61,7 @@ export interface FrenetNode {
   files: FileStore
   sites: Sites
   names: Names
+  moderation: Moderation
   calls: Calls
   groups: Groups
   operator: Operator
@@ -155,10 +157,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
 
   const store = new Store(opts.dataDir)
   const messaging = new Messaging(libp2p, store, privateKey)
-  const blocks = new Blocks(libp2p, store, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
+  const moderation = new Moderation(store, libp2p, privateKey)
+  const blocks = new Blocks(libp2p, store, moderation, { ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}), ...(opts.replicaTtlMs ? { replicaTtlMs: opts.replicaTtlMs } : {}) })
   const files = new FileStore(blocks, store)
   const sites = new Sites(blocks, files)
-  const names = new Names(libp2p, store, blocks, privateKey)
+  const names = new Names(libp2p, store, blocks, privateKey, moderation)
   const calls = new Calls(libp2p, privateKey)
   const groups = new Groups(libp2p, store, privateKey)
   const operator = new Operator(libp2p, store, banned)
@@ -199,6 +202,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     files,
     sites,
     names,
+    moderation,
     calls,
     groups,
     operator,
