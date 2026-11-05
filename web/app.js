@@ -19,9 +19,9 @@ const SECTIONS = [
   ['overview', 'Network Overview'], ['peers', 'Connected Peers'], ['messages', 'Private Communications'],
   ['communities', 'Communities'], ['storage', 'Distributed Storage'], ['browser', 'Decentralized Browser'],
   ['identity', 'Identity and Keys'], ['nodes', 'Network Nodes'],
-  ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['governance', 'Community Governance']
+  ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['safety', 'Content Safety'], ['governance', 'Community Governance']
 ]
-const state = { view: 'overview', status: null, peers: [], dropped: [], chat: [], stop: null, credNote: null }
+const state = { view: 'overview', status: null, peers: [], dropped: [], chat: [], stop: null }
 
 const nav = $('#nav')
 for (const [id, name, phase] of SECTIONS) {
@@ -39,7 +39,7 @@ function go (id) {
   const v = $('#view'); v.replaceChildren()
   const meta = SECTIONS.find((s) => s[0] === id)
   if (meta[2]) return v.append(el('div', { className: 'card' }, el('h3', {}, 'Not built yet'), el('p', { className: 'dim' }, `This section is planned for ${meta[2]}. Nothing here is simulated.`)))
-  ;({ overview, peers, messages, communities, storage, browser, identity, nodes, privacy, security, governance })[id](v)
+  ;({ overview, peers, messages, communities, storage, browser, identity, nodes, privacy, security, safety, governance })[id](v)
 }
 
 function stat (label, value) { return el('div', { className: 'stat' }, el('b', {}, String(value)), el('span', {}, label)) }
@@ -129,11 +129,10 @@ const b64 = (buf) => { let s = ''; const u = new Uint8Array(buf); for (let i = 0
 
 async function storage (v) {
   const b = state.status.blocks
-  v.append(el('div', { className: 'grid' }, stat('Local blocks', b.count), stat('Used', mb(b.bytes) + ' of ' + mb(b.quotaBytes)), stat('Your files', state.status.files), stat('Replica lifetime', b.replicaTtlDays + ' days')))
+  v.append(el('div', { className: 'grid' }, stat('Local blocks', b.count), stat('Used', mb(b.bytes) + ' of ' + mb(b.quotaBytes)), stat('Your files', state.status.files), stat('Replica lifetime', b.replicaTtlDays + ' days'), stat('Last re-announce', b.lastReannounce ? ago(Date.now() - b.lastReannounce.at) + ' ago' : 'not yet')))
 
   const pick = el('input', { type: 'file', 'aria-label': 'File to add' })
   const enc = el('input', { type: 'checkbox', checked: true, id: 'enc' })
-  const rem = el('input', { type: 'checkbox', id: 'rem' })
   const ttl = el('input', { type: 'number', min: 1, placeholder: 'keep for N days (blank = until deleted)', 'aria-label': 'Retention in days' })
   const msg = el('p', { className: 'err' }); const out = el('div')
   const add = el('button', { className: 'btn', type: 'button', onclick: async () => {
@@ -143,15 +142,14 @@ async function storage (v) {
     if (f.size > 16 * 1048576) { msg.textContent = 'File is larger than 16 MB.'; return }
     add.disabled = true; msg.textContent = 'Encrypting and publishing…'
     try {
-      const r = await api('/api/files', { name: f.name, data: b64(await f.arrayBuffer()), encrypt: enc.checked, remember: rem.checked, ttlDays: ttl.value ? Number(ttl.value) : undefined })
+      const r = await api('/api/files', { name: f.name, data: b64(await f.arrayBuffer()), encrypt: enc.checked, ttlDays: ttl.value ? Number(ttl.value) : undefined })
       msg.textContent = ''
       out.append(el('p', {}, r.announced ? 'Added. Peers can find it.' : 'Added locally. No peers announced it yet; connect to peers and add it again to share.'),
         el('div', { className: 'mono' }, r.link), el('p', { className: 'dim' }, r.key ? 'Anyone with this full link can read the file. The key is not stored on this node. Keep the link.' : 'Public file: anyone with the link can read it.'))
       await refresh(); go('storage')
     } catch (e) { msg.textContent = e.message } finally { add.disabled = false }
   } }, 'Add file')
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Add a file'), el('div', { className: 'row' }, pick), el('label', { className: 'row' }, enc, 'Encrypt (recommended)'),
-    el('label', { className: 'row' }, rem, 'Remember the link on this node (keeps the decryption key in the local database and in full archives; off = only you hold the link)'), el('div', { className: 'row' }, ttl, add), msg, out))
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Add a file'), el('div', { className: 'row' }, pick), el('label', { className: 'row' }, enc, 'Encrypt (recommended)'), el('div', { className: 'row' }, ttl, add), msg, out))
 
   const link = el('input', { placeholder: 'frenet://bafk…#key', 'aria-label': 'File link' })
   const dmsg = el('p', { className: 'err' })
@@ -169,12 +167,11 @@ async function storage (v) {
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Download a file'), el('div', { className: 'row' }, link, get), dmsg))
 
   const files = await api('/api/files')
-  const t = el('table', {}, el('thead', {}, el('tr', {}, ...['Name', 'Size', 'Chunks', 'Encrypted', 'Retention', 'Link', ''].map((h) => el('th', {}, h)))))
+  const t = el('table', {}, el('thead', {}, el('tr', {}, ...['Name', 'Size', 'Chunks', 'Encrypted', 'Retention', ''].map((h) => el('th', {}, h)))))
   const tb = el('tbody'); t.append(tb)
   for (const f of files) {
     tb.append(el('tr', {}, el('td', {}, f.name), el('td', {}, mb(f.size)), el('td', {}, String(f.chunks.length)), el('td', {}, f.encrypted ? 'yes' : 'no (public)'),
       el('td', {}, f.expires ? 'until ' + new Date(f.expires).toLocaleDateString() : 'until deleted'),
-      el('td', {}, f.remembered ? el('button', { className: 'btn', type: 'button', onclick: async (e) => { const r = await api('/api/files/link?cid=' + encodeURIComponent(f.cid)); try { await navigator.clipboard.writeText(r.link); e.target.textContent = 'Copied' } catch { e.target.replaceWith(el('span', { className: 'mono' }, r.link)) } } }, 'Copy link') : el('span', { className: 'dim' }, 'not kept')),
       el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/files/delete', { cid: f.cid }); await refresh(); go('storage') } }, 'Delete local copy'))))
   }
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Files you added'), files.length ? t : el('p', { className: 'dim' }, 'No files yet. Other peers may still hold copies of anything you shared.')))
@@ -224,7 +221,8 @@ function browser (v) {
     } catch (e) { msg.textContent = e.message } finally { pub.disabled = false }
   } }, 'Publish site')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Publish a site'), el('p', { className: 'dim' }, 'Static files only (max 64 files, 32 MB). Each site gets its own isolated origin and can only load its own files: no third-party requests, no tracking. A name is yours alone: it is tied to your identity key, signed, and can be updated by publishing again under the same name.'),
-    el('div', { className: 'row' }, pick), el('div', { className: 'row' }, name, title), el('div', { className: 'row' }, kws), el('div', { className: 'row' }, ttl, pub), msg, out))
+    el('div', { className: 'row' }, pick), el('div', { className: 'row' }, name, title), el('div', { className: 'row' }, kws), el('div', { className: 'row' }, ttl, pub), msg, out,
+    el('p', { className: 'dim' }, 'What you publish is stored and served by other people’s nodes. Do not publish anything illegal or abusive: node operators can report it and block it (see Content Safety), and a block cannot be undone from your side.')))
 
   const link = el('input', { placeholder: 'frenet-name://my-blog.… or frenet-site://bafk…', 'aria-label': 'Site link' }); const omsg = el('p', { className: 'err' })
   const open = el('button', { className: 'btn', type: 'button', onclick: () => {
@@ -234,7 +232,7 @@ function browser (v) {
     window.open(u, '_blank', 'noopener,noreferrer')
   } }, 'Open')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Open a site'), el('div', { className: 'row' }, link, open), omsg,
-    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do).')))
+    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do). This is a gateway for FRENET sites only, not a web browser: no HTTPS browsing, tracker blocking or permission manager.')))
 
   const q = el('input', { placeholder: 'search names by keyword, e.g. vegan recipes', 'aria-label': 'Search' }); const smsg = el('p', { className: 'dim' }); const sres = el('div')
   const doSearch = async () => {
@@ -247,7 +245,8 @@ function browser (v) {
           el('h3', {}, h.title || h.name),
           el('p', {}, el('a', { href: `http://${h.name}.${h.pub}.localhost:${gw}/`, target: '_blank', rel: 'noopener noreferrer' }, h.name), h.own ? ' (yours)' : ''),
           el('div', { className: 'mono' }, h.link),
-          el('p', { className: 'dim' }, `version ${h.seq} · ${h.keywords.join(', ')}`)))
+          el('p', { className: 'dim' }, `version ${h.seq} · ${h.keywords.join(', ')}`),
+          h.own ? '' : el('button', { className: 'btn', type: 'button', onclick: () => { state.report = { kind: 'name', target: h.link }; go('safety') } }, 'Report')))
       }
     } catch (e) { smsg.textContent = ''; sres.append(el('p', { className: 'err' }, e.message)) }
   }
@@ -263,104 +262,10 @@ function browser (v) {
   }).catch(() => {})
 }
 
-const shortDid = (d) => d.length > 30 ? d.slice(0, 16) + '…' + d.slice(-8) : d
-const day = (ms) => new Date(ms).toLocaleDateString()
-
-async function identity (v) {
-  const [id, creds] = await Promise.all([api('/api/identity'), api('/api/credentials')])
-  const rot = id.rotation
-  const note = state.credNote; state.credNote = null
-  const msg = el('p', { className: 'err' }); if (note) msg.textContent = note.text
-  const token = el('textarea', { readOnly: true, rows: 4, className: 'mono', 'aria-label': 'Token to hand over' }); token.hidden = !note?.token; token.value = note?.token ?? ''
-  const done = (text, tok) => { state.credNote = { text, token: tok }; go('identity') }
-  const run = (btn, fn) => async () => { msg.textContent = ''; btn.disabled = true; try { await fn() } catch (e) { msg.textContent = e.message } finally { btn.disabled = false } }
-  const copy = async (text, e) => { try { await navigator.clipboard.writeText(text); e.target.textContent = 'Copied' } catch { token.hidden = false; token.value = text; msg.textContent = 'Copy blocked by the browser: the token is shown below.' } }
-
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Your identity'),
-    el('table', {}, el('tbody', {},
-      el('tr', {}, el('th', {}, 'Peer ID'), el('td', { className: 'mono' }, id.peerId)),
-      el('tr', {}, el('th', {}, 'DID'), el('td', { className: 'mono' }, id.did)),
-      ...(rot.enabled ? [el('tr', {}, el('th', {}, 'Key DID'), el('td', { className: 'mono' }, id.keyDid))] : []),
-      el('tr', {}, el('th', {}, 'Rotation'), el('td', {}, rot.enabled ? `Enabled, key #${rot.seq}. The DID survives a lost or stolen key if you hold the offline next-key backup.` : 'Not enabled: this DID is tied to one key for good. Run "frenet identity rotation-init" to make it rotatable.')))),
-    el('p', { className: 'dim' }, 'Ed25519 key pair; the private key stays in your data directory (mode 0600) and is never sent or shown here.')))
-
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Back up and recover (run with the node stopped)'),
-    ...[['frenet backup --full --out FILE [--blocks]', 'Everything: key, messages, files, remembered file links, names, communities, credentials (one encrypted file).'],
-      ['frenet recovery split -k 3 -n 5', 'Split the key into 5 shares, any 3 recover it.'],
-      ['frenet restore FILE', 'Restore a backup or archive; never replaces a different identity without --force.'],
-      ['frenet identity rotation-init --next-out FILE', 'Make the identity rotatable; store that file OFF this machine.'],
-      ['frenet identity rotate --next-key FILE --next-out FILE2', 'After a lost or stolen key: take over with the next key. The DID stays; the peer ID changes.']]
-      .map(([c, d]) => el('div', { style: 'margin:6px 0' }, el('div', { className: 'mono' }, c), el('div', { className: 'dim' }, d))),
-    el('p', { className: 'dim' }, 'These are command-line only on purpose: key material is never exposed through this dashboard or its API.')))
-
-  // ---- credentials
-  const list = (role, title) => {
-    const rows = creds.credentials.filter((c) => c.role === role)
-    const t = el('table', {}, el('thead', {}, el('tr', {}, ...['Type', role === 'held' ? 'Issuer' : 'Subject', 'Status', ''].map((h) => el('th', {}, h)))))
-    const tb = el('tbody'); t.append(tb)
-    for (const c of rows) {
-      const bad = c.revoked ? 'revoked' : c.expired ? 'expired' : null
-      tb.append(el('tr', {}, el('td', {}, c.type), el('td', { className: 'mono', title: role === 'held' ? c.issuer : c.subject }, shortDid(role === 'held' ? c.issuer : c.subject)),
-        el('td', { style: bad ? 'color:var(--bad)' : '' }, bad ?? (c.expires ? 'valid until ' + day(c.expires) : 'valid, no expiry')),
-        el('td', {}, el('div', { className: 'row', style: 'margin:0' },
-          el('button', { className: 'btn', type: 'button', onclick: (e) => copy(c.jwt, e) }, 'Copy token'),
-          role === 'issued'
-            ? (c.revoked ? '' : el('button', { className: 'btn', type: 'button', onclick: async (e) => { if (!confirm('Revoke this credential? Peers will learn of it, and this cannot be undone.')) return; e.target.disabled = true; try { const r = await api('/api/credentials/revoke', { id: c.id }); done(`Revoked. Pushed to ${r.pushed} connected peer(s) and announced; others find it by looking it up. Statement (share it with verifiers that are offline):`, r.jwt) } catch (er) { msg.textContent = er.message; e.target.disabled = false } } }, 'Revoke'))
-            : el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/credentials/delete', { id: c.id, role }); go('identity') } }, 'Remove')))))
-    }
-    return el('div', { className: 'card' }, el('h3', {}, title), rows.length ? t : el('p', { className: 'dim' }, role === 'held' ? 'None yet. Paste a token someone issued to you below and add it.' : 'You have not issued any.'))
-  }
-  v.append(list('held', 'Credentials you hold'), list('issued', 'Credentials you issued'))
-
-  const subject = el('input', { placeholder: 'subject: DID or peer ID', 'aria-label': 'Subject' })
-  const type = el('input', { placeholder: 'type, e.g. Membership', maxLength: 64, 'aria-label': 'Credential type' })
-  const claims = el('textarea', { rows: 3, className: 'mono', placeholder: '{"role": "member"}', 'aria-label': 'Claims as JSON' }); claims.value = '{}'
-  const days = el('input', { type: 'number', min: 1, placeholder: 'expires in N days (blank = never)', 'aria-label': 'Expiry in days' })
-  const issue = el('button', { className: 'btn', type: 'button' }, 'Issue credential')
-  issue.onclick = run(issue, async () => {
-    let c; try { c = JSON.parse(claims.value || '{}') } catch { throw new Error('Claims must be valid JSON.') }
-    const r = await api('/api/credentials/issue', { subject: subject.value.trim(), type: type.value.trim(), claims: c, ttlDays: days.value ? Number(days.value) : undefined })
-    done('Issued. Hand this token to the subject over any channel; they add it below.', r.jwt)
-  })
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Issue a credential'), el('p', { className: 'dim' }, `Signed as ${shortDid(id.did)}. Anyone can verify it offline against your DID${rot.enabled ? ' and key log' : ''}.`), el('div', { className: 'row' }, subject, type), claims, el('div', { className: 'row' }, days, issue)))
-
-  const tok = el('textarea', { rows: 3, className: 'mono', placeholder: 'paste a credential token, or a revocation statement', 'aria-label': 'Token' })
-  const off = el('input', { type: 'checkbox', id: 'off' })
-  const vbtn = el('button', { className: 'btn', type: 'button' }, 'Verify')
-  vbtn.onclick = run(vbtn, async () => {
-    const r = await api('/api/credentials/verify', { jwt: tok.value.trim(), offline: off.checked })
-    msg.textContent = ''; msg.style.color = r.valid ? 'var(--ok)' : ''
-    msg.textContent = r.valid ? `Valid: ${r.credential.types.join(', ')} from ${shortDid(r.credential.issuer)} about ${shortDid(r.credential.subject)}. Claims: ${JSON.stringify(r.credential.claims)}` : `Not valid: ${r.error}`
-  })
-  const abtn = el('button', { className: 'btn', type: 'button' }, 'Add to my credentials')
-  abtn.onclick = run(abtn, async () => { await api('/api/credentials/import', { jwt: tok.value.trim() }); done('Added.') })
-  const rbtn = el('button', { className: 'btn', type: 'button' }, 'Import revocation')
-  rbtn.onclick = run(rbtn, async () => { const r = await api('/api/credentials/revocations', { jwt: tok.value.trim() }); done(`Revocation recorded for ${r.id}.`) })
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Verify, add or revoke by token'),
-    tok, el('label', { className: 'row' }, off, 'Offline: do not look for revocations or key rotations on the network (a credential then only means "not known revoked")'), el('div', { className: 'row' }, vbtn, abtn, rbtn)))
-
-  // ---- presentations
-  const held = creds.credentials.filter((c) => c.role === 'held' && !c.revoked && !c.expired)
-  const pick = el('select', { 'aria-label': 'Credential to present' }, ...held.map((c) => el('option', { value: c.id }, `${c.type} from ${shortDid(c.issuer)}`)))
-  const nonce = el('input', { placeholder: "verifier's challenge (nonce)", 'aria-label': 'Nonce' }); const aud = el('input', { placeholder: 'verifier name (audience, optional)', 'aria-label': 'Audience' })
-  const pbtn = el('button', { className: 'btn', type: 'button' }, 'Create presentation')
-  pbtn.onclick = run(pbtn, async () => {
-    if (!held.length) throw new Error('You hold no valid credentials.')
-    const r = await api('/api/presentations/create', { credentials: [pick.value], nonce: nonce.value.trim(), audience: aud.value.trim() || undefined })
-    done(`Presentation valid until ${new Date(r.expires).toLocaleTimeString()}; it only works for that challenge:`, r.jwt)
-  })
-  const ptok = el('textarea', { rows: 3, className: 'mono', placeholder: 'paste a presentation to verify', 'aria-label': 'Presentation' })
-  const vnonce = el('input', { placeholder: 'the challenge you gave the holder', 'aria-label': 'Challenge' }); const vaud = el('input', { placeholder: 'your name, if the holder used one (audience)', 'aria-label': 'Audience to expect' })
-  const pv = el('button', { className: 'btn', type: 'button' }, 'Verify presentation')
-  pv.onclick = run(pv, async () => {
-    const r = await api('/api/presentations/verify', { jwt: ptok.value.trim(), nonce: vnonce.value.trim(), audience: vaud.value.trim() || undefined })
-    msg.style.color = r.valid ? 'var(--ok)' : ''
-    msg.textContent = r.valid ? `Valid presentation by ${shortDid(r.holder)}: ${r.credentials.map((c) => `${c.types.join(',')} ${JSON.stringify(c.claims)}`).join('; ')}` : `Not valid: ${r.error}`
-  })
-  v.append(el('div', { className: 'card' }, el('h3', {}, 'Present a credential'), el('p', { className: 'dim' }, 'The verifier gives you a fresh challenge; the presentation is bound to it, so it cannot be replayed elsewhere.'), el('div', { className: 'row' }, pick, nonce, aud, pbtn)),
-    el('div', { className: 'card' }, el('h3', {}, 'Verify a presentation'), ptok, el('div', { className: 'row' }, vnonce, vaud, pv)))
-
-  v.append(el('div', { className: 'card' }, msg, token, token.hidden ? '' : el('div', { className: 'row' }, el('button', { className: 'btn', type: 'button', onclick: (e) => copy(token.value, e) }, 'Copy'))))
+function identity (v) {
+  const s = state.status
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Your peer ID'), el('div', { className: 'mono' }, s.peerId),
+    el('p', { className: 'dim' }, 'Ed25519 key pair. The private key is stored in your data directory (mode 0600) and is never sent anywhere. Back up the file identity.key to keep this identity.')))
 }
 
 function privacy (v) {
@@ -501,7 +406,7 @@ async function communities (v) {
   const picks = state.peers.map((p) => ({ p: p.peer, box: el('input', { type: 'checkbox', style: 'flex:none' }) }))
   const extra = el('input', { placeholder: 'other peer IDs, comma separated (optional)', 'aria-label': 'Other members' })
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Create a community'),
-    el('p', { className: 'dim' }, 'You become its owner and are the only one who can change who is a member. Everyone you add must accept before they receive anything. Up to 100 members.'),
+    el('p', { className: 'dim' }, 'You become its owner and are the only one who can change who is a member. Everyone you add must accept before they receive anything. Up to 100 members. Messages are signed and sent over encrypted peer links, but there is no group-wide end-to-end encryption.'),
     el('div', { className: 'row' }, name),
     ...picks.map(({ p, box }) => el('label', { className: 'row mono' }, box, p)), el('div', { className: 'row' }, extra),
     el('div', { className: 'row' }, btn('Create', async () => {
@@ -586,7 +491,9 @@ async function nodes (v) {
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Relay and retention'),
     el('p', {}, s.nat.relayServer ? 'Relay server: on (up to 64 reservations, 2 min / 2 MiB per relayed connection).' : 'Relay server: off. Start with --relay-server on a publicly reachable address to help NATed peers.'),
     el('p', { className: 'dim' }, `NAT traversal ${s.nat.enabled ? 'on' : 'off'} · ${s.nat.relayedAddresses.length} relayed address(es) · replicas expire after ${s.blocks.replicaTtlDays} days`),
-    el('div', { className: 'row' }, btn('Sweep expired data now', async () => { const r = await api('/api/operator/sweep', {}); $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'dim top' }, `Removed ${r.removed} expired block(s).`)) }))))
+    el('p', { className: 'dim' }, s.blocks.reannounceHours > 0 ? `Stored blocks are announced to the network again at start-up and every ${s.blocks.reannounceHours} h, so content stays findable after a restart or while its publisher is offline.` : 'Re-announcing is off (--reannounce-hours 0): content is only findable until the network forgets it.'),
+    el('div', { className: 'row' }, btn('Sweep expired data now', async () => { const r = await api('/api/operator/sweep', {}); $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'dim top' }, `Removed ${r.removed} expired block(s).`)) }),
+      btn('Re-announce stored blocks now', async () => { const r = await api('/api/operator/reannounce', {}); await refresh(); $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'dim top' }, `Announced ${r.ok} of ${r.total} stored block(s).`)) }))))
 
   const reason = el('input', { placeholder: 'ban reason (optional)', maxLength: 200, 'aria-label': 'Ban reason' })
   const t = el('table', {}, el('thead', {}, el('tr', {}, ...['Peer', 'Direction', 'Route', 'Latency', ''].map((h) => el('th', {}, h)))))
@@ -606,6 +513,71 @@ async function nodes (v) {
 
   const dk = Object.entries(o.drops)
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Rejected traffic (since start)'), dk.length ? el('table', {}, el('tbody', {}, ...dk.sort((a, b) => b[1] - a[1]).map(([k, n]) => el('tr', {}, el('td', {}, k), el('td', {}, String(n)))))) : el('p', { className: 'dim' }, 'Nothing rejected.')))
+}
+
+const CATEGORY_LABEL = { illegal: 'Illegal content', 'child-safety': 'Child safety', malware: 'Malware', phishing: 'Phishing or scam', harassment: 'Harassment', spam: 'Spam', other: 'Other' }
+const KIND_LABEL = { cid: 'File, site or block (content ID)', name: 'Name', publisher: 'Publisher key' }
+/** What happened to a file key given for an encrypted file (it is never stored). */
+const keyNote = (s) => s === 'used' ? ' The key was used once to list and block every chunk, and was not saved.'
+  : s === 'manifest-not-held' ? ' This node no longer holds that file’s encrypted manifest, so its chunks could not be listed: only the file ID is blocked.' : ''
+
+async function safety (v) {
+  const m = await api('/api/moderation')
+  if (state.note) { v.append(el('p', { className: 'dim' }, state.note)); state.note = '' }
+  v.append(el('div', { className: 'grid' }, stat('Blocklist entries', m.blocklist.length), stat('Open reports', m.reports.filter((r) => r.status === 'open').length)))
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'You host what you store'),
+    el('p', { className: 'dim' }, 'This node stores and serves content other people published, and nobody else can take it down for you. A block applies to this node only: it deletes the local copies, stops advertising them, and refuses to store, fetch, serve or open the same content again (matching is by exact hash, so an altered copy needs its own block). Nothing is sent anywhere: reports stay on this device. If you find illegal content, child sexual abuse material above all, also report it to your national hotline (see inhope.org) and to the authorities where the law requires it, and do not copy or forward the content itself.')))
+
+  const pre = state.report; state.report = null
+  const kind = el('select', { 'aria-label': 'What you are reporting' }, ...Object.entries(KIND_LABEL).map(([k, l]) => el('option', { value: k, selected: pre?.kind === k }, l)))
+  const cat = el('select', { 'aria-label': 'Category' }, ...m.categories.map((c) => el('option', { value: c }, CATEGORY_LABEL[c] ?? c)))
+  const target = el('input', { placeholder: 'frenet://…  frenet-site://…  frenet-name://name.key  or a publisher key', value: pre?.target ?? '', 'aria-label': 'Link or ID' })
+  const note = el('textarea', { rows: 2, maxLength: 500, placeholder: 'what you saw (optional). Do not paste decryption keys or the content itself.', 'aria-label': 'Note' })
+  const also = el('input', { type: 'checkbox', checked: true, style: 'flex:none' })
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Report content'),
+    el('div', { className: 'row' }, kind, cat), el('div', { className: 'row' }, target), el('div', { className: 'row' }, note),
+    el('label', { className: 'row' }, also, 'Also block it on this node now (deletes local copies, including the files of a site)'),
+    el('p', { className: 'dim' }, 'A report never stores a file’s decryption key: the #key part of a link is dropped. If you tick “also block” and paste the full link of an encrypted file, the key is used once to find and block every chunk, then discarded. Reports are signed by this node’s identity, so you can pass one on and others can check it is genuine.'),
+    el('div', { className: 'row' }, btn('File report', async () => {
+      const r = await api('/api/moderation/report', { kind: kind.value, target: target.value, category: cat.value, note: note.value, block: also.checked })
+      state.note = r.purged === null ? 'Report filed.' : `Report filed and blocked: ${r.purged} stored block(s) deleted.` + keyNote(r.keyStatus)
+      go('safety')
+    }))))
+
+  const rt = el('table', {}, el('thead', {}, el('tr', {}, ...['When', 'Type', 'Target', 'Category', 'Note', 'Status', ''].map((h) => el('th', {}, h)))))
+  const rb = el('tbody'); rt.append(rb)
+  for (const r of m.reports) {
+    const acts = el('div', { className: 'row', style: 'margin:0' })
+    if (r.status === 'open') {
+      acts.append(
+        btn('Block', async () => {
+          if (!confirm('Block this on your node? Local copies are deleted and cannot be restored except by fetching them again after you unblock.')) return
+          let key
+          if (r.kind === 'cid') {
+            // Chunks of an encrypted file can only be listed with its key, which a report never keeps. Once the manifest is deleted the key is of no use, so ask now.
+            key = prompt('Is this an encrypted file? Paste its key (the part of the link after #) so every chunk is blocked too. It is used once and not saved. Leave empty to block the file ID only.')
+            if (key === null) return
+            key = key.trim() || undefined
+          }
+          const x = await api('/api/moderation/resolve', { id: r.id, action: 'block', key })
+          state.note = `Blocked: ${x.purged} stored block(s) deleted.` + keyNote(x.keyStatus); go('safety')
+        }),
+        btn('Dismiss', async () => { await api('/api/moderation/resolve', { id: r.id, action: 'dismiss' }); go('safety') }))
+    }
+    acts.append(el('button', { className: 'btn', type: 'button', onclick: async (e) => {
+      try { await navigator.clipboard.writeText(JSON.stringify(r, null, 2)); e.target.textContent = 'Copied' } catch { e.target.textContent = 'Copy failed' }
+    } }, 'Copy signed report'))
+    rb.append(el('tr', {}, el('td', {}, new Date(r.ts).toLocaleString()), el('td', {}, r.kind), el('td', { className: 'mono' }, r.target), el('td', {}, CATEGORY_LABEL[r.category] ?? r.category), el('td', {}, r.note || '–'), el('td', {}, r.status), el('td', {}, acts)))
+  }
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Reports'), m.reports.length ? rt : el('p', { className: 'dim' }, 'No reports. Use Report on a search result, or the form above.')))
+
+  const bt = el('table', {}, el('thead', {}, el('tr', {}, ...['Type', 'Blocked', 'Reason', 'Since', 'Also covers', ''].map((h) => el('th', {}, h)))))
+  const bb = el('tbody'); bt.append(bb)
+  for (const b of m.blocklist) {
+    bb.append(el('tr', {}, el('td', {}, b.kind), el('td', { className: 'mono' }, b.target), el('td', {}, b.reason || '–'), el('td', {}, new Date(b.ts).toLocaleString()), el('td', {}, b.derived ? `${b.derived} related item(s)` : '–'),
+      el('td', {}, btn('Unblock', async () => { await api('/api/moderation/unblock', { kind: b.kind, target: b.target }); go('safety') }))))
+  }
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Blocklist'), m.blocklist.length ? bt : el('p', { className: 'dim' }, 'Nothing blocked. The blocklist is stored on this node and survives restarts. Unblocking lifts the entry and everything it pulled in, but deleted data is gone until it is fetched again.')))
 }
 
 async function refresh () {

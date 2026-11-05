@@ -28,6 +28,21 @@ function open (key: Buffer, blob: Uint8Array, aad: string): Buffer {
   try { return Buffer.concat([d.update(b.subarray(12, b.length - 16)), d.final()]) } catch { throw new Error('wrong key or corrupted data') }
 }
 
+const KEY_RE = /^[A-Za-z0-9_-]{43}$/
+/** A file key as it appears after `#` in a `frenet://` link: 32 bytes, base64url, no padding. */
+export const validFileKey = (k: unknown): k is string => typeof k === 'string' && KEY_RE.test(k)
+
+/**
+ * Chunk CIDs listed by an encrypted file's manifest block, given the key from its link. The key is used for this
+ * call only and is not kept. Throws if the key does not open the block or the block is not a file manifest.
+ */
+export function sealedManifestChunks (blob: Uint8Array, keyB64u: string): string[] {
+  if (!validFileKey(keyB64u)) throw new Error('invalid file key')
+  const m = JSON.parse(open(Buffer.from(keyB64u, 'base64url'), blob, 'm').toString('utf8'))
+  if (m?.v !== 1 || !Array.isArray(m.chunks)) throw new Error('not a file manifest')
+  return m.chunks.filter((c: unknown): c is string => typeof c === 'string')
+}
+
 /**
  * Files = chunked, client-side-encrypted blocks plus an (also encrypted) manifest.
  * The key never touches the network or disk on this node: it exists only in the returned link
@@ -38,7 +53,7 @@ export class FileStore {
   chunkBytes = CHUNK_BYTES
   constructor (private blocks: Blocks, private store: Store) {}
 
-  async add (name: string, data: Uint8Array, opts: { encrypt?: boolean, ttlMs?: number, remember?: boolean } = {}): Promise<AddedFile> {
+  async add (name: string, data: Uint8Array, opts: { encrypt?: boolean, ttlMs?: number } = {}): Promise<AddedFile> {
     if (data.byteLength === 0) throw new Error('empty file')
     if (data.byteLength > MAX_FILE_BYTES) throw new Error(`file exceeds ${MAX_FILE_BYTES} bytes`)
     const encrypt = opts.encrypt !== false
@@ -55,12 +70,8 @@ export class FileStore {
       const mcid = this.blocks.putLocal(key ? seal(key, m, 'm') : m, opts.ttlMs)
       cids.push(mcid)
       this.store.addFile({ cid: mcid.toString(), name: name.slice(0, 255), size: data.byteLength, chunks, encrypted: encrypt, created: Date.now(), expires: opts.ttlMs === undefined ? null : Date.now() + opts.ttlMs })
-      const link = `frenet://${mcid}${key ? '#' + b64u(key) : ''}`
-      // Opt-in only: by default the key lives nowhere on this node. With `remember` the link is kept in the local
-      // database (and so in full archives) so the file stays readable after a restore.
-      if (opts.remember && key) this.store.addFileLink(mcid.toString(), link)
       const announced = await this.blocks.announceAll(cids)
-      return { cid: mcid.toString(), key: key ? b64u(key) : null, link, chunks: chunks.length, size: data.byteLength, announced }
+      return { cid: mcid.toString(), key: key ? b64u(key) : null, link: `frenet://${mcid}${key ? '#' + b64u(key) : ''}`, chunks: chunks.length, size: data.byteLength, announced }
     } catch (e) {
       for (const c of cids) this.store.deleteBlock(c.toString())  // roll back partial writes (e.g. quota)
       throw e
@@ -89,15 +100,11 @@ export class FileStore {
 
   list () { return this.store.listFiles() }
 
-  /** The remembered link of a file added with `remember`, else null. */
-  rememberedLink (cid: string): string | null { return this.store.getFileLink(cid) }
-
   /** Delete the local copies of a file (manifest + chunks not shared with another local file). */
   remove (cid: string): boolean {
     const f = this.store.getFile(cid)
     if (!f) return false
     this.store.deleteFileRow(cid)
-    this.store.deleteFileLink(cid)
     const shared = this.store.referencedChunks()
     for (const c of f.chunks) if (!shared.has(c)) this.store.deleteBlock(c, false)
     this.store.deleteBlock(cid, false)

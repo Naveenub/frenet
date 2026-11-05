@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs'
 import { request } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -9,7 +9,7 @@ import { CID } from 'multiformats/cid'
 import { startApi } from '../src/api.js'
 import { cidFor, ContentBlocked } from '../src/blocks.js'
 import { startGateway } from '../src/gateway.js'
-import { MAX_NOTE, MAX_REPORTS, normalizeTarget, verifyReport } from '../src/moderation.js'
+import { keyFromLink, MAX_NOTE, MAX_REPORTS, normalizeTarget, verifyReport } from '../src/moderation.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
 
 const L = ['/ip4/127.0.0.1/tcp/0']
@@ -367,6 +367,134 @@ describe('moderation API', () => {
       const st = (await call('/api/status')).json
       assert.equal(st.blocks.lastReannounce.total, 1)
       assert.equal(st.blocks.reannounceHours, 12)
+    } finally { server.close() }
+  })
+})
+
+describe('blocking encrypted files', () => {
+  /** 600 KB = 3 chunks of 256 KB, each sealed with a fresh nonce, so every copy has its own chunk CIDs. */
+  const big = (fill: number) => Buffer.alloc(600 * 1024, fill)
+  /** `a` adds an encrypted file; `b` downloads it, so b holds the manifest and 3 chunks as replicas and cannot read the manifest. */
+  const replicate = async (a: FrenetNode, b: FrenetNode, fill: number) => {
+    const f = await a.files.add(`f${fill}.bin`, big(fill))
+    assert.ok(f.key)
+    await b.files.get(f.cid, f.key)
+    return { ...f, key: f.key!, chunks: a.store.getFile(f.cid)!.chunks }
+  }
+
+  it('without the key only the manifest is blocked; with the file link every chunk is', async () => {
+    const { a, b } = await pair()
+    const f1 = await replicate(a, b, 1)
+    const f2 = await replicate(a, b, 2)
+    assert.equal(b.store.blockStats().count, 8)
+
+    const noKey = b.moderation.block('cid', f1.cid)
+    assert.deepEqual([noKey.purged, noKey.entry.derived, noKey.keyStatus], [1, 0, null])
+    assert.equal(b.store.blockStats().count, 7)                      // f1's 3 chunks are orphans that only the replica TTL will remove
+    for (const c of f1.chunks) assert.equal(b.moderation.isBlocked('cid', c), false)
+
+    const keyed = b.moderation.block('cid', f2.link)                  // the #key in the link is used once, in memory
+    assert.deepEqual([keyed.purged, keyed.entry.derived, keyed.keyStatus], [4, 3, 'used'])
+    assert.equal(b.store.blockStats().count, 3)                      // only f1's orphans are left
+    for (const c of f2.chunks) assert.equal(b.moderation.isBlocked('cid', c), true)
+    await assert.rejects(b.blocks.get(f2.chunks[0]), ContentBlocked)
+
+    // Once the manifest is gone the key cannot help, which is why the dashboard asks for it at the moment of blocking.
+    const late = b.moderation.block('cid', f1.link)
+    assert.deepEqual([late.purged, late.keyStatus], [0, 'manifest-not-held'])
+    assert.equal(b.store.blockStats().count, 3)
+
+    // Unblocking lifts the chunks that the key revealed, together with the manifest.
+    assert.equal(b.moderation.unblock('cid', f2.cid), true)
+    for (const c of f2.chunks) assert.equal(b.moderation.isBlocked('cid', c), false)
+    assert.equal(b.moderation.isBlocked('cid', f1.cid), true)         // f1's own entry is untouched
+  })
+
+  it('takes the key separately too, and says whether it was needed', async () => {
+    const { a, b } = await pair()
+    const sealed = await replicate(a, b, 3)
+    assert.equal(b.moderation.block('cid', sealed.cid, 'x', sealed.key).keyStatus, 'used')       // key as its own argument
+    assert.equal(b.store.blockStats().count, 0)
+
+    // A public file's chunks are the plain bytes, so give each chunk different content (identical chunks would share one CID).
+    const plain = Buffer.concat([Buffer.alloc(256 * 1024, 4), Buffer.alloc(256 * 1024, 5), Buffer.alloc(88 * 1024, 6)])
+    const pub = await a.files.add('open.bin', plain, { encrypt: false })
+    await b.files.get(pub.cid, null)                                                              // a public file: manifest is readable by anyone
+    const anyKey = Buffer.alloc(32, 5).toString('base64url')
+    const r = b.moderation.block('cid', pub.cid, 'x', anyKey)
+    assert.deepEqual([r.keyStatus, r.purged, r.entry.derived], ['not-needed', 4, 3])
+
+    const own = await a.files.add('mine.bin', big(6))                                             // the owner already knows the chunks
+    assert.deepEqual([a.moderation.block('cid', own.link).keyStatus, a.moderation.list()[0].derived], ['not-needed', 3])
+  })
+
+  it('rejects a wrong or malformed key before anything has changed, and leaves no half-finished report', async () => {
+    const { a, b } = await pair()
+    const f = await replicate(a, b, 7)
+    const wrong = Buffer.alloc(32, 9).toString('base64url')
+    assert.throws(() => b.moderation.block('cid', f.cid, '', wrong), /does not open/)
+    assert.throws(() => b.moderation.block('cid', f.cid, '', 'short'), /invalid file key/)
+    assert.throws(() => b.moderation.block('cid', `${f.cid}#nonsense-but-not-a-key`, '', 'short'), /invalid file key/)
+    assert.throws(() => b.moderation.block('name', `x.${a.names.publisherKey}`, '', f.key), /only applies to a content ID/)
+    await assert.rejects(b.moderation.reportAndBlock({ kind: 'cid', target: f.cid, category: 'illegal' }, wrong), /does not open/)
+    assert.deepEqual([b.moderation.list().length, b.moderation.listReports().length, b.store.blockStats().count], [0, 0, 4])
+    assert.equal(b.moderation.block('cid', f.cid, '', f.key).keyStatus, 'used')                    // the right key then works
+    // a fragment that is not a key is simply dropped, as before
+    assert.equal(keyFromLink(`frenet://x#${f.key}`), f.key)
+    assert.equal(keyFromLink(`frenet://x#${f.key}  `), f.key)
+    assert.equal(keyFromLink('frenet://x#short'), undefined)
+    assert.equal(keyFromLink('frenet://x'), undefined)
+    assert.equal(keyFromLink(42), undefined)
+  })
+
+  it('never writes the key to disk', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'frenet-key-')); dirs.push(dir)
+    const a = await track()
+    const b = await track({ dataDir: dir })
+    await a.libp2p.dial(b.libp2p.getMultiaddrs()[0]); await sleep(1500)
+    const f = await replicate(a, b, 8)
+    const out = await b.moderation.reportAndBlock({ kind: 'cid', target: f.link, category: 'malware', note: 'n' })
+    assert.equal(out.keyStatus, 'used')
+    assert.equal(JSON.stringify([out, b.moderation.list(), b.moderation.listReports()]).includes(f.key), false)
+    await b.stop()
+    const files = readdirSync(dir).filter((n) => n.startsWith('frenet.db'))
+    assert.ok(files.length >= 1)
+    const disk = Buffer.concat(files.map((n) => readFileSync(join(dir, n))))
+    assert.ok(disk.includes(Buffer.from(f.cid)), 'the scan can see the database content')     // so a miss below means something
+    assert.equal(disk.includes(Buffer.from(f.key)), false)
+  })
+
+  it('works through the API for blocking, report-and-block and resolving a report, and never echoes a key', async () => {
+    const { a, b } = await pair()
+    const [f1, f2, f3] = [await replicate(a, b, 11), await replicate(a, b, 12), await replicate(a, b, 13)]
+    const { server, port } = await startApi(b, 0)
+    const call = async (path: string, body?: unknown) => {
+      const r = await fetch(`http://127.0.0.1:${port}${path}`, body === undefined ? undefined : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) })
+      return { status: r.status, json: await r.json() as any }
+    }
+    try {
+      const r1 = await call('/api/moderation/block', { kind: 'cid', target: f1.link, reason: 'abuse' })
+      assert.deepEqual([r1.status, r1.json.keyStatus, r1.json.purged, r1.json.entry.derived], [200, 'used', 4, 3])
+
+      const r2 = await call('/api/moderation/report', { kind: 'cid', target: f2.link, category: 'illegal', block: true })
+      assert.deepEqual([r2.status, r2.json.keyStatus, r2.json.purged, r2.json.report.status, r2.json.report.target], [200, 'used', 4, 'blocked', f2.cid])
+
+      const filed = await call('/api/moderation/report', { kind: 'cid', target: f3.link, category: 'malware' })   // a plain report keeps no key
+      assert.deepEqual([filed.json.report.target, filed.json.report.status, filed.json.purged, filed.json.keyStatus], [f3.cid, 'open', null, null])
+      assert.equal(b.store.blockStats().count, 4)                                                                // nothing blocked yet
+      const wrong = await call('/api/moderation/resolve', { id: filed.json.report.id, action: 'block', key: Buffer.alloc(32, 1).toString('base64url') })
+      assert.equal(wrong.status, 400)
+      assert.equal(b.store.blockStats().count, 4)                                                                // a wrong key changed nothing
+      const r3 = await call('/api/moderation/resolve', { id: filed.json.report.id, action: 'block', key: f3.key })
+      assert.deepEqual([r3.status, r3.json.keyStatus, r3.json.purged, r3.json.report.status], [200, 'used', 4, 'blocked'])
+      assert.equal(b.store.blockStats().count, 0)
+
+      const everything = JSON.stringify([r1.json, r2.json, filed.json, wrong.json, r3.json, (await call('/api/moderation')).json])
+      for (const f of [f1, f2, f3]) assert.equal(everything.includes(f.key), false)
+
+      const bad = await call('/api/moderation/report', { kind: 'cid', target: f1.cid, category: 'spam', block: true, key: 'nope' })
+      assert.equal(bad.status, 400)
+      assert.equal((await call('/api/moderation')).json.reports.length, 2)                                       // r2 and the resolved one; r1 was a plain block, and the failed attempt filed nothing
     } finally { server.close() }
   })
 })

@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
 import { CID } from 'multiformats/cid'
 import { canon, ID_RE, signBytes, verifyBytes } from './channel.js'
+import { sealedManifestChunks, validFileKey } from './files.js'
 import { NAME_RE, pubToB32, validPub } from './names.js'
 import { validCid } from './sites.js'
 import type { ReportRow, Store } from './store.js'
@@ -37,6 +38,18 @@ const MAX_DERIVED = 5000
 const HAS_CONTROL = /[\u0000-\u001f\u007f]/
 // eslint-disable-next-line no-control-regex
 const STRIP_CONTROL = /[\u0000-\u001f\u007f]/g
+
+/**
+ * What a supplied file key did: `used` = it opened a manifest this node holds and every chunk was listed;
+ * `not-needed` = the chunks could be listed without it (this node's own file, or a public manifest);
+ * `manifest-not-held` = this node no longer holds the manifest, so its chunks cannot be listed.
+ */
+export type KeyStatus = 'used' | 'not-needed' | 'manifest-not-held'
+
+/** The `#key` at the end of a file link, if there is one. Only ever used in memory, for one block operation. */
+export function keyFromLink (input: unknown): string | undefined {
+  return typeof input === 'string' ? /#([A-Za-z0-9_-]{43})\s*$/.exec(input)?.[1] : undefined
+}
 
 export interface BlockEntry { kind: TargetKind, target: string, reason: string, ts: number, /** how many other entries this one pulled in (a site's files and chunks, a name's site, ...) */ derived: number }
 
@@ -132,13 +145,22 @@ export class Moderation {
    * Block a content ID (a file, a site, or any block), a name, or a publisher key.
    * Whatever the target pulled in that this node holds is blocked with it: a site's file manifests and chunks, the
    * site a name points at, every name of a publisher and their sites. Local copies are deleted and no longer advertised.
+   *
+   * For an encrypted file, pass its key (or the whole `frenet://...#key` link): the sealed manifest is then read once,
+   * in memory, so every chunk is blocked and purged too. The key is never stored, logged or returned. Without it only
+   * the manifest can be blocked, because chunks of an encrypted file cannot be listed. A key that does not open a
+   * manifest this node holds is an error, raised before anything has changed.
    */
-  block (kindIn: unknown, targetIn: unknown, reasonIn: unknown = ''): { entry: BlockEntry, purged: number } {
+  block (kindIn: unknown, targetIn: unknown, reasonIn: unknown = '', keyIn?: unknown): { entry: BlockEntry, purged: number, keyStatus: KeyStatus | null } {
     const kind = parseKind(kindIn)
     const target = normalizeTarget(kind, targetIn)
     const reason = cleanText(reasonIn, MAX_REASON)
     if (kind === 'publisher' && target === this.ownPub) throw new Error("cannot block this node's own publisher key")
     const parent = `${kind}:${target}`
+    const given = keyIn === undefined || keyIn === null || keyIn === '' ? undefined : keyIn
+    if (given !== undefined && kind !== 'cid') throw new Error('a file key only applies to a content ID')
+    const key = given ?? (kind === 'cid' ? keyFromLink(targetIn) : undefined)
+    if (key !== undefined && !validFileKey(key)) throw new Error('invalid file key (43 characters: the part after # in a frenet:// link)')
 
     // Work out what the target covers before anything is deleted.
     const roots: string[] = []
@@ -156,13 +178,18 @@ export class Moderation {
       }
     }
     const covered = new Set<string>()
-    for (const root of roots) for (const c of this.closure(root)) { if (covered.size < MAX_DERIVED) covered.add(c) }
+    let keyStatus: KeyStatus | null = null
+    for (const root of roots) {
+      const walk = this.closure(root, key)   // may throw on a wrong key: nothing above has changed state for kind 'cid'
+      keyStatus = walk.key
+      for (const c of walk.cids) if (covered.size < MAX_DERIVED) covered.add(c)
+    }
 
     this.store.addContentBlock(kind, target, '', reason)
     for (const c of covered) if (!(kind === 'cid' && c === target)) this.store.addContentBlock('cid', c, parent, reason)
     this.reload()
     this.store.closeOpenReports(kind, target, 'blocked')
-    return { entry: this.list().find((e) => e.kind === kind && e.target === target)!, purged: this.purge(covered) }
+    return { entry: this.list().find((e) => e.kind === kind && e.target === target)!, purged: this.purge(covered), keyStatus }
   }
 
   /** Lift an entry and everything it pulled in. Deleted data is not restored; it can be fetched again from peers. */
@@ -175,27 +202,37 @@ export class Moderation {
 
   /**
    * Local-only walk of what a block refers to, never touching the network: a site manifest lists file manifests,
-   * a file manifest lists chunks. Encrypted manifests cannot be read without the key, so for a file this node
-   * holds only as someone else's replica the chunks are not enumerable (they expire with the replica TTL).
+   * a file manifest lists chunks. A sealed (encrypted) manifest can be read only with `key`; without it, a file this
+   * node holds only as someone else's replica has chunks that cannot be listed (they expire with the replica TTL).
+   * The key is applied to the root only and is never kept.
    */
-  private closure (root: string): Set<string> {
+  private closure (root: string, key?: string): { cids: Set<string>, key: KeyStatus | null } {
     const out = new Set<string>([root])
-    const kids = (cid: string): { type: 'site' | 'file' | null, cids: string[] } => {
+    let keyStatus: KeyStatus | null = key === undefined ? null : 'manifest-not-held'
+    const kids = (cid: string, k?: string): { type: 'site' | 'file' | null, cids: string[] } => {
       const f = this.store.getFile(cid)
-      if (f) return { type: 'file', cids: f.chunks.filter(validCid).slice(0, MAX_LIST) }
+      if (f) { if (k) keyStatus = 'not-needed'; return { type: 'file', cids: f.chunks.filter(validCid).slice(0, MAX_LIST) } }
       const data = this.store.getBlock(cid)
-      if (!data || data.byteLength > MAX_MANIFEST_BYTES) return { type: null, cids: [] }
+      if (!data) return { type: null, cids: [] }
+      if (k) keyStatus = 'not-needed'   // held; becomes 'used' below if the key was what opened it
+      if (data.byteLength > MAX_MANIFEST_BYTES) return { type: null, cids: [] }
       let m: any
-      try { m = JSON.parse(Buffer.from(data).toString('utf8')) } catch { return { type: null, cids: [] } }
+      try { m = JSON.parse(Buffer.from(data).toString('utf8')) } catch {
+        if (!k) return { type: null, cids: [] }
+        let chunks: string[]
+        try { chunks = sealedManifestChunks(data, k) } catch { throw new Error("that key does not open this file's manifest") }
+        keyStatus = 'used'
+        return { type: 'file', cids: chunks.filter(validCid).slice(0, MAX_LIST) }
+      }
       if (typeof m !== 'object' || m === null || m.v !== 1) return { type: null, cids: [] }
       if (m.type === 'site' && typeof m.files === 'object' && m.files !== null && !Array.isArray(m.files)) return { type: 'site', cids: (Object.values(m.files) as unknown[]).filter(validCid).slice(0, MAX_LIST) }
       if (Array.isArray(m.chunks)) return { type: 'file', cids: (m.chunks as unknown[]).filter(validCid).slice(0, MAX_LIST) }
       return { type: null, cids: [] }
     }
-    const top = kids(root)
+    const top = kids(root, key)
     for (const c of top.cids) out.add(c)
     if (top.type === 'site') for (const f of top.cids) for (const c of kids(f).cids) out.add(c)
-    return out
+    return { cids: out, key: keyStatus }
   }
 
   /** Delete local data for these CIDs, drop names that point at them, and stop advertising them. Returns blocks removed. */
@@ -230,20 +267,33 @@ export class Moderation {
     return row
   }
 
+  /**
+   * File a report and block its target in one step. The block comes first: if it fails (a key that does not open the
+   * manifest, say) nothing has changed and no half-finished report is left behind.
+   */
+  async reportAndBlock (input: Record<string, unknown>, keyIn?: unknown): Promise<{ report: ReportRow, purged: number, keyStatus: KeyStatus | null }> {
+    const category = parseCategory(input.category)
+    const done = this.block(input.kind, input.target, `report: ${category}`, keyIn)   // the raw target, so a #key in the link is found
+    const report = await this.report(input)
+    this.store.setReportStatus(report.id, 'blocked')
+    return { report: { ...report, status: 'blocked' }, purged: done.purged, keyStatus: done.keyStatus }
+  }
+
   listReports (): ReportRow[] { return this.store.listReports() }
 
   /** Close a report: `block` blocks its target (and closes every open report about it), `dismiss` just closes it. */
-  resolve (idIn: unknown, action: unknown, reasonIn: unknown = ''): { report: ReportRow, purged: number } {
+  resolve (idIn: unknown, action: unknown, reasonIn: unknown = '', keyIn?: unknown): { report: ReportRow, purged: number, keyStatus: KeyStatus | null } {
     const r = this.store.getReport(String(idIn))
     if (!r) throw new Error('no such report')
     if (action === 'dismiss') {
       this.store.setReportStatus(r.id, 'dismissed')
-      return { report: { ...r, status: 'dismissed' }, purged: 0 }
+      return { report: { ...r, status: 'dismissed' }, purged: 0, keyStatus: null }
     }
     if (action !== 'block') throw new Error('action must be "block" or "dismiss"')
-    const { purged } = this.block(r.kind, r.target, cleanText(reasonIn, MAX_REASON) || `report: ${r.category}`)
+    // A report never holds the file key, so for an encrypted file the operator supplies it again here, if they have it.
+    const { purged, keyStatus } = this.block(r.kind, r.target, cleanText(reasonIn, MAX_REASON) || `report: ${r.category}`, keyIn)
     this.store.setReportStatus(r.id, 'blocked')   // block() closed the open ones; this also covers a report that was dismissed earlier
-    return { report: { ...r, status: 'blocked' }, purged }
+    return { report: { ...r, status: 'blocked' }, purged, keyStatus }
   }
 
   counts (): { blocklist: number, openReports: number } {
