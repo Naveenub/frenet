@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { multiaddr } from '@multiformats/multiaddr'
 import { peerIdFromString } from '@libp2p/peer-id'
 import { ContentBlocked, DAY_MS } from './blocks.js'
+import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
 import { REPORT_CATEGORIES } from './moderation.js'
@@ -48,10 +49,12 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (!hostOk(req)) return json(res, 403, { error: 'bad host' })
       const url = new URL(req.url ?? '/', 'http://localhost')
 
-      if (req.method === 'POST') {
+      const streamUpload = req.method === 'PUT' && url.pathname === '/api/files/stream'
+      if (req.method === 'POST' || streamUpload) {
         const origin = req.headers.origin
         if (origin && new URL(origin).host !== req.headers.host) return json(res, 403, { error: 'cross-origin' })
-        if (!String(req.headers['content-type'] ?? '').startsWith('application/json')) return json(res, 415, { error: 'json only' })
+        const ct = String(req.headers['content-type'] ?? '')
+        if (streamUpload ? !ct.startsWith('application/octet-stream') : !ct.startsWith('application/json')) return json(res, 415, { error: streamUpload ? 'octet-stream only' : 'json only' })
       }
 
       if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort))
@@ -67,25 +70,57 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         return
       }
       if (req.method === 'POST' && url.pathname === '/api/blocks') {
+        // Encrypted by default: the block is sealed with a fresh key that is returned once and never stored, so a
+        // provider (or anyone who learns the CID) sees ciphertext. `public: true` stores the bytes as given.
         const b = await body(req)
         const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
-        return json(res, 200, await n.blocks.put(Buffer.from(String(b.data ?? ''), 'base64'), ttl))
+        const plain = Buffer.from(String(b.data ?? ''), 'base64')
+        if (b.public === true) return json(res, 200, { ...await n.blocks.put(plain, ttl), key: null })
+        if (plain.length === 0 || plain.length > 1024 * 1024 - 28) throw new Error(`encrypted block must be 1..${1024 * 1024 - 28} bytes`)
+        const sealed = sealBlock(plain)
+        return json(res, 200, { ...await n.blocks.put(sealed.blob, ttl), key: sealed.key })
       }
       if (req.method === 'GET' && url.pathname.startsWith('/api/blocks/')) {
         const data = await n.blocks.get(decodeURIComponent(url.pathname.slice('/api/blocks/'.length)))
         if (!data) return json(res, 404, { error: 'no provider returned this block' })
-        return json(res, 200, { data: Buffer.from(data).toString('base64') })
+        const key = req.headers['x-frenet-key']
+        if (typeof key === 'string' && key) return json(res, 200, { data: openBlock(data, key).toString('base64') })
+        return json(res, 200, { data: Buffer.from(data).toString('base64') })   // no key: the stored bytes (ciphertext for encrypted blocks)
       }
       if (req.method === 'GET' && url.pathname === '/api/files') return json(res, 200, n.files.list())
       if (req.method === 'POST' && url.pathname === '/api/files') {
-        const b = await body(req, 24 * 1024 * 1024)
+        const b = await body(req, 24 * 1024 * 1024)   // JSON/base64 path stays for small files (dashboard); use PUT /api/files/stream for large ones
         const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
         return json(res, 200, await n.files.add(String(b.name ?? 'file').slice(0, 255), Buffer.from(String(b.data ?? ''), 'base64'), { encrypt: b.encrypt !== false, ttlMs: ttl, remember: b.remember === true }))
       }
+      if (streamUpload) {
+        // Raw bytes in, no base64/JSON: memory stays at ~one chunk. name, ttlDays, encrypt, remember are query parameters.
+        const len = Number(req.headers['content-length'] ?? 0)
+        if (len > MAX_FILE_BYTES) return json(res, 413, { error: `file exceeds ${MAX_FILE_BYTES} bytes` })
+        const q = url.searchParams
+        const ttl = q.get('ttlDays') ? Number(q.get('ttlDays')) * DAY_MS : undefined
+        return json(res, 200, await n.files.addStream(String(q.get('name') ?? 'file').slice(0, 255), req, { encrypt: q.get('encrypt') !== 'false', ttlMs: ttl, remember: q.get('remember') === 'true' }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/files/download') {
+        const b = await body(req)
+        const key = b.key ? String(b.key) : null
+        if (key && !validFileKey(key)) throw new Error('invalid key')
+        const f = await n.files.open(String(b.cid), key)   // manifest errors (404-ish, wrong key, blocked 451) surface before any bytes are sent
+        res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': String(f.size), 'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(f.name)}`, 'x-content-type-options': 'nosniff', 'cache-control': 'no-store' })
+        try {
+          for await (const part of f.chunks) { if (!res.write(part)) await new Promise<void>((ok) => res.once('drain', ok)) }
+          res.end()
+        } catch { res.destroy() }   // a failed chunk must not look like a complete file: cut the connection
+        return
+      }
       if (req.method === 'POST' && url.pathname === '/api/files/get') {
         const b = await body(req)
-        const f = await n.files.get(String(b.cid), b.key ? String(b.key) : null)
-        return json(res, 200, { name: f.name, size: f.data.length, data: f.data.toString('base64') })
+        const o = await n.files.open(String(b.cid), b.key ? String(b.key) : null)
+        if (o.size > 16 * 1024 * 1024) { await o.chunks.return(); throw new Error('file is larger than 16 MB: use POST /api/files/download, which streams') }
+        const parts: Buffer[] = []
+        for await (const p of o.chunks) parts.push(p)
+        const data = Buffer.concat(parts)
+        return json(res, 200, { name: o.name, size: data.length, data: data.toString('base64') })
       }
       if (req.method === 'POST' && url.pathname === '/api/files/delete') {
         const b = await body(req)

@@ -1,9 +1,10 @@
 import { CID } from 'multiformats/cid'
 import type { Blocks } from './blocks.js'
-import { MAX_FILE_BYTES, type FileStore } from './files.js'
+import type { FileStore } from './files.js'
 
 export const MAX_SITE_FILES = 64
 export const MAX_SITE_BYTES = 32 * 1024 * 1024
+export const MAX_SITE_FILE_BYTES = 16 * 1024 * 1024
 const MAX_MANIFEST_BYTES = 64 * 1024
 const MAX_PATH_LEN = 200
 const SEGMENT_RE = /^[A-Za-z0-9._-]{1,100}$/
@@ -43,7 +44,7 @@ export class Sites {
       if (seen.has(e.path)) throw new Error(`duplicate path: ${e.path}`)
       seen.add(e.path)
       if (e.data.byteLength === 0) throw new Error(`empty file: ${e.path}`)
-      if (e.data.byteLength > MAX_FILE_BYTES) throw new Error(`file too large: ${e.path}`)
+      if (e.data.byteLength > MAX_SITE_FILE_BYTES) throw new Error(`file too large: ${e.path}`)
       bytes += e.data.byteLength
     }
     if (bytes > MAX_SITE_BYTES) throw new Error(`site exceeds ${MAX_SITE_BYTES} bytes`)

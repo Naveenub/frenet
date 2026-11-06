@@ -138,13 +138,17 @@ async function storage (v) {
   const add = el('button', { className: 'btn', type: 'button', onclick: async () => {
     msg.textContent = ''; out.replaceChildren()
     const f = pick.files[0]
-    if (!f) { msg.textContent = 'Choose a file first (max 16 MB).'; return }
-    if (f.size > 16 * 1048576) { msg.textContent = 'File is larger than 16 MB.'; return }
+    if (!f) { msg.textContent = 'Choose a file first (max 1 GiB).'; return }
+    if (f.size > 1024 * 1048576) { msg.textContent = 'File is larger than 1 GiB.'; return }
     add.disabled = true; msg.textContent = 'Encrypting and publishing…'
     try {
-      const r = await api('/api/files', { name: f.name, data: b64(await f.arrayBuffer()), encrypt: enc.checked, ttlDays: ttl.value ? Number(ttl.value) : undefined })
+      // The File is sent as the raw request body (no base64, not read into the page's memory); the node encrypts it chunk by chunk.
+      const qs = new URLSearchParams({ name: f.name, encrypt: String(enc.checked) }); if (ttl.value) qs.set('ttlDays', String(Number(ttl.value)))
+      const up = await fetch('/api/files/stream?' + qs, { method: 'PUT', headers: { 'content-type': 'application/octet-stream' }, body: f })
+      const r = await up.json()
+      if (!up.ok) throw new Error(r.error || up.statusText)
       msg.textContent = ''
-      out.append(el('p', {}, r.announced ? 'Added. Peers can find it.' : 'Added locally. No peers announced it yet; connect to peers and add it again to share.'),
+      out.append(el('p', {}, r.announced ? 'Added. Peers can find it.' : r.announcing ? 'Added. Large file: announcing it to peers in the background.' : 'Added locally. No peers announced it yet; connect to peers and add it again to share.'),
         el('div', { className: 'mono' }, r.link), el('p', { className: 'dim' }, r.key ? 'Anyone with this full link can read the file. The key is not stored on this node. Keep the link.' : 'Public file: anyone with the link can read it.'))
       await refresh(); go('storage')
     } catch (e) { msg.textContent = e.message } finally { add.disabled = false }
@@ -158,10 +162,12 @@ async function storage (v) {
     try {
       const [cid, key] = link.value.trim().replace(/^frenet:\/\//, '').split('#')
       dmsg.textContent = 'Fetching from peers…'
-      const r = await api('/api/files/get', { cid, key })
-      const bytes = Uint8Array.from(atob(r.data), (c) => c.charCodeAt(0))
-      const a = el('a', { href: URL.createObjectURL(new Blob([bytes])), download: r.name }); document.body.append(a); a.click(); a.remove()
-      dmsg.textContent = `Downloaded ${r.name} (${mb(r.size)}).`
+      const r = await fetch('/api/files/download', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ cid, key }) })
+      if (!r.ok) throw new Error((await r.json()).error || r.statusText)
+      const blob = await r.blob()   // a cut-off transfer (failed chunk) rejects here instead of saving a partial file
+      const name = decodeURIComponent((/filename\*=UTF-8''([^;]+)/.exec(r.headers.get('content-disposition') || '') || [])[1] || 'download')
+      const a = el('a', { href: URL.createObjectURL(blob), download: name }); document.body.append(a); a.click(); a.remove()
+      dmsg.textContent = `Downloaded ${name} (${mb(blob.size)}).`
     } catch (e) { dmsg.textContent = e.message }
   } }, 'Download from network')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Download a file'), el('div', { className: 'row' }, link, get), dmsg))

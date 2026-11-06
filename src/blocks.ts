@@ -150,6 +150,7 @@ export class Blocks {
 
   async announce (cid: CID): Promise<boolean> {
     if (this.moderation.isBlocked('cid', cid.toString())) return false
+    if (this.node.getPeers().length === 0) return false   // nobody to tell: fail now instead of waiting out the timeout per block (the re-announce run retries later)
     try { await this.node.contentRouting.provide(cid, { signal: AbortSignal.timeout(5000) }); return true } catch { return false }
   }
 
