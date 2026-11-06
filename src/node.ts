@@ -14,10 +14,14 @@ import { uPnPNAT } from '@libp2p/upnp-nat'
 import { createLibp2p } from 'libp2p'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
+import { base32 } from 'multiformats/bases/base32'
 import { loadOrCreateIdentity } from './identity.js'
+import { IdentityLogs, verifyLog, type IdentityState } from './identity-log.js'
+import { readIdentityLog } from './recovery.js'
+import { Revocations } from './revocations.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
-import { Credentials } from './credentials.js'
+import { Credentials, type RevocationCheck } from './credentials.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
@@ -81,8 +85,14 @@ export interface FrenetNode {
   reputation: Reputation
   sybil: SybilGuard
   credentials: Credentials
-  /** did:key of this node's identity (same key as the peer ID). */
+  identityLogs: IdentityLogs
+  revocations: Revocations
+  /** Primary DID: did:frenet when this node has a rotatable identity (key log), otherwise the did:key of its key. */
   did: string
+  /** did:key of the current key (same key as the peer ID). */
+  keyDid: string
+  /** The verified key log of a rotatable identity, or null for a plain fixed-key identity. */
+  identity: IdentityState | null
   iceServers: string[]
   startedAt: number
   stop: () => Promise<void>
@@ -95,6 +105,16 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     privateKey = opts.privateKey ?? await generateKeyPair('Ed25519')
   } else {
     privateKey = (await loadOrCreateIdentity(opts.dataDir)).key
+  }
+  // A rotatable identity (did:frenet) keeps a public key log next to the key. It is verified before anything is opened,
+  // and it must end in the key this node actually runs with: otherwise we would sign as an identity we do not control.
+  let identity: IdentityState | null = null
+  if (opts.dataDir !== ':memory:') {
+    const events = readIdentityLog(opts.dataDir)
+    if (events) {
+      identity = await verifyLog(events)
+      if (identity.key !== base32.baseEncode(privateKey.publicKey.raw)) throw new Error("identity-log.json does not end in this node's identity key; restore the matching key or remove the log")
+    }
   }
 
   if (opts.reannounceMs !== undefined && !(Number.isFinite(opts.reannounceMs) && opts.reannounceMs >= 0)) throw new Error('reannounceMs must be a number >= 0 (0 turns re-announcing off)')
@@ -186,7 +206,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const calls = new Calls(libp2p, privateKey)
   const groups = new Groups(libp2p, store, privateKey)
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
-  const credentials = new Credentials(store, privateKey)
+  const identityLogs = new IdentityLogs(libp2p, store)
+  const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
+  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations })
   // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
   const report = (peer: string, ev: ReputationEvent, detail = ''): void => {
     if (reputation.record(peer, ev, detail)) { void libp2p.hangUp(peerIdFromString(peer)).catch(() => {}) }
@@ -214,6 +236,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   await groups.start()
   await blocks.start()
   await names.start()
+  if (identity) await identityLogs.adopt(identity.events, true)
+  await identityLogs.start()
+  await revocations.start()
   await libp2p.start()
 
   // Auto-dial discovered peers (mDNS / bootstrap).
@@ -238,7 +263,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     reputation,
     sybil,
     credentials,
+    identityLogs,
+    revocations,
     did: credentials.did,
+    keyDid: credentials.keyDid,
+    identity,
     iceServers,
     startedAt: Date.now(),
     stop: async () => {
@@ -248,6 +277,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
       await groups.stop()
       await blocks.stop()
       await names.stop()
+      await identityLogs.stop()
+      await revocations.stop()
       await libp2p.stop()
       store.close()
     }

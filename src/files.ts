@@ -53,7 +53,7 @@ export class FileStore {
   chunkBytes = CHUNK_BYTES
   constructor (private blocks: Blocks, private store: Store) {}
 
-  async add (name: string, data: Uint8Array, opts: { encrypt?: boolean, ttlMs?: number } = {}): Promise<AddedFile> {
+  async add (name: string, data: Uint8Array, opts: { encrypt?: boolean, ttlMs?: number, remember?: boolean } = {}): Promise<AddedFile> {
     if (data.byteLength === 0) throw new Error('empty file')
     if (data.byteLength > MAX_FILE_BYTES) throw new Error(`file exceeds ${MAX_FILE_BYTES} bytes`)
     const encrypt = opts.encrypt !== false
@@ -70,8 +70,11 @@ export class FileStore {
       const mcid = this.blocks.putLocal(key ? seal(key, m, 'm') : m, opts.ttlMs)
       cids.push(mcid)
       this.store.addFile({ cid: mcid.toString(), name: name.slice(0, 255), size: data.byteLength, chunks, encrypted: encrypt, created: Date.now(), expires: opts.ttlMs === undefined ? null : Date.now() + opts.ttlMs })
+      const link = `frenet://${mcid}${key ? '#' + b64u(key) : ''}`
+      // opt-in only: by default the key exists nowhere on this node but in the returned link
+      if (opts.remember && key) this.store.putFileLink(mcid.toString(), link)
       const announced = await this.blocks.announceAll(cids)
-      return { cid: mcid.toString(), key: key ? b64u(key) : null, link: `frenet://${mcid}${key ? '#' + b64u(key) : ''}`, chunks: chunks.length, size: data.byteLength, announced }
+      return { cid: mcid.toString(), key: key ? b64u(key) : null, link, chunks: chunks.length, size: data.byteLength, announced }
     } catch (e) {
       for (const c of cids) this.store.deleteBlock(c.toString())  // roll back partial writes (e.g. quota)
       throw e
@@ -99,6 +102,9 @@ export class FileStore {
   }
 
   list () { return this.store.listFiles() }
+
+  /** The full `frenet://cid#key` link, only for files added with `remember`; null otherwise (the key is not stored by default). */
+  rememberedLink (cid: string): string | null { return this.store.getFileLink(cid) }
 
   /** Delete the local copies of a file (manifest + chunks not shared with another local file). */
   remove (cid: string): boolean {

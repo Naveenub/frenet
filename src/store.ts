@@ -2,6 +2,26 @@ import { DatabaseSync } from 'node:sqlite'
 import { join } from 'node:path'
 import type { NameRecord } from './names.js'
 import type { PeerReputation } from './reputation.js'
+import type { IdentityEvent } from './identity-log.js'
+
+const MAX_FOREIGN_REVOCATIONS = 10_000
+const MAX_FOREIGN_IDENTITY_LOGS = 5_000
+
+interface Col { name: string, type: 'text' | 'int', nullable?: boolean }
+const T = (name: string, nullable = false): Col => ({ name, type: 'text', nullable })
+const I = (name: string, nullable = false): Col => ({ name, type: 'int', nullable })
+/** Tables an archive carries, with the columns validated on import. Replicas and cached foreign records are left out on purpose. */
+const ARCHIVE_TABLES: Record<string, { cols: Col[], where?: string }> = {
+  messages: { cols: [T('id'), T('peer'), T('direction'), I('ts'), T('body'), T('sig', true), T('sender', true), T('recipient', true)] },
+  files: { cols: [T('cid'), T('name'), I('size'), T('chunks'), I('encrypted'), I('created'), I('expires', true)] },
+  file_links: { cols: [T('cid'), T('link')] },
+  names: { cols: [T('name'), T('pub'), I('seq'), I('own'), I('seen'), T('record')], where: 'own = 1' },
+  communities: { cols: [T('id'), T('owner'), T('name'), I('seq'), T('members'), T('state'), I('updated')] },
+  group_events: { cols: [T('community'), T('id'), T('kind'), T('author'), I('ts'), T('body'), T('sig'), T('meta', true)] },
+  credentials: { cols: [T('id'), T('role'), T('issuer'), T('subject'), T('type'), I('issued'), I('expires', true), T('jwt')] },
+  revocations: { cols: [T('issuer'), T('id'), I('ts'), T('jwt'), I('own')], where: 'own = 1' },
+  bans: { cols: [T('peer'), T('reason'), I('ts')] }
+}
 
 export interface StoredMessage {
   id: string
@@ -56,13 +76,16 @@ export class Store {
       CREATE TABLE IF NOT EXISTS credentials (id TEXT NOT NULL, role TEXT NOT NULL CHECK (role IN ('issued','held')), issuer TEXT NOT NULL, subject TEXT NOT NULL, type TEXT NOT NULL, issued INTEGER NOT NULL, expires INTEGER, jwt TEXT NOT NULL, PRIMARY KEY (id, role));
       CREATE TABLE IF NOT EXISTS reputation (peer TEXT PRIMARY KEY, score REAL NOT NULL, good INTEGER NOT NULL, bad INTEGER NOT NULL, strikes INTEGER NOT NULL, blocked_until INTEGER, last_reason TEXT NOT NULL, updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL, ts INTEGER NOT NULL);
-      CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, PRIMARY KEY (issuer, id));
+      CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (issuer, id));
+      CREATE TABLE IF NOT EXISTS identity_logs (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, events TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS file_links (cid TEXT PRIMARY KEY, link TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL CHECK (kind IN ('cid','name','publisher')), target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, target, parent));
       CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
       CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','blocked','dismissed')));
       CREATE INDEX IF NOT EXISTS reports_ts ON reports (ts);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
+    try { this.db.exec('ALTER TABLE revocations ADD COLUMN own INTEGER NOT NULL DEFAULT 0') } catch { /* column already present */ }
     for (const c of ['sig', 'sender', 'recipient']) {
       try { this.db.exec(`ALTER TABLE messages ADD COLUMN ${c} TEXT`) } catch { /* column already present */ }
     }
@@ -139,7 +162,13 @@ export class Store {
   private row (r: any): FileRow { return { cid: r.cid, name: r.name, size: Number(r.size), chunks: JSON.parse(r.chunks), encrypted: !!r.encrypted, created: Number(r.created), expires: r.expires == null ? null : Number(r.expires) } }
   listFiles (): FileRow[] { return (this.db.prepare('SELECT * FROM files ORDER BY created DESC').all() as any[]).map((r) => this.row(r)) }
   getFile (cid: string): FileRow | null { const r = this.db.prepare('SELECT * FROM files WHERE cid = ?').get(cid); return r ? this.row(r) : null }
-  deleteFileRow (cid: string): void { this.db.prepare('DELETE FROM files WHERE cid = ?').run(cid) }
+  deleteFileRow (cid: string): void {
+    this.db.prepare('DELETE FROM files WHERE cid = ?').run(cid)
+    this.db.prepare('DELETE FROM file_links WHERE cid = ?').run(cid)
+  }
+  /** Opt-in: remember the full `frenet://cid#key` link of a file so an archive can carry its key. Never done by default. */
+  putFileLink (cid: string, link: string): void { this.db.prepare('INSERT OR REPLACE INTO file_links (cid, link) VALUES (?, ?)').run(cid, link) }
+  getFileLink (cid: string): string | null { const r = this.db.prepare('SELECT link FROM file_links WHERE cid = ?').get(cid) as { link: string } | undefined; return r ? r.link : null }
   referencedChunks (): Set<string> {
     const out = new Set<string>()
     for (const f of this.listFiles()) { out.add(f.cid); for (const c of f.chunks) out.add(c) }
@@ -240,12 +269,45 @@ export class Store {
   deleteCredential (id: string, role: 'issued' | 'held'): boolean { return Number(this.db.prepare('DELETE FROM credentials WHERE id = ? AND role = ?').run(id, role).changes) > 0 }
   private credential (r: any): CredentialRow { return { id: r.id, role: r.role, issuer: r.issuer, subject: r.subject, type: r.type, issued: Number(r.issued), expires: r.expires == null ? null : Number(r.expires), jwt: r.jwt } }
 
-  addRevocation (issuer: string, id: string, jwt: string): boolean {
-    return Number(this.db.prepare('INSERT OR IGNORE INTO revocations (issuer, id, ts, jwt) VALUES (?, ?, ?, ?)').run(issuer, id, Date.now(), jwt).changes) > 0
+  /**
+   * Store a verified revocation statement. Returns false if it was already known. Foreign statements are capped
+   * (oldest evicted first) so junk cannot grow the DB forever; our own are never evicted.
+   */
+  addRevocation (issuer: string, id: string, jwt: string, own = false): boolean {
+    const fresh = Number(this.db.prepare('INSERT OR IGNORE INTO revocations (issuer, id, ts, jwt, own) VALUES (?, ?, ?, ?, ?)').run(issuer, id, Date.now(), jwt, own ? 1 : 0).changes) > 0
+    if (own && !fresh) this.db.prepare('UPDATE revocations SET own = 1 WHERE issuer = ? AND id = ?').run(issuer, id)
+    if (fresh && !own) {
+      this.db.prepare(`DELETE FROM revocations WHERE own = 0 AND rowid IN (
+        SELECT rowid FROM revocations WHERE own = 0 ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?)`).run(MAX_FOREIGN_REVOCATIONS)
+    }
+    return fresh
   }
   isRevoked (issuer: string, id: string): boolean { return !!this.db.prepare('SELECT 1 FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) }
+  /** The stored statement (a JWT) for a revocation, or null. */
+  getRevocation (issuer: string, id: string): string | null {
+    const r = this.db.prepare('SELECT jwt FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) as { jwt: string } | undefined
+    return r ? r.jwt : null
+  }
   listRevocations (): Array<{ issuer: string, id: string, ts: number, jwt: string }> {
     return (this.db.prepare('SELECT * FROM revocations ORDER BY ts DESC').all() as any[]).map((r) => ({ issuer: r.issuer, id: r.id, ts: Number(r.ts), jwt: r.jwt }))
+  }
+
+  /** Key logs (did:frenet) we hold, ours and others'. Foreign logs are capped; ours are never evicted. */
+  putIdentityLog (id: string, seq: number, eventsJson: string, own = false): void {
+    this.db.prepare(`INSERT INTO identity_logs (id, seq, events, own, seen) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(id) DO UPDATE SET seq = excluded.seq, events = excluded.events, own = MAX(identity_logs.own, excluded.own), seen = excluded.seen
+      WHERE excluded.seq >= identity_logs.seq`).run(id, seq, eventsJson, own ? 1 : 0, Date.now())
+    this.db.prepare(`DELETE FROM identity_logs WHERE own = 0 AND rowid IN (
+      SELECT rowid FROM identity_logs WHERE own = 0 ORDER BY seen DESC, rowid DESC LIMIT -1 OFFSET ?)`).run(MAX_FOREIGN_IDENTITY_LOGS)
+  }
+  getIdentityLog (id: string): { id: string, seq: number, events: IdentityEvent[], own: boolean } | null {
+    const r = this.db.prepare('SELECT * FROM identity_logs WHERE id = ?').get(id) as any
+    if (!r) return null
+    try { return { id: r.id, seq: Number(r.seq), events: JSON.parse(r.events) as IdentityEvent[], own: !!r.own } } catch { return null }
+  }
+  listIdentityLogs (ownOnly = false): Array<{ id: string, seq: number, own: boolean }> {
+    const sql = `SELECT id, seq, own FROM identity_logs ${ownOnly ? 'WHERE own = 1 ' : ''}ORDER BY seen DESC`
+    return (this.db.prepare(sql).all() as any[]).map((r) => ({ id: r.id, seq: Number(r.seq), own: !!r.own }))
   }
 
   putReputation (r: PeerReputation): void {
@@ -271,6 +333,62 @@ export class Store {
   deletePeer (peer: string): void {
     this.db.prepare('DELETE FROM messages WHERE peer = ?').run(peer)
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
+  }
+
+  /** Blocks this node holds as its own (pinned: no expiry). Replicas of other people's data carry an expiry and are not included. */
+  ownBlocks (): Array<{ cid: string, data: Uint8Array, expires: number | null }> {
+    return (this.db.prepare('SELECT cid, data, expires FROM blocks WHERE expires IS NULL ORDER BY ts ASC').all() as any[])
+      .map((r) => ({ cid: r.cid, data: new Uint8Array(r.data), expires: null }))
+  }
+
+  /** Everything this node holds that the network cannot give back, as plain rows (see archive.ts for what is left out). */
+  exportTables (): Record<string, unknown[]> {
+    const out: Record<string, unknown[]> = {}
+    for (const [t, spec] of Object.entries(ARCHIVE_TABLES)) {
+      out[t] = this.db.prepare(`SELECT ${spec.cols.map((c) => c.name).join(', ')} FROM ${t}${spec.where ? ' WHERE ' + spec.where : ''}`).all()
+        .map((r: any) => Object.fromEntries(spec.cols.map((c) => [c.name, r[c.name] ?? null])))
+    }
+    return out
+  }
+
+  /**
+   * Merge exported rows in one transaction: existing rows win, so re-running is safe, and one bad row rolls everything
+   * back. Rows are type-checked column by column (the archive is authenticated but may still be malformed).
+   * Returns how many rows were newly added per table. Unknown tables are ignored.
+   */
+  importTables (tables: unknown): Record<string, number> {
+    if (typeof tables !== 'object' || tables === null || Array.isArray(tables)) throw new Error('corrupt archive')
+    const added: Record<string, number> = {}
+    this.db.exec('BEGIN')
+    try {
+      for (const [t, spec] of Object.entries(ARCHIVE_TABLES)) {
+        const rows = (tables as Record<string, unknown>)[t]
+        if (rows === undefined) continue
+        if (!Array.isArray(rows)) throw new Error('corrupt archive')
+        // ON CONFLICT DO NOTHING (not OR IGNORE): duplicates are skipped, but CHECK violations still throw
+        const stmt = this.db.prepare(`INSERT INTO ${t} (${spec.cols.map((c) => c.name).join(', ')}) VALUES (${spec.cols.map(() => '?').join(', ')}) ON CONFLICT DO NOTHING`)
+        let n = 0
+        for (const row of rows) {
+          if (typeof row !== 'object' || row === null || Array.isArray(row)) throw new Error('corrupt archive')
+          const vals = spec.cols.map((c) => {
+            const v = (row as Record<string, unknown>)[c.name]
+            if (v === undefined || v === null) {
+              if (c.nullable) return null
+              throw new Error(`corrupt archive: ${t}.${c.name} missing`)
+            }
+            if (c.type === 'int' ? !Number.isSafeInteger(v) : typeof v !== 'string') throw new Error(`corrupt archive: ${t}.${c.name} has the wrong type`)
+            return v as string | number
+          })
+          n += Number(stmt.run(...vals).changes)
+        }
+        added[t] = n
+      }
+      this.db.exec('COMMIT')
+    } catch (e) {
+      try { this.db.exec('ROLLBACK') } catch { /* already rolled back */ }
+      throw e
+    }
+    return added
   }
 
   close (): void { this.db.close() }

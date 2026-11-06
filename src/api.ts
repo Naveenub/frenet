@@ -80,7 +80,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/files') {
         const b = await body(req, 24 * 1024 * 1024)
         const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
-        return json(res, 200, await n.files.add(String(b.name ?? 'file').slice(0, 255), Buffer.from(String(b.data ?? ''), 'base64'), { encrypt: b.encrypt !== false, ttlMs: ttl }))
+        return json(res, 200, await n.files.add(String(b.name ?? 'file').slice(0, 255), Buffer.from(String(b.data ?? ''), 'base64'), { encrypt: b.encrypt !== false, ttlMs: ttl, remember: b.remember === true }))
       }
       if (req.method === 'POST' && url.pathname === '/api/files/get') {
         const b = await body(req)
