@@ -189,14 +189,12 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/moderation/report') {
         // `block: true` files the report and blocks its target in one step; otherwise it only records it.
         const b = await body(req)
-        const report = await n.moderation.report(b)
-        if (b.block !== true) return json(res, 200, { report, purged: null })
-        const done = n.moderation.resolve(report.id, 'block', b.reason)
-        return json(res, 200, { report: done.report, purged: done.purged })
+        if (b.block !== true) return json(res, 200, { report: await n.moderation.report(b), purged: null, keyStatus: null })
+        return json(res, 200, await n.moderation.reportAndBlock(b, b.key))
       }
-      if (req.method === 'POST' && url.pathname === '/api/moderation/block') { const b = await body(req); return json(res, 200, n.moderation.block(b.kind, b.target, b.reason)) }
+      if (req.method === 'POST' && url.pathname === '/api/moderation/block') { const b = await body(req); return json(res, 200, n.moderation.block(b.kind, b.target, b.reason, b.key)) }
       if (req.method === 'POST' && url.pathname === '/api/moderation/unblock') { const b = await body(req); return json(res, 200, { removed: n.moderation.unblock(b.kind, b.target) }) }
-      if (req.method === 'POST' && url.pathname === '/api/moderation/resolve') { const b = await body(req); return json(res, 200, n.moderation.resolve(b.id, b.action, b.reason)) }
+      if (req.method === 'POST' && url.pathname === '/api/moderation/resolve') { const b = await body(req); return json(res, 200, n.moderation.resolve(b.id, b.action, b.reason, b.key)) }
       if (req.method === 'GET' && url.pathname === '/api/communities') return json(res, 200, n.groups.list())
       if (req.method === 'POST' && url.pathname === '/api/communities') { const b = await body(req); return json(res, 200, await n.groups.create(b.name, b.members ?? [])) }
       if (req.method === 'POST' && url.pathname === '/api/communities/members') { const b = await body(req); return json(res, 200, await n.groups.setMembers(String(b.id), b.members)) }
