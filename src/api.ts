@@ -141,6 +141,17 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         const b = await body(req, 100 * 1024)
         return json(res, 200, await n.credentials.verifyPresentation(b.jwt, String(b.nonce ?? ''), b.audience === undefined ? undefined : String(b.audience)))
       }
+      // Zero-knowledge membership auth (see zkauth.ts): prove "I am one of these identities" without saying which.
+      if (req.method === 'POST' && url.pathname === '/api/zk/challenge') return json(res, 200, n.zk.challenge())
+      if (req.method === 'POST' && url.pathname === '/api/zk/prove') {
+        const b = await body(req, 100 * 1024)
+        return json(res, 200, await n.zk.prove(b.ring, { scope: b.scope as string, nonce: b.nonce as string, ...(b.audience !== undefined ? { audience: b.audience as string } : {}) }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/zk/verify') {
+        const b = await body(req, 100 * 1024)
+        return json(res, 200, await n.zk.verify(b.proof, b.ring, { scope: b.scope as string, nonce: b.nonce as string, ...(b.audience !== undefined ? { audience: b.audience as string } : {}), once: b.once === true }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/zk/forget') return json(res, 200, { removed: n.store.forgetZkScope(String((await body(req)).scope ?? '')) })
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
         const r = await n.messaging.send(peerIdFromString(String(b.peer)), String(b.body ?? ''))
@@ -260,6 +271,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
     privacy: {
       transportEncryption: 'Noise XX (ChaCha20-Poly1305), forward secret',
       identity: 'Ed25519, key stored locally only',
+      anonymousAuth: 'linkable ring proofs over Ed25519 (zero-knowledge membership, one tag per scope)',
       telemetry: 'none',
       apiBind: 'loopback only'
     }

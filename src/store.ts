@@ -6,6 +6,7 @@ import type { IdentityEvent } from './identity-log.js'
 
 const MAX_FOREIGN_REVOCATIONS = 10_000
 const MAX_FOREIGN_IDENTITY_LOGS = 5_000
+const MAX_ZK_TAGS = 100_000
 
 interface Col { name: string, type: 'text' | 'int', nullable?: boolean }
 const T = (name: string, nullable = false): Col => ({ name, type: 'text', nullable })
@@ -78,6 +79,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS update_state (channel TEXT PRIMARY KEY, seq INTEGER NOT NULL, version TEXT NOT NULL, ts INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (issuer, id));
       CREATE TABLE IF NOT EXISTS identity_logs (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, events TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS zk_tags (scope TEXT NOT NULL, tag TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (scope, tag));
       CREATE TABLE IF NOT EXISTS file_links (cid TEXT PRIMARY KEY, link TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL CHECK (kind IN ('cid','name','publisher')), target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, target, parent));
       CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
@@ -390,6 +392,19 @@ export class Store {
     }
     return added
   }
+
+  /**
+   * Zero-knowledge auth (zkauth.ts): remember that an anonymous member of a scope has already acted. Returns false if this
+   * (scope, tag) was seen before. A tag is unlinkable across scopes and says nothing about who holds it; only the newest
+   * MAX_ZK_TAGS are kept, so a scope that must never accept a repeat should not be flooded with others.
+   */
+  claimZkTag (scope: string, tag: string): boolean {
+    const fresh = Number(this.db.prepare('INSERT OR IGNORE INTO zk_tags (scope, tag, ts) VALUES (?, ?, ?)').run(scope, tag, Date.now()).changes) > 0
+    if (fresh) this.db.prepare('DELETE FROM zk_tags WHERE rowid IN (SELECT rowid FROM zk_tags ORDER BY ts DESC, rowid DESC LIMIT -1 OFFSET ?)').run(MAX_ZK_TAGS)
+    return fresh
+  }
+  zkTagCount (scope: string): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM zk_tags WHERE scope = ?').get(scope) as { n: number }).n) }
+  forgetZkScope (scope: string): number { return Number(this.db.prepare('DELETE FROM zk_tags WHERE scope = ?').run(scope).changes) }
 
   close (): void { this.db.close() }
 }

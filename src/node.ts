@@ -32,6 +32,7 @@ import { Reputation, type ReputationEvent, type ReputationOptions } from './repu
 import { Sites } from './sites.js'
 import { Store } from './store.js'
 import { meetsIdentityWork, SybilGuard } from './sybil.js'
+import { frenetKeyResolver, ZkAuth } from './zkauth.js'
 
 export interface FrenetOptions {
   dataDir: string | ':memory:'
@@ -85,6 +86,8 @@ export interface FrenetNode {
   reputation: Reputation
   sybil: SybilGuard
   credentials: Credentials
+  /** Anonymous membership proofs (linkable ring proofs) and single-use verifier challenges. */
+  zk: ZkAuth
   identityLogs: IdentityLogs
   revocations: Revocations
   /** Primary DID: did:frenet when this node has a rotatable identity (key log), otherwise the did:key of its key. */
@@ -209,6 +212,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const identityLogs = new IdentityLogs(libp2p, store)
   const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
   const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations })
+  const zk = new ZkAuth(store, privateKey, { resolveFrenet: frenetKeyResolver((id) => identityLogs.resolve(id, { network: false })) })
   // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
   const report = (peer: string, ev: ReputationEvent, detail = ''): void => {
     if (reputation.record(peer, ev, detail)) { void libp2p.hangUp(peerIdFromString(peer)).catch(() => {}) }
@@ -263,6 +267,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     reputation,
     sybil,
     credentials,
+    zk,
     identityLogs,
     revocations,
     did: credentials.did,

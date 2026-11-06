@@ -40,6 +40,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Search: keyword search over names/titles/keywords that publishers announce on the DHT, every record signature-checked | working, tested; opt-in per site, unranked, spammable (see limits) |
 | DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID | working, tested (spec test vector) |
 | Verifiable credentials: issue/verify W3C VC-JWTs signed by your identity key, holder presentations bound to a verifier nonce, issuer-signed revocation | working, tested (tamper, alg-confusion, replay, wrong-holder cases); revocation is pull-only, no trust registry |
+| Zero-knowledge authentication: prove "I am one of these N identities" without saying which (linkable ring proof over the same Ed25519 keys, `@noble/curves`), bound to a verifier challenge, scope and audience; a per-scope tag lets a verifier allow each anonymous member one action (a vote, a claim) | working, tested (every signer position, replay, tamper, forged/small-order tags, one-per-scope, two nodes over the API); anonymity set = the ring (O(n), max 256); **not a general-purpose zk-SNARK, no dashboard UI, not independently audited** |
 | Account recovery: passphrase-encrypted key backup and k-of-n Shamir recovery shares, CLI only | working, tested end to end; recovers the *same* key, cannot help if the key is stolen (see SECURITY.md) |
 | QUIC transport (`/udp/…/quic-v1`) next to TCP, on by default (`--no-quic` to disable); ban list and all other gating apply to it | working, tested on loopback (connect, messaging, ban); behaviour behind real NATs/firewalls untested; depends on the third-party native module `@chainsafe/libp2p-quic` |
 | Sybil resistance: optional identity proof-of-work (`--min-identity-bits N`, `frenet identity mine`), per-subnet peer limits, cluster flagging | working, tested; **raises the cost of fake identities, does not prevent them** (see ARCHITECTURE.md) |
@@ -143,6 +144,18 @@ curl -s localhost:7777/api/credentials/issue -H 'content-type: application/json'
 # verifier: POST /api/credentials/verify {jwt}  and  POST /api/presentations/verify {jwt, nonce, audience}
 # issuer revokes: POST /api/credentials/revoke {id} -> {jwt}; verifiers import it with POST /api/credentials/revocations {jwt}
 ```
+
+Anonymous membership (zero-knowledge): the verifier names the ring (DIDs or peer IDs), asks for a challenge, and the prover answers with a proof that hides which member it is:
+
+```bash
+curl -s -XPOST localhost:7777/api/zk/challenge -H 'content-type: application/json' -d '{}'          # verifier -> {nonce, expires}
+curl -s localhost:7777/api/zk/prove  -H 'content-type: application/json' \
+  -d '{"ring":["did:key:z6Mk...","did:key:z6Mk..."],"scope":"vote:42","nonce":"<nonce>","audience":"<verifier>"}'   # prover -> {proof, tag}
+curl -s localhost:7777/api/zk/verify -H 'content-type: application/json' \
+  -d '{"ring":[...same ring...],"scope":"vote:42","nonce":"<nonce>","audience":"<verifier>","proof":"<proof>","once":true}'   # verifier -> {valid, tag}
+```
+
+`once: true` records the tag so the same member cannot act twice in that scope, without learning who they are. Tags in different scopes cannot be linked. See SECURITY.md for what this does not hide.
 
 Behind NAT (home router, CGNAT)? Point the node at a relay that has a public address:
 
