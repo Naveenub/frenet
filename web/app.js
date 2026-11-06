@@ -18,7 +18,7 @@ const ago = (ms) => { const s = Math.floor(ms / 1000); return s < 60 ? s + 's' :
 const SECTIONS = [
   ['overview', 'Network Overview'], ['peers', 'Connected Peers'], ['messages', 'Private Communications'],
   ['communities', 'Communities'], ['storage', 'Distributed Storage'], ['browser', 'Decentralized Browser'],
-  ['identity', 'Identity and Keys'], ['nodes', 'Network Nodes'],
+  ['identity', 'Identity and Keys'], ['anon', 'Anonymous Auth'], ['nodes', 'Network Nodes'],
   ['privacy', 'Privacy Center'], ['security', 'Security Center'], ['safety', 'Content Safety'], ['governance', 'Community Governance']
 ]
 const state = { view: 'overview', status: null, peers: [], dropped: [], chat: [], stop: null }
@@ -39,7 +39,7 @@ function go (id) {
   const v = $('#view'); v.replaceChildren()
   const meta = SECTIONS.find((s) => s[0] === id)
   if (meta[2]) return v.append(el('div', { className: 'card' }, el('h3', {}, 'Not built yet'), el('p', { className: 'dim' }, `This section is planned for ${meta[2]}. Nothing here is simulated.`)))
-  ;({ overview, peers, messages, communities, storage, browser, identity, nodes, privacy, security, safety, governance })[id](v)
+  ;({ overview, peers, messages, communities, storage, browser, identity, anon, nodes, privacy, security, safety, governance })[id](v)
 }
 
 function stat (label, value) { return el('div', { className: 'stat' }, el('b', {}, String(value)), el('span', {}, label)) }
@@ -594,6 +594,62 @@ async function safety (v) {
         btn('Unblock', async () => { await api('/api/moderation/unblock', { kind: b.kind, target: b.target }); go('safety') })))))
   }
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Blocklist'), m.blocklist.length ? bt : el('p', { className: 'dim' }, 'Nothing blocked. The blocklist is stored on this node and survives restarts. Unblocking lifts the entry and everything it pulled in, but deleted data is gone until it is fetched again.')))
+}
+
+// ---- Anonymous Auth: zero-knowledge membership proofs (linkable ring proofs, see SECURITY.md for what they do not hide) ----
+function anon (v) {
+  const MIN = 5
+  const ta = (ph, rows, extra = {}) => el('textarea', { rows, placeholder: ph, spellcheck: false, className: 'mono', ...extra })
+  const ring = ta('One DID (did:key:z6Mk…) or Ed25519 peer ID per line. The people who could have signed.', 6, { 'aria-label': 'Ring members' })
+  const scope = el('input', { placeholder: 'scope, e.g. vote:42 (one tag per member per scope)', 'aria-label': 'Scope' })
+  const audience = el('input', { placeholder: 'audience (optional): who this proof is for', 'aria-label': 'Audience' })
+  const nonce = el('input', { placeholder: 'challenge from the verifier', 'aria-label': 'Challenge' })
+  const minRing = el('input', { type: 'number', min: 2, max: 1024, value: String(MIN), 'aria-label': 'Minimum ring size', style: 'max-width:90px' })
+  const proof = ta('proof (base64url)', 4, { 'aria-label': 'Proof' })
+  const once = el('input', { type: 'checkbox', checked: true, style: 'flex:none' })
+  const out = el('p', { className: 'dim', role: 'status' })
+  const info = el('p', { className: 'dim' })
+  const lines = () => ring.value.split('\n').map((l) => l.trim()).filter(Boolean)
+  const say = (t, bad) => { out.textContent = t; out.style.color = bad ? '#ff6b81' : '' }
+  const run = (fn) => async () => { try { await fn() } catch (e) { say(e.message, true) } }
+  const describe = run(async () => {
+    if (lines().length === 0) { info.textContent = ''; return }
+    const r = await api('/api/zk/ring', { ring: lines() })
+    const warn = r.ringSize < Number(minRing.value) ? ` Too small for your minimum of ${minRing.value}: a small ring hides little.` : ''
+    info.textContent = `${r.ringSize} distinct members · fingerprint ${r.ringId.slice(0, 16)} · ${r.includesMe ? 'you are in this ring' : 'you are NOT in this ring (you can verify but not prove)'}.${warn} Check the fingerprint with the verifier: it changes if anyone is added or swapped.`
+  })
+  ring.onchange = describe; minRing.onchange = describe
+  const params = () => ({ ring: lines(), scope: scope.value, nonce: nonce.value, minRing: Number(minRing.value), ...(audience.value ? { audience: audience.value } : {}) })
+
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Prove you belong, without saying who you are'),
+    el('p', { className: 'dim' }, 'A zero-knowledge membership proof shows you hold the key of one identity in a group without revealing which. The verifier learns that you are in the ring and a tag that is the same every time you act in this scope (so “once each” can be enforced) but cannot be linked to your tags in other scopes or to your identity. Your key never leaves this node. Anonymity is only as big as the ring: with few members, or a ring the verifier padded with keys of nobody, it hides little. It is not a general zero-knowledge system and has not been independently audited.')))
+  v.append(el('div', { className: 'card' }, el('h3', {}, '1 · The ring'),
+    el('div', { className: 'row' }, ring),
+    el('div', { className: 'row' },
+      btn('Add my DID', async () => { ring.value = (ring.value.trim() + '\n' + state.status.did).trim(); await describe() }),
+      btn('Add connected peers', async () => { ring.value = (ring.value.trim() + '\n' + state.peers.map((p) => p.peer).join('\n')).trim(); await describe() }),
+      el('label', { className: 'dim' }, 'minimum size ', minRing)),
+    info))
+  v.append(el('div', { className: 'card' }, el('h3', {}, '2 · Scope and challenge'),
+    el('div', { className: 'row' }, scope), el('div', { className: 'row' }, audience),
+    el('div', { className: 'row' }, nonce, btn('New challenge (I am the verifier)', run(async () => { nonce.value = (await api('/api/zk/challenge', {})).nonce; say('Challenge issued by this node: valid once, for 2 minutes. Give it to the prover.') }))),
+    el('p', { className: 'dim' }, 'A challenge ties a proof to one request, so a copy of it is worthless later or elsewhere.')))
+  v.append(el('div', { className: 'card' }, el('h3', {}, '3 · Prove or verify'),
+    el('div', { className: 'row' }, proof),
+    el('div', { className: 'row' },
+      btn('Prove (I am the prover)', run(async () => {
+        const r = await api('/api/zk/prove', params())
+        proof.value = r.proof
+        say(`Proof made over ${r.ringSize} members (ring ${r.ringId.slice(0, 16)}). Your tag in this scope: ${r.tag.slice(0, 16)}… It does not identify you, but it is the same each time you act in this scope.`)
+      })),
+      btn('Verify', run(async () => {
+        const r = await api('/api/zk/verify', { ...params(), proof: proof.value.trim(), once: once.checked })
+        if (r.valid) say(`Valid: a member of this ring of ${r.ringSize} signed, and no one can tell which. Tag ${r.tag.slice(0, 16)}…${once.checked ? ' Recorded: this member cannot act again in this scope.' : ''}`)
+        else say(`Not valid: ${r.error}`, true)
+      })),
+      el('label', { className: 'row', style: 'margin:0' }, once, 'record the tag (once per scope)')),
+    out,
+    el('div', { className: 'row' }, btn('Forget this scope’s tags', run(async () => { const r = await api('/api/zk/forget', { scope: scope.value }); say(`Forgot ${r.removed} tag(s) in this scope.`) })))))
 }
 
 async function refresh () {

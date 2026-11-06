@@ -143,13 +143,14 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       }
       // Zero-knowledge membership auth (see zkauth.ts): prove "I am one of these identities" without saying which.
       if (req.method === 'POST' && url.pathname === '/api/zk/challenge') return json(res, 200, n.zk.challenge())
+      if (req.method === 'POST' && url.pathname === '/api/zk/ring') return json(res, 200, await n.zk.describeRing((await body(req, 256 * 1024)).ring))
       if (req.method === 'POST' && url.pathname === '/api/zk/prove') {
-        const b = await body(req, 100 * 1024)
-        return json(res, 200, await n.zk.prove(b.ring, { scope: b.scope as string, nonce: b.nonce as string, ...(b.audience !== undefined ? { audience: b.audience as string } : {}) }))
+        const b = await body(req, 256 * 1024)
+        return json(res, 200, await n.zk.prove(b.ring, { scope: b.scope as string, nonce: b.nonce as string, ...zkExtras(b) }))
       }
       if (req.method === 'POST' && url.pathname === '/api/zk/verify') {
-        const b = await body(req, 100 * 1024)
-        return json(res, 200, await n.zk.verify(b.proof, b.ring, { scope: b.scope as string, nonce: b.nonce as string, ...(b.audience !== undefined ? { audience: b.audience as string } : {}), once: b.once === true }))
+        const b = await body(req, 256 * 1024)
+        return json(res, 200, await n.zk.verify(b.proof, b.ring, { scope: b.scope as string, nonce: b.nonce as string, ...zkExtras(b), once: b.once === true }))
       }
       if (req.method === 'POST' && url.pathname === '/api/zk/forget') return json(res, 200, { removed: n.store.forgetZkScope(String((await body(req)).scope ?? '')) })
       if (req.method === 'POST' && url.pathname === '/api/send') {
@@ -223,6 +224,15 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
     server.once('error', reject)
     server.listen(port, host, () => resolve({ server, port: (server.address() as { port: number }).port }))
   })
+}
+
+/** Optional ZK parameters from a request body; wrong types are passed through so zkauth.ts rejects them. */
+function zkExtras (b: Record<string, unknown>): { audience?: string, minRing?: number, ringId?: string } {
+  return {
+    ...(b.audience !== undefined ? { audience: b.audience as string } : {}),
+    ...(b.minRing !== undefined ? { minRing: b.minRing as number } : {}),
+    ...(b.ringId !== undefined ? { ringId: b.ringId as string } : {})
+  }
 }
 
 function hostOk (req: IncomingMessage): boolean {

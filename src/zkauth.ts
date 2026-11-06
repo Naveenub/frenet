@@ -22,7 +22,7 @@ import type { Store } from './store.js'
  * exact ring, so it cannot be replayed elsewhere, to another verifier, or against a bigger or smaller ring.
  *
  * Proof (bytes): 0x01 | I (32) | c0 (32) | s_0 .. s_{n-1} (32 each); all points compressed Edwards, all scalars canonical
- * little-endian. Size 65 + 32n. Verification and signing cost O(n) scalar multiplications; the ring is capped at 256.
+ * little-endian. Size 65 + 32n. Verification and signing cost O(n) scalar multiplications; the ring is capped at 1024.
  *
  * Limits, stated plainly: the anonymity set is the ring, so a ring of 2 hides little, and a verifier can pad a ring with
  * keys it knows belong to nobody, which shrinks the set to the real members: a prover should check that the ring is the
@@ -33,7 +33,9 @@ import type { Store } from './store.js'
 const DOM = 'frenet/zk-ring/v1'
 const VERSION = 1
 export const MIN_RING = 2
-export const MAX_RING = 256
+export const MAX_RING = 1024
+/** Policy default for ZkAuth: a ring smaller than this hides too little to be worth calling anonymous. */
+export const DEFAULT_MIN_RING = 5
 const NONCE_RE = /^[A-Za-z0-9._~+/=-]{1,128}$/
 const TEXT_RE = /^[\x21-\x7e]{1,200}$/   // eslint-disable-line no-control-regex
 const CHALLENGE_TTL_MS = 2 * 60 * 1000
@@ -80,6 +82,9 @@ function decodePoint (raw: Uint8Array, what: string): Pt {
   if (p.is0() || !p.isTorsionFree()) throw new Error(`${what}: not in the prime-order subgroup`)
   return p
 }
+
+/** Short fingerprint of a canonical ring (SHA-256, hex). Two parties can compare it out of band to be sure they mean the same ring. */
+export const ringId = (ring: Uint8Array[]): string => createHash('sha256').update(lp(`${DOM}/ring`, ...ring)).digest('hex').slice(0, 32)
 
 export interface ScopeParams { scope: string, nonce: string, audience?: string }
 
@@ -217,8 +222,21 @@ export function verifyMembership (proof: unknown, ring: Uint8Array[], params: Sc
   } catch (e) { return { valid: false, error: e instanceof Error ? e.message : 'invalid' } }
 }
 
+export interface PolicyParams {
+  /** Refuse rings with fewer members than this (default DEFAULT_MIN_RING, lowest allowed 2). */
+  minRing?: number
+  /** Refuse unless the ring's fingerprint (`ringId`) is exactly this: defends against a ring padded or swapped behind your back. */
+  ringId?: string
+}
+export function checkPolicy (ring: Uint8Array[], p: PolicyParams): void {
+  const min = p.minRing ?? DEFAULT_MIN_RING
+  if (!Number.isInteger(min) || min < MIN_RING || min > MAX_RING) throw new Error(`minRing must be ${MIN_RING}-${MAX_RING}`)
+  if (ring.length < min) throw new Error(`ring has ${ring.length} members but at least ${min} are required: a small ring hides little (lower minRing only if you accept that)`)
+  if (p.ringId !== undefined && p.ringId !== ringId(ring)) throw new Error('ring does not match the expected ringId')
+}
+
 export interface ZkAuthOptions { resolveFrenet?: FrenetKeyResolver }
-export interface VerifyOptions extends ScopeParams {
+export interface VerifyOptions extends ScopeParams, PolicyParams {
   /** Accept the nonce although this node did not issue it (the caller guarantees it is fresh and single-use). */
   externalNonce?: boolean
   /** Record the tag and refuse the same member in the same scope a second time. */
@@ -244,14 +262,21 @@ export class ZkAuth {
     return { nonce, expires: now + ttlMs }
   }
 
-  async prove (members: unknown, params: ScopeParams): Promise<{ proof: string, tag: string, ringSize: number }> {
+  /** Size and fingerprint of a ring, and whether this identity is in it, without proving anything. */
+  async describeRing (members: unknown): Promise<{ ringSize: number, ringId: string, includesMe: boolean, minRing: number }> {
     const ring = await resolveRing(members, this.opts.resolveFrenet)
-    return { ...proveMembership(this.key, ring, params), ringSize: ring.length }
+    return { ringSize: ring.length, ringId: ringId(ring), includesMe: ring.some((r) => eq(r, this.key.publicKey.raw)), minRing: DEFAULT_MIN_RING }
   }
 
-  async verify (proof: unknown, members: unknown, opts: VerifyOptions): Promise<MembershipCheck & { ringSize?: number }> {
+  async prove (members: unknown, params: ScopeParams & PolicyParams): Promise<{ proof: string, tag: string, ringSize: number, ringId: string }> {
+    const ring = await resolveRing(members, this.opts.resolveFrenet)
+    checkPolicy(ring, params)
+    return { ...proveMembership(this.key, ring, params), ringSize: ring.length, ringId: ringId(ring) }
+  }
+
+  async verify (proof: unknown, members: unknown, opts: VerifyOptions): Promise<MembershipCheck & { ringSize?: number, ringId?: string }> {
     let ring: Uint8Array[]
-    try { ring = await resolveRing(members, this.opts.resolveFrenet) } catch (e) { return { valid: false, error: e instanceof Error ? e.message : 'invalid ring' } }
+    try { ring = await resolveRing(members, this.opts.resolveFrenet); checkPolicy(ring, opts) } catch (e) { return { valid: false, error: e instanceof Error ? e.message : 'invalid ring' } }
     const issued = this.challenges.get(String(opts.nonce))
     if (!opts.externalNonce && (issued === undefined || issued <= Date.now())) return { valid: false, error: 'unknown or expired challenge (request one with challenge())' }
     const r = verifyMembership(proof, ring, opts)
@@ -259,7 +284,7 @@ export class ZkAuth {
     // From here to the return there is no await, so the nonce and tag are claimed atomically.
     if (!opts.externalNonce) this.challenges.delete(opts.nonce)
     if (opts.once && !this.store.claimZkTag(opts.scope, r.tag)) return { valid: false, error: 'this member has already acted in this scope' }
-    return { ...r, ringSize: ring.length }
+    return { ...r, ringSize: ring.length, ringId: ringId(ring) }
   }
 }
 

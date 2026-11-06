@@ -6,6 +6,7 @@ import { startApi } from './api.js'
 import { IDENTITY_COMMANDS, runIdentityCommand } from './cli-identity.js'
 import { startGateway } from './gateway.js'
 import { runUpdateCommand } from './cli-update.js'
+import { runZkCommand } from './cli-zk.js'
 import { startFrenet } from './node.js'
 
 // Identity and recovery subcommands (frenet identity | backup | restore | recovery ...) run without starting a node.
@@ -14,6 +15,7 @@ if (subcommand && IDENTITY_COMMANDS.includes(subcommand)) {
   process.exit(await runIdentityCommand(subcommand, process.argv.slice(3)))
 }
 
+if (subcommand === 'zk') process.exit(await runZkCommand(process.argv.slice(3)))
 if (subcommand === 'update') process.exit(await runUpdateCommand(process.argv.slice(3)))
 
 const { values } = parseArgs({
@@ -46,6 +48,7 @@ if (values.help) {
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777
   --reannounce-hours N: announce every stored block on the DHT again at start-up and every N hours (default 12, 0 = never).
   QUIC is on by default (udp, /quic-v1) next to TCP. --min-identity-bits N refuses peers whose key lacks N bits of work (see: frenet identity mine --bits N).
+  anonymous membership proofs (zero-knowledge): frenet zk challenge | ring | tag | prove | verify   (frenet zk --help)
   secure updates: frenet update keygen | manifest | sign | verify   (frenet update --help)
   identity & recovery (node stopped): frenet identity | backup --out FILE | restore FILE | recovery split -k K -n N | recovery restore [SHARE...]   (frenet <cmd> --help)`)
   process.exit(0)

@@ -9,7 +9,7 @@ import { ed25519 } from '@noble/curves/ed25519.js'
 import { startApi } from '../src/api.js'
 import { didFromPublicKeyRaw } from '../src/did.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
-import { MAX_RING, proveMembership, ringFromMembers, tagFor, verifyMembership, ZkAuth } from '../src/zkauth.js'
+import { DEFAULT_MIN_RING, MAX_RING, ringId, proveMembership, ringFromMembers, tagFor, verifyMembership, ZkAuth } from '../src/zkauth.js'
 
 const L = ed25519.Point.Fn.ORDER
 const keys = async (n: number): Promise<PrivateKey[]> => Promise.all(Array.from({ length: n }, () => generateKeyPair('Ed25519')))
@@ -158,9 +158,9 @@ describe('ZkAuth verifier (challenges, once-per-scope)', () => {
     const members = [did(a), did(b)]
     const prover = new ZkAuth(v.store, a)
     const { nonce } = v.zk.challenge()
-    const { proof } = await prover.prove(members, { scope: 's', nonce })
-    assert.equal((await v.zk.verify(proof, members, { scope: 's', nonce })).valid, true)
-    const again = await v.zk.verify(proof, members, { scope: 's', nonce })
+    const { proof } = await prover.prove(members, { scope: 's', nonce, minRing: 2 })
+    assert.equal((await v.zk.verify(proof, members, { scope: 's', nonce, minRing: 2 })).valid, true)
+    const again = await v.zk.verify(proof, members, { scope: 's', nonce, minRing: 2 })
     assert.equal(again.valid, false)
     assert.match((again as any).error, /challenge/)
   })
@@ -169,22 +169,22 @@ describe('ZkAuth verifier (challenges, once-per-scope)', () => {
     const v = await node(); const [a, b] = await keys(2) as [PrivateKey, PrivateKey]
     const members = [did(a), did(b)]
     const prover = new ZkAuth(v.store, a)
-    const own = await prover.prove(members, { scope: 's', nonce: 'made-up' })
-    assert.equal((await v.zk.verify(own.proof, members, { scope: 's', nonce: 'made-up' })).valid, false)
-    assert.equal((await v.zk.verify(own.proof, members, { scope: 's', nonce: 'made-up', externalNonce: true })).valid, true)
+    const own = await prover.prove(members, { scope: 's', nonce: 'made-up', minRing: 2 })
+    assert.equal((await v.zk.verify(own.proof, members, { scope: 's', nonce: 'made-up', minRing: 2 })).valid, false)
+    assert.equal((await v.zk.verify(own.proof, members, { scope: 's', nonce: 'made-up', externalNonce: true, minRing: 2 })).valid, true)
     const { nonce } = v.zk.challenge()
-    const good = await prover.prove(members, { scope: 's', nonce })
-    assert.equal((await v.zk.verify(mutate(good.proof, (x) => { x[40] = x[40]! ^ 1 }), members, { scope: 's', nonce })).valid, false)
-    assert.equal((await v.zk.verify(good.proof, members, { scope: 's', nonce })).valid, true)
+    const good = await prover.prove(members, { scope: 's', nonce, minRing: 2 })
+    assert.equal((await v.zk.verify(mutate(good.proof, (x) => { x[40] = x[40]! ^ 1 }), members, { scope: 's', nonce, minRing: 2 })).valid, false)
+    assert.equal((await v.zk.verify(good.proof, members, { scope: 's', nonce, minRing: 2 })).valid, true)
   })
 
   it('expires challenges', async () => {
     const v = await node(); const [a, b] = await keys(2) as [PrivateKey, PrivateKey]
     assert.throws(() => v.zk.challenge(10), /lifetime/)
     const { nonce } = v.zk.challenge(1000)
-    const proof = (await new ZkAuth(v.store, a).prove([did(a), did(b)], { scope: 's', nonce })).proof
+    const proof = (await new ZkAuth(v.store, a).prove([did(a), did(b)], { scope: 's', nonce, minRing: 2 })).proof
     const realNow = Date.now
-    try { Date.now = () => realNow() + 2000; assert.equal((await v.zk.verify(proof, [did(a), did(b)], { scope: 's', nonce })).valid, false) } finally { Date.now = realNow }
+    try { Date.now = () => realNow() + 2000; assert.equal((await v.zk.verify(proof, [did(a), did(b)], { scope: 's', nonce, minRing: 2 })).valid, false) } finally { Date.now = realNow }
   })
 
   it('enforces one action per member per scope without learning who', async () => {
@@ -192,8 +192,8 @@ describe('ZkAuth verifier (challenges, once-per-scope)', () => {
     const members = [did(a), did(b), did(c)]
     const act = async (k: PrivateKey, scope: string) => {
       const { nonce } = v.zk.challenge()
-      const { proof } = await new ZkAuth(v.store, k).prove(members, { scope, nonce })
-      return v.zk.verify(proof, members, { scope, nonce, once: true })
+      const { proof } = await new ZkAuth(v.store, k).prove(members, { scope, nonce, minRing: 2 })
+      return v.zk.verify(proof, members, { scope, nonce, once: true, minRing: 2 })
     }
     assert.equal((await act(a, 'vote:1')).valid, true)
     assert.equal((await act(b, 'vote:1')).valid, true)
@@ -212,10 +212,28 @@ describe('ZkAuth verifier (challenges, once-per-scope)', () => {
     const v = await node(); const [a, b] = await keys(2) as [PrivateKey, PrivateKey]
     const members = [did(a), did(b)]
     const { nonce } = v.zk.challenge()
-    const { proof } = await new ZkAuth(v.store, a).prove(members, { scope: 'x', nonce })
+    const { proof } = await new ZkAuth(v.store, a).prove(members, { scope: 'x', nonce, minRing: 2 })
     assert.equal((await v.zk.verify(proof, members, { scope: 'x', nonce, audience: 'wrong', once: true })).valid, false)
     assert.equal(v.store.zkTagCount('x'), 0)
-    assert.equal((await v.zk.verify(proof, members, { scope: 'x', nonce, once: true })).valid, true)
+    assert.equal((await v.zk.verify(proof, members, { scope: 'x', nonce, once: true, minRing: 2 })).valid, true)
+  })
+
+  it('enforces a minimum anonymity set and an expected ring fingerprint', async () => {
+    const v = await node(); const ks = await keys(6)
+    const prover = new ZkAuth(v.store, ks[0]!)
+    const four = ks.slice(0, 4).map(did); const five = ks.slice(0, 5).map(did)
+    const { nonce } = v.zk.challenge()
+    await assert.rejects(prover.prove(four, { scope: 's', nonce }), /at least 5/)
+    assert.equal(DEFAULT_MIN_RING, 5)
+    const ok = await prover.prove(five, { scope: 's', nonce })
+    assert.equal(ok.ringSize, 5)
+    assert.equal((await v.zk.verify(ok.proof, four, { scope: 's', nonce })).valid, false)   // verifier policy too
+    assert.equal((await v.zk.verify(ok.proof, five, { scope: 's', nonce, ringId: 'f'.repeat(32) })).valid, false)
+    // A ring padded with an extra key has another fingerprint, so a prover that pinned the ringId refuses it.
+    await assert.rejects(prover.prove(ks.map(did), { scope: 's', nonce, ringId: ok.ringId }), /expected ringId/)
+    assert.equal((await prover.prove(five, { scope: 's', nonce, ringId: ok.ringId })).ringId, ok.ringId)
+    assert.deepEqual(await v.zk.verify(ok.proof, five, { scope: 's', nonce, ringId: ok.ringId }), { valid: true, tag: ok.tag, ringSize: 5, ringId: ok.ringId })
+    await assert.rejects(prover.prove(five, { scope: 's', nonce, minRing: 1 }), /minRing/)
   })
 
   it('accepts did:frenet members by their current key', async () => {
@@ -226,9 +244,9 @@ describe('ZkAuth verifier (challenges, once-per-scope)', () => {
     const verifier = new ZkAuth(v.store, a, { resolveFrenet: resolve })
     const members = [did(a), `did:frenet:${id}`]
     const { nonce } = verifier.challenge()
-    const { proof, tag } = await prover.prove(members, { scope: 's', nonce })
-    assert.deepEqual(await verifier.verify(proof, members, { scope: 's', nonce }), { valid: true, tag, ringSize: 2 })
-    await assert.rejects(new ZkAuth(v.store, b).prove(members, { scope: 's', nonce }), /cannot resolve/)   // no resolver, no did:frenet
+    const { proof, tag, ringId: rid } = await prover.prove(members, { scope: 's', nonce, minRing: 2 })
+    assert.deepEqual(await verifier.verify(proof, members, { scope: 's', nonce, minRing: 2 }), { valid: true, tag, ringSize: 2, ringId: rid })
+    await assert.rejects(new ZkAuth(v.store, b).prove(members, { scope: 's', nonce, minRing: 2 }), /cannot resolve/)   // no resolver, no did:frenet
   })
 
   it('works through the local API between two nodes', async () => {
@@ -238,15 +256,44 @@ describe('ZkAuth verifier (challenges, once-per-scope)', () => {
     try {
       const post = async (port: number, path: string, data: unknown) => (await fetch(`http://127.0.0.1:${port}${path}`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(data) })).json() as Promise<any>
       const ch = await post(va.port, '/api/zk/challenge', {})
-      const pr = await post(pa.port, '/api/zk/prove', { ring: members, scope: 'room:1', nonce: ch.nonce, audience: 'v' })
+      const pr = await post(pa.port, '/api/zk/prove', { ring: members, scope: 'room:1', nonce: ch.nonce, audience: 'v', minRing: 3 })
       assert.equal(pr.ringSize, 3)
-      const ok = await post(va.port, '/api/zk/verify', { proof: pr.proof, ring: members, scope: 'room:1', nonce: ch.nonce, audience: 'v', once: true })
+      const ok = await post(va.port, '/api/zk/verify', { proof: pr.proof, ring: members, scope: 'room:1', nonce: ch.nonce, audience: 'v', once: true, minRing: 3 })
       assert.deepEqual([ok.valid, ok.tag], [true, pr.tag])
-      assert.equal((await post(va.port, '/api/zk/verify', { proof: pr.proof, ring: members, scope: 'room:1', nonce: ch.nonce, audience: 'v', once: true })).valid, false)
-      assert.match((await post(pa.port, '/api/zk/prove', { ring: [other.keyDid, verifier.keyDid], scope: 'room:1', nonce: 'x' })).error, /not in the ring/)
+      assert.equal((await post(va.port, '/api/zk/verify', { proof: pr.proof, ring: members, scope: 'room:1', nonce: ch.nonce, audience: 'v', once: true, minRing: 3 })).valid, false)
+      assert.match((await post(pa.port, '/api/zk/prove', { ring: [other.keyDid, verifier.keyDid], scope: 'room:1', nonce: 'x', minRing: 2 })).error, /not in the ring/)
       assert.equal((await post(va.port, '/api/zk/forget', { scope: 'room:1' })).removed, 1)
       const st = await (await fetch(`http://127.0.0.1:${va.port}/api/status`)).json() as any
       assert.match(st.privacy.anonymousAuth, /ring/)
     } finally { va.server.close(); pa.server.close() }
+  })
+})
+
+describe('frenet zk CLI', () => {
+  it('proves and verifies offline, and refuses a wrong nonce', async () => {
+    const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { privateKeyToProtobuf } = await import('@libp2p/crypto/keys')
+    const { runZkCommand } = await import('../src/cli-zk.js')
+    const ks = await keys(5)
+    const dir = mkdtempSync(join(tmpdir(), 'frenet-zk-')); mkdirSync(join(dir, 'd'))
+    writeFileSync(join(dir, 'd', 'identity.key'), privateKeyToProtobuf(ks[2]!))
+    writeFileSync(join(dir, 'ring.txt'), `# five members\n${ks.map(did).join('\n')}\n`)
+    const run = async (...a: string[]): Promise<{ code: number, out: string }> => {
+      const log = console.log; let out = ''; console.log = (x: unknown) => { out += String(x) }
+      try { return { code: await runZkCommand(a), out } } finally { console.log = log }
+    }
+    const args = ['--ring', join(dir, 'ring.txt'), '--scope', 'vote:cli', '--nonce', 'abc']
+    const p = await run('prove', '--data', join(dir, 'd'), ...args)
+    assert.equal(p.code, 0)
+    const made = JSON.parse(p.out) as { proof: string, tag: string, ringSize: number }
+    assert.equal(made.ringSize, 5)
+    assert.equal((await run('tag', '--data', join(dir, 'd'), '--scope', 'vote:cli')).out, made.tag)
+    writeFileSync(join(dir, 'p.json'), p.out)
+    const v = await run('verify', ...args, '--proof', join(dir, 'p.json'))
+    assert.deepEqual([v.code, JSON.parse(v.out).valid], [0, true])
+    assert.equal((await run('verify', ...args.slice(0, 4), '--nonce', 'zzz', '--proof', join(dir, 'p.json'))).code, 1)
+    assert.equal((await run('prove', '--data', join(dir, 'd'), ...args, '--min-ring', '6')).code, 1)
   })
 })
