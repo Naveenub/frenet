@@ -40,11 +40,17 @@ const HAS_CONTROL = /[\u0000-\u001f\u007f]/
 const STRIP_CONTROL = /[\u0000-\u001f\u007f]/g
 
 /**
- * What a supplied file key did: `used` = it opened a manifest this node holds and every chunk was listed;
- * `not-needed` = the chunks could be listed without it (this node's own file, or a public manifest);
- * `manifest-not-held` = this node no longer holds the manifest, so its chunks cannot be listed.
+ * What happened about a file's key when a content ID was blocked:
+ *  - `used`: the key opened the sealed manifest (held here, or fetched from a peer) and every chunk was listed;
+ *  - `not-needed`: the chunks could be listed without it (this node's own file, or a public manifest);
+ *  - `manifest-not-held`: a key was given but the manifest is neither on this node nor reachable on the network, so
+ *    the chunks could not be listed (block again with the key once a peer holding it is reachable);
+ *  - `key-needed`: no key was given and the block this node holds could not be read without one. If it is an encrypted
+ *    file's manifest, only that manifest is blocked and the chunks stay stored until they expire; block the same ID
+ *    again with the key to cover them.
+ * `null` = nothing to report (no key given and nothing unreadable, or the target is not a content ID).
  */
-export type KeyStatus = 'used' | 'not-needed' | 'manifest-not-held'
+export type KeyStatus = 'used' | 'not-needed' | 'manifest-not-held' | 'key-needed'
 
 /** The `#key` at the end of a file link, if there is one. Only ever used in memory, for one block operation. */
 export function keyFromLink (input: unknown): string | undefined {
@@ -115,6 +121,12 @@ export class Moderation {
   /** In-memory copy of the blocklist so the hot paths (block serving, gateway) never touch SQLite. */
   private sets: Record<TargetKind, Set<string>> = { cid: new Set(), name: new Set(), publisher: new Set() }
   private ownPub: string
+  /**
+   * Set by the node: reads one small block for a block operation, from this node or else from a peer, without storing
+   * it. Used only to open an encrypted file's manifest when the operator gives its key and the manifest is no longer
+   * (or was never) held here. Chunks are never fetched.
+   */
+  fetchBlock: ((cid: string, maxBytes: number) => Promise<Uint8Array | null>) | null = null
 
   constructor (private store: Store, private node: Libp2p, private key: PrivateKey) {
     this.ownPub = pubToB32(key.publicKey.raw)
@@ -147,11 +159,13 @@ export class Moderation {
    * site a name points at, every name of a publisher and their sites. Local copies are deleted and no longer advertised.
    *
    * For an encrypted file, pass its key (or the whole `frenet://...#key` link): the sealed manifest is then read once,
-   * in memory, so every chunk is blocked and purged too. The key is never stored, logged or returned. Without it only
-   * the manifest can be blocked, because chunks of an encrypted file cannot be listed. A key that does not open a
-   * manifest this node holds is an error, raised before anything has changed.
+   * in memory, so every chunk is blocked and purged too. If this node no longer holds the manifest (it was blocked
+   * before, or was never kept) it is fetched from a peer for this one purpose: just that small block, verified against
+   * its ID and never stored. The key is never stored, logged or returned. Without it only the manifest can be blocked,
+   * because chunks of an encrypted file cannot be listed, and the result says `key-needed`. A key that does not open
+   * the manifest is an error, raised before anything has changed. Blocking an ID again with the key adds the chunks.
    */
-  block (kindIn: unknown, targetIn: unknown, reasonIn: unknown = '', keyIn?: unknown): { entry: BlockEntry, purged: number, keyStatus: KeyStatus | null } {
+  async block (kindIn: unknown, targetIn: unknown, reasonIn: unknown = '', keyIn?: unknown): Promise<{ entry: BlockEntry, purged: number, keyStatus: KeyStatus | null }> {
     const kind = parseKind(kindIn)
     const target = normalizeTarget(kind, targetIn)
     const reason = cleanText(reasonIn, MAX_REASON)
@@ -161,6 +175,12 @@ export class Moderation {
     if (given !== undefined && kind !== 'cid') throw new Error('a file key only applies to a content ID')
     const key = given ?? (kind === 'cid' ? keyFromLink(targetIn) : undefined)
     if (key !== undefined && !validFileKey(key)) throw new Error('invalid file key (43 characters: the part after # in a frenet:// link)')
+
+    // The only network step, and it comes before any change: the sealed manifest, when a key was given and none is held.
+    let fetched: Uint8Array | undefined
+    if (kind === 'cid' && key !== undefined && !this.store.getFile(target) && !this.store.getBlock(target)) {
+      fetched = (await this.fetchBlock?.(target, MAX_MANIFEST_BYTES).catch(() => null)) ?? undefined
+    }
 
     // Work out what the target covers before anything is deleted.
     const roots: string[] = []
@@ -180,7 +200,7 @@ export class Moderation {
     const covered = new Set<string>()
     let keyStatus: KeyStatus | null = null
     for (const root of roots) {
-      const walk = this.closure(root, key)   // may throw on a wrong key: nothing above has changed state for kind 'cid'
+      const walk = this.closure(root, key, kind === 'cid' ? fetched : undefined, kind === 'cid')   // may throw on a wrong key: nothing above has changed state for kind 'cid'
       keyStatus = walk.key
       for (const c of walk.cids) if (covered.size < MAX_DERIVED) covered.add(c)
     }
@@ -201,24 +221,27 @@ export class Moderation {
   }
 
   /**
-   * Local-only walk of what a block refers to, never touching the network: a site manifest lists file manifests,
-   * a file manifest lists chunks. A sealed (encrypted) manifest can be read only with `key`; without it, a file this
-   * node holds only as someone else's replica has chunks that cannot be listed (they expire with the replica TTL).
-   * The key is applied to the root only and is never kept.
+   * Walk of what a block refers to, using only data this node holds (plus `fetched`, the root manifest block that the
+   * caller got from a peer when a key was given): a site manifest lists file manifests, a file manifest lists chunks.
+   * A sealed (encrypted) manifest can be read only with `key`; without it, a file this node holds only as someone
+   * else's replica has chunks that cannot be listed (they expire with the replica TTL), which is reported as
+   * `key-needed` when `isFile` says the root is a content ID the operator named. The key is applied to the root only
+   * and is never kept.
    */
-  private closure (root: string, key?: string): { cids: Set<string>, key: KeyStatus | null } {
+  private closure (root: string, key?: string, fetched?: Uint8Array, isFile = false): { cids: Set<string>, key: KeyStatus | null } {
     const out = new Set<string>([root])
     let keyStatus: KeyStatus | null = key === undefined ? null : 'manifest-not-held'
     const kids = (cid: string, k?: string): { type: 'site' | 'file' | null, cids: string[] } => {
       const f = this.store.getFile(cid)
       if (f) { if (k) keyStatus = 'not-needed'; return { type: 'file', cids: f.chunks.filter(validCid).slice(0, MAX_LIST) } }
-      const data = this.store.getBlock(cid)
+      const data = this.store.getBlock(cid) ?? (cid === root ? fetched : undefined)
       if (!data) return { type: null, cids: [] }
       if (k) keyStatus = 'not-needed'   // held; becomes 'used' below if the key was what opened it
       if (data.byteLength > MAX_MANIFEST_BYTES) return { type: null, cids: [] }
       let m: any
       try { m = JSON.parse(Buffer.from(data).toString('utf8')) } catch {
-        if (!k) return { type: null, cids: [] }
+        // Small and not JSON: possibly a sealed manifest. Chunks (256 KB) and anything larger never get here.
+        if (!k) { if (isFile && cid === root && data.byteLength >= 28) keyStatus = 'key-needed'; return { type: null, cids: [] } }
         let chunks: string[]
         try { chunks = sealedManifestChunks(data, k) } catch { throw new Error("that key does not open this file's manifest") }
         keyStatus = 'used'
@@ -273,7 +296,7 @@ export class Moderation {
    */
   async reportAndBlock (input: Record<string, unknown>, keyIn?: unknown): Promise<{ report: ReportRow, purged: number, keyStatus: KeyStatus | null }> {
     const category = parseCategory(input.category)
-    const done = this.block(input.kind, input.target, `report: ${category}`, keyIn)   // the raw target, so a #key in the link is found
+    const done = await this.block(input.kind, input.target, `report: ${category}`, keyIn)   // the raw target, so a #key in the link is found
     const report = await this.report(input)
     this.store.setReportStatus(report.id, 'blocked')
     return { report: { ...report, status: 'blocked' }, purged: done.purged, keyStatus: done.keyStatus }
@@ -282,7 +305,7 @@ export class Moderation {
   listReports (): ReportRow[] { return this.store.listReports() }
 
   /** Close a report: `block` blocks its target (and closes every open report about it), `dismiss` just closes it. */
-  resolve (idIn: unknown, action: unknown, reasonIn: unknown = '', keyIn?: unknown): { report: ReportRow, purged: number, keyStatus: KeyStatus | null } {
+  async resolve (idIn: unknown, action: unknown, reasonIn: unknown = '', keyIn?: unknown): Promise<{ report: ReportRow, purged: number, keyStatus: KeyStatus | null }> {
     const r = this.store.getReport(String(idIn))
     if (!r) throw new Error('no such report')
     if (action === 'dismiss') {
@@ -291,7 +314,7 @@ export class Moderation {
     }
     if (action !== 'block') throw new Error('action must be "block" or "dismiss"')
     // A report never holds the file key, so for an encrypted file the operator supplies it again here, if they have it.
-    const { purged, keyStatus } = this.block(r.kind, r.target, cleanText(reasonIn, MAX_REASON) || `report: ${r.category}`, keyIn)
+    const { purged, keyStatus } = await this.block(r.kind, r.target, cleanText(reasonIn, MAX_REASON) || `report: ${r.category}`, keyIn)
     this.store.setReportStatus(r.id, 'blocked')   // block() closed the open ones; this also covers a report that was dismissed earlier
     return { report: { ...r, status: 'blocked' }, purged, keyStatus }
   }

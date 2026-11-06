@@ -517,9 +517,12 @@ async function nodes (v) {
 
 const CATEGORY_LABEL = { illegal: 'Illegal content', 'child-safety': 'Child safety', malware: 'Malware', phishing: 'Phishing or scam', harassment: 'Harassment', spam: 'Spam', other: 'Other' }
 const KIND_LABEL = { cid: 'File, site or block (content ID)', name: 'Name', publisher: 'Publisher key' }
-/** What happened to a file key given for an encrypted file (it is never stored). */
+/** What happened about the key of an encrypted file when something was blocked (a key is never stored). */
 const keyNote = (s) => s === 'used' ? ' The key was used once to list and block every chunk, and was not saved.'
-  : s === 'manifest-not-held' ? ' This node no longer holds that file’s encrypted manifest, so its chunks could not be listed: only the file ID is blocked.' : ''
+  : s === 'manifest-not-held' ? ' The file’s encrypted manifest is not on this node and no peer could provide it just now, so its chunks could not be listed: only the file ID is blocked. Use “Add key” on its blocklist entry to try again later.'
+  : s === 'key-needed' ? ' This block could not be read without a key. If it is an encrypted file, only its ID is blocked and its chunks stay stored here until they expire. Use “Add key” on its blocklist entry to block them too.' : ''
+/** The file key in pasted text: a bare 43-character key, or a link that ends in #key. */
+const fileKeyFrom = (t) => (/(?:^|#)([A-Za-z0-9_-]{43})\s*$/.exec(t.trim()) || [])[1]
 
 async function safety (v) {
   const m = await api('/api/moderation')
@@ -554,10 +557,13 @@ async function safety (v) {
           if (!confirm('Block this on your node? Local copies are deleted and cannot be restored except by fetching them again after you unblock.')) return
           let key
           if (r.kind === 'cid') {
-            // Chunks of an encrypted file can only be listed with its key, which a report never keeps. Once the manifest is deleted the key is of no use, so ask now.
-            key = prompt('Is this an encrypted file? Paste its key (the part of the link after #) so every chunk is blocked too. It is used once and not saved. Leave empty to block the file ID only.')
-            if (key === null) return
-            key = key.trim() || undefined
+            // Chunks of an encrypted file can only be listed with its key, which a report never keeps, so ask now (it can also be added later from the blocklist).
+            const typed = prompt('Is this an encrypted file? Paste its key (the part of the link after #, or the whole link) so every chunk is blocked too. It is used once and not saved. Leave empty to block the file ID only; you can add the key later from the blocklist.')
+            if (typed === null) return
+            if (typed.trim()) {
+              key = fileKeyFrom(typed)
+              if (!key) { alert('That does not look like a file key: it is 43 characters, the part of the link after #.'); return }
+            }
           }
           const x = await api('/api/moderation/resolve', { id: r.id, action: 'block', key })
           state.note = `Blocked: ${x.purged} stored block(s) deleted.` + keyNote(x.keyStatus); go('safety')
@@ -575,7 +581,17 @@ async function safety (v) {
   const bb = el('tbody'); bt.append(bb)
   for (const b of m.blocklist) {
     bb.append(el('tr', {}, el('td', {}, b.kind), el('td', { className: 'mono' }, b.target), el('td', {}, b.reason || '–'), el('td', {}, new Date(b.ts).toLocaleString()), el('td', {}, b.derived ? `${b.derived} related item(s)` : '–'),
-      el('td', {}, btn('Unblock', async () => { await api('/api/moderation/unblock', { kind: b.kind, target: b.target }); go('safety') }))))
+      el('td', {}, el('div', { className: 'row', style: 'margin:0' },
+        ...(b.kind === 'cid' ? [btn('Add key', async () => {
+          // For an encrypted file that was blocked without its key: the key opens the manifest (fetched from a peer if this node no longer has it) so every chunk gets blocked too.
+          const typed = prompt('Paste the file’s key (the part of its link after #, or the whole link) to block every chunk of this encrypted file. It is used once and not saved.')
+          if (typed === null || !typed.trim()) return
+          const key = fileKeyFrom(typed)
+          if (!key) { alert('That does not look like a file key: it is 43 characters, the part of the link after #.'); return }
+          const x = await api('/api/moderation/block', { kind: 'cid', target: b.target, key })
+          state.note = `Key applied: ${x.purged} more stored block(s) deleted.` + keyNote(x.keyStatus); go('safety')
+        })] : []),
+        btn('Unblock', async () => { await api('/api/moderation/unblock', { kind: b.kind, target: b.target }); go('safety') })))))
   }
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Blocklist'), m.blocklist.length ? bt : el('p', { className: 'dim' }, 'Nothing blocked. The blocklist is stored on this node and survives restarts. Unblocking lifts the entry and everything it pulled in, but deleted data is gone until it is fetched again.')))
 }

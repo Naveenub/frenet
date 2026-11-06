@@ -169,6 +169,29 @@ export class Blocks {
     if (this.moderation.isBlocked('cid', cid.toString())) throw new ContentBlocked()
     const local = this.store.getBlock(cid.toString())
     if (local) return local
+    const data = await this.fromProviders(cid, MAX_BLOCK_BYTES)
+    if (data && this.room(data.length)) {
+      try {
+        this.store.putBlock(cid.toString(), data, Date.now() + this.retention.replicaTtlMs)
+        void this.announce(cid) // replicate: become a provider while the replica lives
+      } catch { /* served but not cached */ }
+    }
+    return data
+  }
+
+  /**
+   * Read a block for the operator's moderation tools: the local copy, else one fetched from a provider and verified
+   * against its CID. Unlike `get` it ignores the blocklist (the operator may need to read what they are blocking, or
+   * have already blocked) and it never stores or announces anything. `maxBytes` stops a download early, so asking for
+   * a manifest cannot pull a whole chunk; a provider that sends more than that is skipped without a penalty.
+   */
+  async peek (cidStr: string, maxBytes = MAX_BLOCK_BYTES): Promise<Uint8Array | null> {
+    const cid = CID.parse(cidStr)
+    return this.store.getBlock(cid.toString()) ?? await this.fromProviders(cid, Math.min(maxBytes, MAX_BLOCK_BYTES))
+  }
+
+  /** Find providers via the DHT and return the first copy that hashes to `cid`, or null. Stores nothing. */
+  private async fromProviders (cid: CID, maxBytes: number): Promise<Buffer | null> {
     const signal = AbortSignal.timeout(10_000)
     try {
       for await (const prov of this.node.contentRouting.findProviders(cid, { signal })) {
@@ -180,17 +203,14 @@ export class Blocks {
           await stream.close()
           const chunks: Uint8Array[] = []
           let n = 0
-          for await (const c of stream) { n += c.byteLength; if (n > MAX_BLOCK_BYTES) { this.report(prov.id.toString(), 'oversize', 'block response'); throw new Error('oversize') }; chunks.push(c.subarray()) }
+          for await (const c of stream) {
+            n += c.byteLength
+            if (n > maxBytes) { if (maxBytes >= MAX_BLOCK_BYTES) this.report(prov.id.toString(), 'oversize', 'block response'); throw new Error('oversize') }
+            chunks.push(c.subarray())
+          }
           const data = Buffer.concat(chunks)
           if (data.length && !verify(cid, data)) this.report(prov.id.toString(), 'bad-block', 'data does not match CID')
-          if (data.length && verify(cid, data)) {
-            this.report(prov.id.toString(), 'valid-block')
-            if (this.room(data.length)) {
-              this.store.putBlock(cid.toString(), data, Date.now() + this.retention.replicaTtlMs)
-              void this.announce(cid) // replicate: become a provider while the replica lives
-            }
-            return data
-          }
+          if (data.length && verify(cid, data)) { this.report(prov.id.toString(), 'valid-block'); return data }
         } catch { /* try next provider */ }
       }
     } catch { /* no providers / timeout */ }
