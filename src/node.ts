@@ -1,7 +1,7 @@
 import { noise } from '@chainsafe/libp2p-noise'
 import { yamux } from '@chainsafe/libp2p-yamux'
 import { quic } from '@chainsafe/libp2p-quic'
-import { autoNAT } from '@libp2p/autonat'
+import { autoNATv2 } from '@libp2p/autonat-v2'
 import { bootstrap } from '@libp2p/bootstrap'
 import { circuitRelayServer, circuitRelayTransport } from '@libp2p/circuit-relay-v2'
 import { dcutr } from '@libp2p/dcutr'
@@ -183,7 +183,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     })
   }
   if (useNat) {
-    services.autonat = autoNAT()
+    // v2, not v1: the v1 server answers a QUIC client's check by "dialing" the connection it already has, then closes it
+    // (@libp2p/autonat 3.0.32), which drops the client's relay reservation. v2 dials back on a fresh connection.
+    services.autonat = autoNATv2()
     services.dcutr = dcutr()
     services.upnp = uPnPNAT()
   }

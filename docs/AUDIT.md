@@ -16,7 +16,7 @@
 
 ## Known gaps a reviewer should expect to confirm (self-assessed, not verified)
 - Constant-time behaviour of the Shamir implementation; Noise/QUIC are the upstream libraries' responsibility.
-- Real browser WebRTC media, NAT traversal and QUIC behind NATs are untested.
+- Real browser WebRTC media is untested. NAT traversal and QUIC behind NATs are tested only in a Linux network-namespace lab (see `docs/ARCHITECTURE.md`); hole punching does not work; real routers, CGNAT and UDP-blocking firewalls are untested.
 - Reputation thresholds and proof-of-work levels are untuned guesses.
 - Equivocation by a community owner (different rosters to different members) is not detected.
 - Update trust roots cannot be rotated. The installer (`src/installer.ts`) replaces files atomically but does not unpack or run anything; its path handling, backup/rollback and https-only fetching are new and unreviewed.
