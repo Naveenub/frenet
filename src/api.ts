@@ -9,8 +9,10 @@ import { ContentBlocked, DAY_MS } from './blocks.js'
 import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
+import { PERMISSION_FEATURES } from './permissions.js'
 import { REPORT_CATEGORIES } from './moderation.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
+import type { AdminCommand } from './admin.js'
 import type { FrenetNode } from './node.js'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -41,6 +43,12 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
   n.groups.on('community', (id) => push('community', { id }))
   n.groups.on('event', (e) => push('group', e))
   n.groups.on('dropped', (d) => push('dropped', { peer: d.peer, reason: `group: ${d.reason}` }))
+
+  const browser = (): Record<string, unknown> => ({
+    permissions: { features: PERMISSION_FEATURES, origins: n.permissions.list() },
+    trackers: n.trackers.snapshot(),
+    proxy: proxy ? { port: proxy.port, httpsOnly: true, ...(proxy.stats() as object) } : { port: null, httpsOnly: true }
+  })
 
   const root = webRoot()
 
@@ -207,6 +215,29 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/sweep') return json(res, 200, { removed: n.operator.sweep() })
       if (req.method === 'POST' && url.pathname === '/api/operator/reannounce') return json(res, 200, await n.blocks.reannounce())
+      // Remote administration: signed commands to nodes that list this node as an admin, and this node's own audit log.
+      if (req.method === 'GET' && url.pathname === '/api/admin') return json(res, 200, { enabled: n.admin.enabled, admins: [...n.admin.admins], log: n.store.listAdminLog(100) })
+      if (req.method === 'POST' && url.pathname === '/api/admin/remote') {
+        const b = await body(req)
+        if (!isPeerId(b.peer)) return json(res, 400, { error: 'invalid peer ID' })
+        const args = b.args && typeof b.args === 'object' && !Array.isArray(b.args) ? b.args as Record<string, unknown> : {}
+        const result = await n.admin.call(b.peer, String(b.cmd) as AdminCommand, args, typeof b.addr === 'string' ? { addr: b.addr } : {})
+        return json(res, 200, { ok: true, result })
+      }
+      // Browser: per-site permissions and tracker blocking (the web proxy itself is HTTPS-only by design).
+      if (req.method === 'GET' && url.pathname === '/api/browser') return json(res, 200, browser())
+      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/grant') { const b = await body(req); n.permissions.grant(b.origin, b.feature); return json(res, 200, browser()) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/revoke') { const b = await body(req); n.permissions.revoke(b.origin, b.feature); return json(res, 200, browser()) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/reset') { const b = await body(req); n.permissions.reset(b.origin); return json(res, 200, browser()) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers') {
+        const b = await body(req)
+        if (b.action === 'remove') n.trackers.removeRule(b.host)
+        else if (b.action === 'block' || b.action === 'allow') n.trackers.addRule(b.host, b.action)
+        else return json(res, 400, { error: 'action must be block, allow or remove' })
+        return json(res, 200, browser())
+      }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/import') { const b = await body(req); const imported = n.trackers.importList(b.text); return json(res, 200, { ...browser(), imported }) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/clear') { const b = await body(req); if (b.action !== 'block' && b.action !== 'allow') return json(res, 400, { error: 'action must be block or allow' }); const removed = n.trackers.clearRules(b.action); return json(res, 200, { ...browser(), removed }) }
       // Content safety: local reports and the operator's blocklist (see Moderation).
       if (req.method === 'GET' && url.pathname === '/api/moderation') return json(res, 200, { categories: REPORT_CATEGORIES, blocklist: n.moderation.list(), reports: n.moderation.listReports() })
       if (req.method === 'POST' && url.pathname === '/api/moderation/report') {
