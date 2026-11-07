@@ -5,8 +5,8 @@ import { peerIdFromPrivateKey } from '@libp2p/peer-id'
 import type { PrivateKey } from '@libp2p/interface'
 import { startApi } from '../src/api.js'
 import { CALL_PROTOCOL, MAX_SIGNAL_BYTES } from '../src/calls.js'
-import { canon, signBytes } from '../src/channel.js'
-import { GROUP_DOMAIN, tally, type Wire } from '../src/groups.js'
+import { canon, MAX_SKEW_MS, signBytes } from '../src/channel.js'
+import { GROUP_DOMAIN, MIN_DISCUSSION_MS, tally, type Wire } from '../src/groups.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
 import { Operator } from '../src/operator.js'
 
@@ -159,6 +159,148 @@ describe('governance', () => {
     assert.equal(tally(el, [v('a', 1, 'yes'), v('b', 1, 'no'), v('c', 1, 'abstain')]).outcome, 'rejected') // tie yes=no
     assert.equal(tally(el, [v('a', 1, 'yes'), v('b', 1, 'yes'), v('c', 1, 'abstain')]).outcome, 'passed')
     assert.equal(tally([], []).outcome, 'no-quorum')
+  })
+})
+
+describe('governance: delegation, process and enforcement', () => {
+  it('tally: delegation is transitive, overridable, revocable and cycle-safe; binding needs two thirds', () => {
+    const el = ['a', 'b', 'c', 'd']
+    const v = (author: string, ts: number, choice: string) => ({ author, ts, id: `${author}${ts}`, choice })
+    const d = (author: string, ts: number, to: string | null) => ({ author, ts, id: `d${author}${ts}`, to })
+    const chain = tally(el, [v('a', 1, 'yes')], { delegations: [d('b', 1, 'a'), d('c', 1, 'b')] })
+    assert.deepEqual([chain.yes, chain.voted, chain.delegated, chain.outcome], [3, 3, 2, 'passed'])           // c -> b -> a
+    const own = tally(el, [v('a', 1, 'yes'), v('b', 1, 'no'), v('c', 1, 'no')], { delegations: [d('b', 1, 'a')] })
+    assert.deepEqual([own.yes, own.no, own.delegated], [1, 2, 0])                                                // a direct ballot beats a delegation
+    assert.equal(tally(el, [v('a', 1, 'yes')], { delegations: [d('b', 1, 'a'), d('b', 2, null)] }).voted, 1)    // latest delegation (a revocation) wins
+    assert.equal(tally(el, [], { delegations: [d('b', 1, 'c'), d('c', 1, 'b')] }).voted, 0)                     // cycle: nobody votes
+    assert.equal(tally(el, [v('a', 1, 'yes')], { delegations: [d('b', 1, 'z'), d('z', 1, 'a')] }).voted, 1)     // outsiders neither delegate nor receive
+    assert.equal(tally(el, [v('a', 1, 'yes'), v('b', 1, 'yes'), v('c', 1, 'no')], { supermajority: true }).outcome, 'passed')   // 2 of 3 yes+no
+    assert.equal(tally(el, [v('a', 1, 'yes'), v('b', 1, 'no'), v('c', 1, 'no')], { supermajority: true }).outcome, 'rejected')
+    assert.equal(tally(el, [v('a', 1, 'yes'), v('b', 1, 'yes'), v('c', 1, 'no')]).outcome, 'passed')
+  })
+
+  it('runs the process rules and enforces a passed binding proposal only after every check', async () => {
+    const n = await track()
+    const base = Date.now()
+    let off = 0
+    n.groups.clock = () => base + off
+    const O = await author(); const M1 = await author(); const M2 = await author(); const X = await author(); const Y = await author()
+    await n.groups.accept(O.id, await wire(O, C, 'roster', roster('g', 1, [O.id, id(n), M1.id, M2.id])))
+    n.groups.join(C)
+    const act = { type: 'rename', name: 'renamed' }
+    const prop = async (a: Author, o: { action?: unknown, discussion?: number, vote?: number, title?: string }) => {
+      const opens = base + (o.discussion ?? 0)
+      const w = await wire(a, C, 'proposal', JSON.stringify({ title: o.title ?? 'p', text: '', closes: opens + (o.vote ?? 60_000), ...(o.discussion ? { opens } : {}), ...(o.action ? { action: o.action } : {}) }), { ts: base })
+      return w
+    }
+    // Binding proposals need a discussion period and a valid action.
+    assert.equal(await n.groups.accept(M1.id, await prop(M1, { action: act })), 'malformed')
+    assert.equal(await n.groups.accept(M1.id, await prop(M1, { action: { type: 'rename', name: '' }, discussion: 120_000 })), 'malformed')
+    assert.equal(await n.groups.accept(M1.id, await prop(M1, { action: { type: 'members', members: [M1.id, id(n)] }, discussion: 120_000 })), 'malformed') // would remove the owner
+    assert.equal(await n.groups.accept(M1.id, await prop(M1, { action: { type: 'wipe' }, discussion: 120_000 })), 'malformed')
+    await assert.rejects(n.groups.propose(C, 't', '', 60_000, { action: act }), /discussion/)
+    const P = await prop(M1, { action: act, discussion: MIN_DISCUSSION_MS + 60_000, title: 'rename' })
+    assert.equal(await n.groups.accept(M1.id, P), null)
+    const opens = base + MIN_DISCUSSION_MS + 60_000; const closes = opens + 60_000
+    const ballot = (a: Author, pid: string, choice: string, ts: number) => wire(a, C, 'vote', JSON.stringify({ proposal: pid, choice }), { ts })
+    // Discussion: comments allowed, ballots not yet.
+    assert.equal(await n.groups.accept(M2.id, await wire(M2, C, 'comment', JSON.stringify({ proposal: P.id, text: 'why?' }), { ts: base })), null)
+    assert.equal(await n.groups.accept(M2.id, await wire(M2, C, 'comment', JSON.stringify({ proposal: 'nope', text: 'x' }), { ts: base })), 'unknown-proposal')
+    assert.equal(await n.groups.accept(X.id, await wire(X, C, 'comment', JSON.stringify({ proposal: P.id, text: 'x' }), { ts: base })), 'not-a-member')
+    assert.equal(await n.groups.accept(M2.id, await ballot(M2, P.id, 'no', base)), 'voting-not-open')
+    assert.equal(n.groups.proposals(C)[0].status, 'discussion')
+    assert.equal(n.groups.comments(C, P.id)[0].text, 'why?')
+    // Voting: O yes, M1 yes, M2 no, and this node delegates to O (counted as yes).
+    off = MIN_DISCUSSION_MS + 61_000
+    const vO = await ballot(O, P.id, 'yes', opens + 1000); const vM1 = await ballot(M1, P.id, 'yes', opens + 1000); const vM2 = await ballot(M2, P.id, 'no', opens + 1000)
+    for (const [a, w] of [[O, vO], [M1, vM1], [M2, vM2]] as const) assert.equal(await n.groups.accept(a.id, w), null)
+    await n.groups.delegate(C, O.id)
+    await assert.rejects(n.groups.delegate(C, id(n)), /invalid delegate/)
+    await assert.rejects(n.groups.delegate(C, X.id), /invalid delegate/)
+    assert.equal(n.groups.delegations(C).mine, O.id)
+    let pr = n.groups.proposals(C).find((x) => x.id === P.id)!
+    assert.deepEqual([pr.status, pr.tally.yes, pr.tally.no, pr.tally.delegated, pr.tally.outcome, pr.canEnact], ['voting', 3, 1, 1, 'passed', false])
+    const pick = (a: Author, w: Wire) => ({ author: a.id, id: w.id, ts: w.ts, body: w.body, sig: w.sig })
+    const evidence = { proposal: P.id, ballots: [pick(O, vO), pick(M1, vM1), pick(M2, vM2)], delegations: [] as unknown[] }
+    // Not enactable while voting is open or inside the clock-skew allowance after closing.
+    off = closes - base + 1000
+    assert.equal(await n.groups.accept(M1.id, await wire(M1, C, 'enact', JSON.stringify(evidence), { ts: base + off })), 'voting-open')
+    off = closes - base + MAX_SKEW_MS + 1000
+    assert.equal(n.groups.proposals(C).find((x) => x.id === P.id)!.canEnact, true)
+    const enact = (a: Author, e: unknown, o: Partial<Wire> = {}) => wire(a, C, 'enact', JSON.stringify(e), { ts: base + off, ...o })
+    // Forged or tampered evidence, outsiders and unknown proposals are refused; the name has not changed.
+    const forged = { ...evidence, ballots: [pick(O, vO), { ...pick(M1, vM1), body: JSON.stringify({ proposal: P.id, choice: 'no' }) }] }
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, forged)), 'bad-evidence')
+    assert.equal(await n.groups.accept(X.id, await enact(X, evidence)), 'not-a-member')
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, { ...evidence, proposal: 'nope' })), 'unknown-proposal')
+    assert.equal(n.store.getCommunity(C)!.name, 'g')
+    // Omitting a ballot this node already holds does not help the enacter; the node recounts everything it knows.
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, { ...evidence, ballots: [pick(O, vO), pick(M1, vM1)] })), null)
+    assert.deepEqual([n.store.getCommunity(C)!.name, n.store.getCommunity(C)!.seq], ['renamed', 2])
+    assert.equal(await n.groups.accept(M2.id, await enact(M2, evidence)), 'already-enacted')
+    assert.equal(n.groups.proposals(C).find((x) => x.id === P.id)!.status, 'enacted')
+    // A failing vote is not applied even with valid evidence; advisory proposals are never "enacted".
+    off = 0
+    const Q = await prop(M1, { action: { type: 'rename', name: 'nope' }, discussion: 120_000, vote: 60_000 })
+    assert.equal(await n.groups.accept(M1.id, Q), null)
+    const qo = base + 120_000
+    const q1 = await ballot(O, Q.id, 'yes', qo + 1); const q2 = await ballot(M1, Q.id, 'yes', qo + 1); const q3 = await ballot(M2, Q.id, 'no', qo + 1)
+    off = 120_500
+    for (const [a, w] of [[O, q1], [M1, q2], [M2, q3]] as const) assert.equal(await n.groups.accept(a.id, w), null)
+    await n.groups.vote(C, Q.id, 'no') // 2 yes, 2 no: below two thirds
+    off = 180_000 + MAX_SKEW_MS + 1000
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, { proposal: Q.id, ballots: [pick(O, q1), pick(M1, q2)], delegations: [] })), 'not-passed')
+    assert.equal(n.groups.proposals(C).find((x) => x.id === Q.id)!.canEnact, false)
+    const adv = await prop(M1, { title: 'adv' })
+    off = 0
+    assert.equal(await n.groups.accept(M1.id, adv), null)
+    off = 60_000 + MAX_SKEW_MS + 1000
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, { proposal: adv.id, ballots: [], delegations: [] })), 'not-binding')
+    // Withdrawal: only the proposer, and a withdrawn proposal cannot be enacted.
+    off = 0
+    const W = await prop(M1, { action: act, discussion: 120_000 })
+    assert.equal(await n.groups.accept(M1.id, W), null)
+    assert.equal(await n.groups.accept(M2.id, await wire(M2, C, 'withdraw', JSON.stringify({ proposal: W.id }), { ts: base })), 'not-proposer')
+    assert.equal(await n.groups.accept(M1.id, await wire(M1, C, 'withdraw', JSON.stringify({ proposal: W.id }), { ts: base })), null)
+    assert.equal(n.groups.proposals(C).find((x) => x.id === W.id)!.status, 'withdrawn')
+    off = 180_000 + MAX_SKEW_MS + 1000
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, { proposal: W.id, ballots: [], delegations: [] })), 'withdrawn')
+    // A membership change cannot touch the owner and is applied (with removal) only through a verified enactment.
+    off = 0
+    const R = await prop(M1, { action: { type: 'members', members: [O.id, id(n), M1.id, Y.id] }, discussion: 120_000 })
+    assert.equal(await n.groups.accept(M1.id, R), null)
+    const ro = base + 120_000
+    off = 120_500
+    const rb = [await ballot(O, R.id, 'yes', ro + 1), await ballot(M1, R.id, 'yes', ro + 1), await ballot(M2, R.id, 'yes', ro + 1)]
+    for (const [i, a] of [O, M1, M2].entries()) assert.equal(await n.groups.accept(a.id, rb[i]), null)
+    off = 180_000 + MAX_SKEW_MS + 1000
+    assert.equal(await n.groups.accept(M1.id, await enact(M1, { proposal: R.id, ballots: [pick(O, rb[0]), pick(M1, rb[1]), pick(M2, rb[2])], delegations: [] })), null)
+    assert.deepEqual(n.store.getCommunity(C)!.members, [O.id, id(n), M1.id, Y.id])
+    assert.equal(await n.groups.accept(M2.id, await wire(M2, C, 'msg', 'still here?', { ts: base + off })), 'not-a-member')
+  })
+
+  it('enforces a vote across real peers: enact is verified remotely and the owner invites the new member', async () => {
+    const a = await track(); const b = await track(); const c = await track()
+    await link(a, b); await link(a, c); await link(b, c)
+    const t0 = Date.now(); let off = 0
+    for (const x of [a, b, c]) x.groups.clock = () => Date.now() + off
+    const made = await a.groups.create('club', [id(b)])
+    await waitFor(() => b.store.getCommunity(made.community.id) !== undefined && b.store.getCommunity(made.community.id) !== null)
+    b.groups.join(made.community.id)
+    const cid = made.community.id
+    const sent = await a.groups.propose(cid, 'Invite carol', '', 60_000, { discussionMs: MIN_DISCUSSION_MS, action: { type: 'members', members: [id(a), id(b), id(c)] } })
+    await waitFor(() => b.groups.proposals(cid).length === 1)
+    off = MIN_DISCUSSION_MS + 1000
+    await a.groups.vote(cid, sent.id, 'yes'); await b.groups.vote(cid, sent.id, 'yes')
+    await waitFor(() => a.groups.proposals(cid)[0].tally.voted === 2 && b.groups.proposals(cid)[0].tally.voted === 2)
+    off = 2 * MIN_DISCUSSION_MS + MAX_SKEW_MS + 5000
+    assert.deepEqual(await b.groups.sweep(), [])             // only the proposer's node enacts automatically
+    assert.deepEqual(await a.groups.sweep(), [sent.id])
+    await waitFor(() => b.store.getCommunity(cid)!.members.length === 3)
+    assert.equal(b.groups.proposals(cid)[0].status, 'enacted')
+    await waitFor(() => c.store.getCommunity(cid)?.state === 'invited')
+    assert.equal(c.store.getCommunity(cid)!.members.length, 3)
+    assert.ok(Date.now() - t0 < 60_000)
   })
 })
 

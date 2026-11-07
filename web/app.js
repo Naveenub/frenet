@@ -238,7 +238,7 @@ function browser (v) {
     window.open(u, '_blank', 'noopener,noreferrer')
   } }, 'Open')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Open a site'), el('div', { className: 'row' }, link, open), omsg,
-    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do).')))
+    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do). This is a gateway for FRENET sites only, not a web browser: no HTTPS browsing, tracker blocking or permission manager.')))
 
   const q = el('input', { placeholder: 'search names by keyword, e.g. vegan recipes', 'aria-label': 'Search' }); const smsg = el('p', { className: 'dim' }); const sres = el('div')
   const doSearch = async () => {
@@ -259,9 +259,6 @@ function browser (v) {
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Search'), el('div', { className: 'row' }, q, el('button', { className: 'btn', type: 'button', onclick: doSearch }, 'Search')), smsg,
     el('p', { className: 'dim' }, 'Matches names, titles and keywords that publishers announced on the network, checking each record’s signature. There is no central index and no ranking, so treat results as unvetted: anyone can publish under any keyword.'), sres))
 
-  webBrowsing(v)
-  sitePermissions(v)
-
   api('/api/names').then((r) => {
     const mine = r.names.filter((n) => n.own)
     if (!mine.length) return
@@ -269,67 +266,6 @@ function browser (v) {
     for (const n of mine) card.append(el('p', {}, el('a', { href: `http://${n.name}.${n.pub}.localhost:${gw}/`, target: '_blank', rel: 'noopener noreferrer' }, n.name), ` · version ${n.seq}`), el('div', { className: 'mono' }, n.link))
     v.append(card)
   }).catch(() => {})
-}
-
-/** HTTPS browsing through the local proxy: setup, tracker blocking, counters. */
-function webBrowsing (v) {
-  const card = el('div', { className: 'card' }, el('h3', {}, 'Web browsing (HTTPS) and tracker blocking'))
-  v.append(card)
-  const draw = (b) => {
-    card.replaceChildren(el('h3', {}, 'Web browsing (HTTPS) and tracker blocking'))
-    if (!b.proxy) { card.append(el('p', { className: 'dim' }, 'The web proxy is off. Restart the node without --no-proxy to browse HTTPS sites through it.')); return }
-    const st = b.proxy.stats
-    card.append(
-      el('p', { className: 'dim' }, 'Point your everyday browser at this node’s proxy to load normal https:// sites with tracker blocking. FRENET sites on *.localhost bypass it. The proxy only tunnels TLS: it never decrypts, re-signs or logs your traffic, refuses plain http://, and refuses to reach your own machine or LAN.'),
-      el('p', {}, 'Proxy auto-config URL: '), el('div', { className: 'mono' }, b.proxy.pacUrl),
-      el('p', { className: 'dim' }, `Or set an HTTPS proxy of 127.0.0.1 port ${b.proxy.port} by hand.`),
-      el('table', {}, el('tbody', {}, ...Object.entries({ 'Tunnels opened': st.tunnels, 'Open now': st.active, 'Trackers blocked': st.trackersBlocked, 'Plain-HTTP refused': st.refusedHttp, 'Local/LAN targets refused': st.refusedPrivate, 'Other ports refused': st.refusedPort }).map(([k, val]) => el('tr', {}, el('th', {}, k), el('td', {}, String(val)))))),
-      el('p', { className: 'dim' }, `Built-in list: ${b.trackers.builtinCount} well-known tracker and ad domains, plus ${b.trackers.ruleCount} of your own rules. Import a maintained blocklist below for wider coverage. Blocking is by host name only, because encrypted traffic cannot be inspected.`),
-      el('p', { className: 'dim' }, st.upstream ? `All web traffic goes through ${st.upstream}; host names are resolved there, not on this machine. That only hides your address if that proxy does (e.g. Tor).` : 'Without an upstream proxy, sites and your network see your IP address and this machine’s resolver sees every host name. Start the node with --proxy-upstream socks5://127.0.0.1:9050 to route through Tor or another SOCKS5 proxy.'))
-    const host = el('input', { placeholder: 'domain, e.g. ads.example.com', 'aria-label': 'Domain' }); const msg = el('p', { className: 'err' })
-    const rule = (action) => async () => { msg.textContent = ''; try { draw(await api('/api/browser/trackers', { host: host.value, action })) } catch (e) { msg.textContent = e.message } }
-    card.append(el('div', { className: 'row' }, host, el('button', { className: 'btn', type: 'button', onclick: rule('block') }, 'Block'), el('button', { className: 'btn', type: 'button', onclick: rule('allow') }, 'Always allow')), msg,
-      el('p', { className: 'dim' }, 'A domain covers its subdomains. “Always allow” overrides the built-in list, for a site that breaks.'))
-    const file = el('input', { type: 'file', accept: '.txt,.hosts,text/plain', 'aria-label': 'Blocklist file' }); const imsg = el('p', { className: 'dim' })
-    card.append(el('div', { className: 'row' }, file, el('button', { className: 'btn', type: 'button', onclick: async () => {
-      imsg.textContent = ''
-      const f = file.files[0]; if (!f) { imsg.textContent = 'Choose a blocklist file (hosts format, one domain per line, or Adblock ||domain^ rules).'; return }
-      try { const r = await api('/api/browser/trackers/import', { text: await f.text() }); draw(r.state); card.append(el('p', { className: 'dim' }, `Imported ${r.added} domains, skipped ${r.skipped} lines that were not plain domains.`)) } catch (e) { imsg.textContent = e.message }
-    } }, 'Import list'), el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/clear', { action: 'block' }); draw(await api('/api/browser')) } }, 'Remove all my block rules')), imsg,
-    el('p', { className: 'dim' }, 'The node never downloads a list itself: get one from a source you trust and import the file here. Your “always allow” rules are never overridden.'))
-    if (b.trackers.rules.length) {
-      const t = el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, b.trackers.ruleCount > b.trackers.rules.length ? `Your rules (first ${b.trackers.rules.length} of ${b.trackers.ruleCount})` : 'Your rules'), el('th', {}, ''), el('th', {}, ''))), el('tbody', {}, ...b.trackers.rules.map((r) => el('tr', {}, el('td', { className: 'mono' }, r.host), el('td', {}, r.action), el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/remove', { host: r.host }); draw(await api('/api/browser')) } }, 'Remove'))))))
-      card.append(t)
-    }
-    if (b.trackers.recent.length) {
-      card.append(el('p', { className: 'dim' }, 'Recently blocked (kept in memory only, never saved):'),
-        el('div', { className: 'mono' }, b.trackers.recent.map((r) => r.host).join('\n')),
-        el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/clear-recent', {}); draw(await api('/api/browser')) } }, 'Clear'))
-    }
-  }
-  api('/api/browser').then(draw).catch((e) => card.append(el('p', { className: 'err' }, e.message)))
-}
-
-/** Per-site permission manager: everything is off until you grant it, and every grant is listed here. */
-function sitePermissions (v) {
-  const card = el('div', { className: 'card' }, el('h3', {}, 'Site permissions'))
-  v.append(card)
-  const draw = (b) => {
-    card.replaceChildren(el('h3', {}, 'Site permissions'),
-      el('p', { className: 'dim' }, 'Every FRENET site starts with camera, microphone, location, fullscreen, clipboard and screen capture switched off. A grant here only lets that one site ask: your browser still shows its own prompt, and you can still say no. A name keeps its grants when its publisher updates the site, so grant only to names you trust.'))
-    const origins = b.permissions.origins
-    if (!origins.length) card.append(el('p', { className: 'dim' }, 'No site has any permission.'))
-    for (const o of origins) {
-      card.append(el('div', { className: 'mono' }, o.origin),
-        el('p', {}, ...o.grants.map((g) => el('button', { className: 'btn', type: 'button', title: `granted ${new Date(g.since).toLocaleString()}; click to revoke`, onclick: async () => { await api('/api/browser/permissions/revoke', { origin: o.origin, feature: g.feature }); draw(await api('/api/browser')) } }, `${g.feature} ✕`)),
-          el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/permissions/reset', { origin: o.origin }); draw(await api('/api/browser')) } }, 'Revoke all')))
-    }
-    const origin = el('input', { placeholder: 'site:<id> or name:<n>.<publisher-key>', 'aria-label': 'Site origin' })
-    const feature = el('select', { 'aria-label': 'Permission' }, ...b.permissions.features.map((f) => el('option', { value: f }, f)))
-    const msg = el('p', { className: 'err' })
-    card.append(el('div', { className: 'row' }, origin, feature, el('button', { className: 'btn', type: 'button', onclick: async () => { msg.textContent = ''; try { draw(await api('/api/browser/permissions/grant', { origin: origin.value.trim(), feature: feature.value })) } catch (e) { msg.textContent = e.message } } }, 'Grant')), msg)
-  }
-  api('/api/browser').then(draw).catch((e) => card.append(el('p', { className: 'err' }, e.message)))
 }
 
 function identity (v) {
@@ -527,29 +463,61 @@ async function governance (v) {
   const joined = (await api('/api/communities')).filter((c) => c.state === 'joined')
   if (!joined.length) { v.append(el('div', { className: 'card' }, el('h3', {}, 'No communities'), el('p', { className: 'dim' }, 'Join or create a community under Communities first.'))); return }
   if (!joined.some((c) => c.id === state.cid)) state.cid = joined[0].id
+  const com = joined.find((c) => c.id === state.cid)
   const pick = el('select', { 'aria-label': 'Community', onchange: () => { state.cid = pick.value; go('governance') } }, ...joined.map((c) => el('option', { value: c.id, selected: c.id === state.cid }, c.name)))
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Community'), el('div', { className: 'row' }, pick),
-    el('p', { className: 'dim' }, 'One member, one vote. A proposal freezes the member list when it is first seen; your latest ballot counts; it needs more than half of those members to vote. Ballots are signed and checked by every node, but results are advisory: nothing here enforces them, and only the owner can change membership.')))
+    el('p', { className: 'dim' }, 'One member, one vote. A proposal freezes the member list when it is first seen; your latest ballot counts; it needs more than half of those members to vote. A binding proposal (rename, or add or remove a member) also needs a discussion period and two thirds yes. When it passes, any member can enact it: every node re-checks the signed ballots itself before applying anything, and the owner cannot be voted out. Advisory proposals change nothing by themselves.')))
+
+  // Delegation: your ballot goes to another member for every proposal you do not vote on yourself.
+  const del = await api('/api/communities/delegations?id=' + state.cid)
+  const others = com.members.filter((m) => m !== me)
+  const who = el('select', { 'aria-label': 'Delegate to' }, ...others.map((m) => el('option', { value: m }, short(m))))
+  v.append(el('div', { className: 'card' }, el('h3', {}, 'Delegated voting'),
+    el('p', { className: 'dim' }, del.mine ? `Your ballot goes to ${short(del.mine)} unless you vote yourself. Chains are followed to the first member who voted; loops count for nothing.` : 'You vote for yourself. Delegate to a member you trust and your ballot follows theirs on proposals you skip; voting yourself always wins.'),
+    el('p', { className: 'dim' }, del.current.length ? `${del.current.length} active delegation(s) in this community.` : 'No delegations yet.'),
+    el('div', { className: 'row' }, others.length ? who : '', others.length ? btn('Delegate', async () => { await api('/api/communities/delegate', { id: state.cid, to: who.value }); go('governance') }) : '',
+      del.mine ? btn('Revoke', async () => { await api('/api/communities/delegate', { id: state.cid, to: null }); go('governance') }) : '')))
 
   const title = el('input', { placeholder: 'proposal title', maxLength: 80, 'aria-label': 'Proposal title' })
   const text = el('textarea', { rows: 3, maxLength: 2000, placeholder: 'details (optional)', 'aria-label': 'Proposal details' })
   const hours = el('select', { 'aria-label': 'Voting period' }, ...[[1, '1 hour'], [24, '1 day'], [72, '3 days'], [168, '7 days']].map(([h, l]) => el('option', { value: h }, l)))
+  const disc = el('select', { 'aria-label': 'Discussion period' }, ...[[0, 'no discussion (advisory only)'], [1, '1 hour discussion'], [24, '1 day discussion'], [72, '3 days discussion']].map(([h, l]) => el('option', { value: h }, l)))
+  const kind = el('select', { 'aria-label': 'Proposal type' }, ...[['advisory', 'Advisory (changes nothing)'], ['rename', 'Binding: rename community'], ['add', 'Binding: add member'], ['remove', 'Binding: remove member']].map(([k, l]) => el('option', { value: k }, l)))
+  const arg = el('input', { placeholder: 'new name or member peer ID', maxLength: 128, 'aria-label': 'Binding action value' })
+  const action = () => {
+    if (kind.value === 'rename') return { type: 'rename', name: arg.value }
+    if (kind.value === 'add') return { type: 'members', members: [...new Set([...com.members, arg.value.trim()])] }
+    if (kind.value === 'remove') return { type: 'members', members: com.members.filter((m) => m !== arg.value.trim()) }
+    return undefined
+  }
   v.append(el('div', { className: 'card' }, el('h3', {}, 'New proposal'), el('div', { className: 'row' }, title), el('div', { className: 'row' }, text),
-    el('div', { className: 'row' }, hours, btn('Propose', async () => { await api('/api/communities/propose', { id: state.cid, title: title.value, text: text.value, hours: Number(hours.value) }); go('governance') }))))
+    el('div', { className: 'row' }, kind, arg), el('div', { className: 'row' }, disc, hours,
+      btn('Propose', async () => { await api('/api/communities/propose', { id: state.cid, title: title.value, text: text.value, hours: Number(hours.value), discussionHours: Number(disc.value), action: action() }); go('governance') }))))
 
   const props = await api('/api/communities/proposals?id=' + state.cid)
   if (!props.length) v.append(el('p', { className: 'dim' }, 'No proposals yet.'))
+  const STATUS = { discussion: 'discussion', voting: 'voting', closed: 'closed', withdrawn: 'withdrawn', enacted: 'enacted' }
+  const describe = (a) => !a ? 'advisory' : a.type === 'rename' ? `binding: rename to "${a.name}"` : `binding: member list becomes ${a.members.length} member(s)`
   for (const p of props) {
     const t = p.tally; const seg = (n, c) => el('i', { style: `width:${(n / Math.max(t.electorate, 1)) * 100}%;background:${c}` })
-    const status = p.open ? `open until ${new Date(p.closes).toLocaleString()}` : ({ passed: 'closed: passed', rejected: 'closed: rejected', 'no-quorum': 'closed: no quorum' })[t.outcome]
+    const result = { passed: 'passed', rejected: 'rejected', 'no-quorum': 'no quorum' }[t.outcome]
+    const when = p.status === 'discussion' ? `voting opens ${new Date(p.opens).toLocaleString()}` : p.status === 'voting' ? `open until ${new Date(p.closes).toLocaleString()}` : `${STATUS[p.status]}: ${result}`
     const acts = el('div', { className: 'row' })
-    if (p.open) for (const c of ['yes', 'no', 'abstain']) acts.append(btn(c[0].toUpperCase() + c.slice(1) + (p.myVote === c ? ' ✓' : ''), async () => { await api('/api/communities/vote', { id: state.cid, proposal: p.id, choice: c }); go('governance') }))
+    if (p.status === 'voting') for (const c of ['yes', 'no', 'abstain']) acts.append(btn(c[0].toUpperCase() + c.slice(1) + (p.myVote === c ? ' ✓' : ''), async () => { await api('/api/communities/vote', { id: state.cid, proposal: p.id, choice: c }); go('governance') }))
+    if (p.canEnact) acts.append(btn('Enact', async () => { await api('/api/communities/enact', { id: state.cid, proposal: p.id }); go('governance') }))
+    else if (p.binding && p.status === 'closed' && t.outcome === 'passed') acts.append(el('span', { className: 'dim' }, `can be enacted after ${new Date(p.enactAfter).toLocaleTimeString()} (late ballots are still arriving)`))
+    if (p.author === me && ['discussion', 'voting'].includes(p.status)) acts.append(btn('Withdraw', async () => { await api('/api/communities/withdraw', { id: state.cid, proposal: p.id }); go('governance') }))
+    const talk = el('div', {})
+    const note = el('input', { placeholder: 'comment', maxLength: 500, 'aria-label': 'Comment on ' + p.title })
+    const load = async () => { talk.replaceChildren(...(await api(`/api/communities/comments?id=${state.cid}&proposal=${p.id}`)).map((m) => el('p', { className: 'dim' }, `${m.own ? 'you' : short(m.author)}: ${m.text}`))) }
+    if (p.comments) await load()
     v.append(el('div', { className: 'card' }, el('h3', {}, p.title), p.text ? el('p', {}, p.text) : '',
-      el('p', { className: 'dim' }, `by ${p.author === me ? 'you' : short(p.author)} · ${status}`),
+      el('p', { className: 'dim' }, `by ${p.author === me ? 'you' : short(p.author)} · ${describe(p.action)} · ${when}`),
       el('div', { className: 'bar', role: 'img', 'aria-label': `${t.yes} yes, ${t.no} no, ${t.abstain} abstain of ${t.electorate}` }, seg(t.yes, 'var(--ok)'), seg(t.no, 'var(--bad)'), seg(t.abstain, 'var(--dim)')),
-      el('p', { className: 'dim' }, `yes ${t.yes} · no ${t.no} · abstain ${t.abstain} · ${t.voted} of ${t.electorate} voted · quorum ${t.quorum ? 'met' : 'not met'}` + (p.myVote ? ` · you voted ${p.myVote}` : '')), acts))
+      el('p', { className: 'dim' }, `yes ${t.yes} · no ${t.no} · abstain ${t.abstain} · ${t.voted} of ${t.electorate} voted (${t.delegated} by delegation) · quorum ${t.quorum ? 'met' : 'not met'}` + (p.myVote ? ` · you voted ${p.myVote}` : '')), acts,
+      talk, el('div', { className: 'row' }, note, btn('Comment', async () => { await api('/api/communities/comment', { id: state.cid, proposal: p.id, text: note.value }); go('governance') }))))
   }
-  state.onGroup = (e) => { if (e.community === state.cid && ['proposal', 'vote'].includes(e.kind)) go('governance') }
+  state.onGroup = (e) => { if (e.community === state.cid && ['proposal', 'vote', 'delegate', 'comment', 'withdraw', 'enact'].includes(e.kind)) go('governance') }
   state.stop = () => { state.onGroup = null }
 }
 

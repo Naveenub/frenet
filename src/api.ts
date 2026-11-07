@@ -10,8 +10,6 @@ import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
 import { REPORT_CATEGORIES } from './moderation.js'
-import { PERMISSION_FEATURES } from './permissions.js'
-import type { ProxyStats } from './webproxy.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
 
@@ -28,7 +26,7 @@ const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js
  * Local control API. Binds to loopback only, rejects foreign Host headers (DNS rebinding)
  * and cross-origin state-changing requests (CSRF).
  */
-export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number, proxy?: { port: number, stats: () => ProxyStats }): Promise<{ server: Server, port: number }> {
+export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number): Promise<{ server: Server, port: number }> {
   const clients = new Set<ServerResponse>()
   const push = (event: string, data: unknown): void => {
     const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -59,7 +57,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         if (streamUpload ? !ct.startsWith('application/octet-stream') : !ct.startsWith('application/json')) return json(res, 415, { error: streamUpload ? 'octet-stream only' : 'json only' })
       }
 
-      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort, proxy?.port))
+      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort))
       if (req.method === 'GET' && url.pathname === '/api/peers') return json(res, 200, await peers(n))
       if (req.method === 'GET' && url.pathname === '/api/messages') {
         return json(res, 200, n.store.list(url.searchParams.get('peer') ?? undefined))
@@ -201,16 +199,6 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         await n.calls.send(peerIdFromString(String(b.peer)), String(b.call), String(b.kind), String(b.data ?? ''))
         return json(res, 200, { ok: true })
       }
-      // Browser: web proxy status, tracker rules and per-site permissions.
-      if (req.method === 'GET' && url.pathname === '/api/browser') return json(res, 200, browserState(n, proxy))
-      if (req.method === 'POST' && url.pathname === '/api/browser/trackers') { const b = await body(req); n.trackers.addRule(b.host, b.action === 'allow' ? 'allow' : 'block'); return json(res, 200, browserState(n, proxy)) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/import') { const b = await body(req, 9 * 1024 * 1024); return json(res, 200, { ...n.trackers.importList(b.text), state: browserState(n, proxy) }) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/clear') { const b = await body(req); return json(res, 200, { removed: n.trackers.clearRules(b.action === 'allow' ? 'allow' : 'block') }) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/remove') { const b = await body(req); return json(res, 200, { removed: n.trackers.removeRule(b.host) }) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/clear-recent') { n.trackers.clearRecent(); return json(res, 200, { ok: true }) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/grant') { const b = await body(req); n.permissions.grant(b.origin, b.feature); return json(res, 200, browserState(n, proxy)) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/revoke') { const b = await body(req); return json(res, 200, { removed: n.permissions.revoke(b.origin, b.feature) }) }
-      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/reset') { const b = await body(req); return json(res, 200, { removed: n.permissions.reset(b.origin) }) }
       if (req.method === 'GET' && url.pathname === '/api/operator') return json(res, 200, n.operator.snapshot())
       if (req.method === 'GET' && url.pathname === '/api/reputation') return json(res, 200, { threshold: n.reputation.opts.banThreshold, blocked: n.reputation.blockedCount(), peers: n.reputation.list(200), clusters: n.sybil.clusters() })
       if (req.method === 'POST' && url.pathname === '/api/reputation/reset') { const b = await body(req); if (!isPeerId(b.peer)) return json(res, 400, { error: 'invalid peer ID' }); return json(res, 200, { removed: n.reputation.reset(b.peer) }) }
@@ -219,13 +207,6 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/sweep') return json(res, 200, { removed: n.operator.sweep() })
       if (req.method === 'POST' && url.pathname === '/api/operator/reannounce') return json(res, 200, await n.blocks.reannounce())
-      // Remote administration (see admin.ts): this node acting as an admin of another, and the audit log of who administered this one.
-      if (req.method === 'GET' && url.pathname === '/api/admin') return json(res, 200, { enabled: n.admin.enabled, admins: [...n.admin.admins], log: n.store.listAdminLog(100) })
-      if (req.method === 'POST' && url.pathname === '/api/admin/remote') {
-        const b = await body(req)
-        const args = b.args && typeof b.args === 'object' && !Array.isArray(b.args) ? b.args as Record<string, unknown> : {}
-        return json(res, 200, { result: await n.admin.call(String(b.peer), b.cmd as any, args, b.addr ? { addr: String(b.addr) } : {}) })
-      }
       // Content safety: local reports and the operator's blocklist (see Moderation).
       if (req.method === 'GET' && url.pathname === '/api/moderation') return json(res, 200, { categories: REPORT_CATEGORIES, blocklist: n.moderation.list(), reports: n.moderation.listReports() })
       if (req.method === 'POST' && url.pathname === '/api/moderation/report') {
@@ -245,8 +226,17 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'GET' && url.pathname === '/api/communities/messages') return json(res, 200, n.groups.messages(String(url.searchParams.get('id') ?? '')))
       if (req.method === 'POST' && url.pathname === '/api/communities/post') { const b = await body(req); return json(res, 200, await n.groups.post(String(b.id), b.text)) }
       if (req.method === 'GET' && url.pathname === '/api/communities/proposals') return json(res, 200, n.groups.proposals(String(url.searchParams.get('id') ?? '')))
-      if (req.method === 'POST' && url.pathname === '/api/communities/propose') { const b = await body(req); return json(res, 200, await n.groups.propose(String(b.id), b.title, b.text, Number(b.hours) * 3_600_000)) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/propose') {
+        const b = await body(req)
+        return json(res, 200, await n.groups.propose(String(b.id), b.title, b.text, Number(b.hours) * 3_600_000, { discussionMs: Number(b.discussionHours ?? 0) * 3_600_000, action: b.action ?? undefined }))
+      }
       if (req.method === 'POST' && url.pathname === '/api/communities/vote') { const b = await body(req); return json(res, 200, await n.groups.vote(String(b.id), b.proposal, b.choice)) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/delegate') { const b = await body(req); return json(res, 200, await n.groups.delegate(String(b.id), b.to ?? null)) }
+      if (req.method === 'GET' && url.pathname === '/api/communities/delegations') return json(res, 200, n.groups.delegations(String(url.searchParams.get('id') ?? '')))
+      if (req.method === 'POST' && url.pathname === '/api/communities/comment') { const b = await body(req); return json(res, 200, await n.groups.comment(String(b.id), b.proposal, b.text)) }
+      if (req.method === 'GET' && url.pathname === '/api/communities/comments') return json(res, 200, n.groups.comments(String(url.searchParams.get('id') ?? ''), String(url.searchParams.get('proposal') ?? '')))
+      if (req.method === 'POST' && url.pathname === '/api/communities/withdraw') { const b = await body(req); return json(res, 200, await n.groups.withdraw(String(b.id), b.proposal)) }
+      if (req.method === 'POST' && url.pathname === '/api/communities/enact') { const b = await body(req); return json(res, 200, await n.groups.enact(String(b.id), b.proposal)) }
       if (req.method === 'POST' && url.pathname === '/api/dial') {
         const b = await body(req)
         await n.libp2p.dial(multiaddr(String(b.addr)))
@@ -310,26 +300,15 @@ async function body (req: IncomingMessage, max = 64 * 1024): Promise<Record<stri
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
 }
 
-function browserState (n: FrenetNode, proxy?: { port: number, stats: () => ProxyStats }): unknown {
-  return {
-    proxy: proxy ? { port: proxy.port, pacUrl: `http://127.0.0.1:${proxy.port}/proxy.pac`, httpsOnly: true, stats: proxy.stats() } : null,
-    trackers: n.trackers.snapshot(),
-    permissions: { features: PERMISSION_FEATURES, origins: n.permissions.list() }
-  }
-}
-
-async function status (n: FrenetNode, gatewayPort?: number, proxyPort?: number): Promise<unknown> {
+async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
   const l = n.libp2p
   const dht = (l.services as any).dht
   return {
     peerId: l.peerId.toString(),
     did: n.did,
-    profile: n.profile,
-    remoteAdmin: n.admin.enabled,
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
     gatewayPort: gatewayPort ?? null,
-    proxyPort: proxyPort ?? null,
     nat: {
       enabled: !!(l.services as any).autonat,
       relayServer: !!(l.services as any).relay,

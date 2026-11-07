@@ -19,7 +19,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 |---|---|
 | Ed25519 identity, key stored locally (0600), never transmitted | working |
 | TCP + Noise (forward-secret) + yamux via libp2p | working |
-| Peer discovery: mDNS (LAN) + bootstrap list + manual dial | working; mDNS tested between two network namespaces on a shared LAN (not physical hosts or Wi-Fi) |
+| Peer discovery: mDNS (LAN) + bootstrap list + manual dial | working (mDNS untested across hosts) |
 | Kademlia DHT (`/frenet/kad/1.0.0`) provider records | working, tested (3 nodes, A<->B<->C) |
 | Content-addressed blocks (sha256 CIDs, <=1 MB, hash-verified fetch, replicate-on-fetch) | working; blocks added through the API are encrypted by default (key returned once, never stored); `public: true` stores plaintext. The network layer still serves any block to anyone who asks for its CID, which is how content addressing works, so what protects a block is its encryption |
 | Files: 256 KB chunks, AES-256-GCM client-side encryption, encrypted manifest, key only in the share link | working, tested (<= 1 GiB/file). Upload and download stream chunk by chunk (`PUT /api/files/stream`, `POST /api/files/download`), so memory does not grow with file size. Files over 64 blocks are announced to the DHT in the background. The older JSON/base64 routes remain for small files (<= 16 MB). Sites keep their own 16 MB per-file cap |
@@ -30,27 +30,22 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
-| Web browsing: local HTTPS-only CONNECT proxy (`127.0.0.1:7779`, PAC file), host-based tracker blocking with your own allow/block rules, no browsing log | working, tested against local TCP targets and a fake SOCKS5 server; **not tested against real HTTPS sites, real browsers or a real Tor**; blocks by host only (TLS is never decrypted) |
-| Site permissions: per-origin grants for camera, microphone, location, fullscreen, clipboard-write, screen capture; all off by default, listed and revocable in the dashboard | working, tested (the gateway's `Permissions-Policy` changes for that origin only); the browser's own prompt still applies |
-| Secure downloads: files that are not on the render allow-list (and any file with `?download=1`) are sandboxed attachments with a validated filename and `X-Frenet-File` id | working, tested |
 | Decentralized sites: publish a static folder (<= 64 files, 32 MB), content-addressed, served by a local gateway on an isolated per-site origin (`<site-id>.localhost`) with a no-third-party CSP; dashboard Browser view | working, tested (publish on A, serve via B over the DHT) |
 | Voice/video: WebRTC calls from the dashboard, signed signalling over `/frenet/call/1.0.0` (ephemeral, rate limited, accept/decline) | signalling tested on two real nodes; dashboard call flow tested only with a stubbed WebRTC stack, so **real camera/microphone media across browsers and NATs is untested** |
 | Communities + group chat: owner-managed signed rosters, invitations need explicit join, signed messages fanned out to members (`/frenet/group/1.0.0`) | working, tested (3 nodes); no history sync, no store-and-forward |
-| Governance: signed proposals and one-member-one-vote ballots, frozen electorate, quorum, tally verifiable by any node | working, tested; **advisory only**, nothing enforces outcomes |
-| Node operator tools: persistent peer ban list enforced at the connection gater, disconnect, retention sweep, resource and rejected-traffic stats | working, tested; local dashboard, plus optional remote administration (next row) |
-| Remote administration: peers you list with `--admin-peer` can read stats and ban, unban, disconnect, sweep, re-announce and edit the content blocklist over a signed, replay-protected request (`/frenet/admin/1.0.0`); every command is audit-logged; `frenet admin PEER CMD` | working, tested (two and three nodes, replay, stale, mis-addressed, mis-signed, unlisted peers); **off by default, no read access to data or keys, no shared admin lists, not audited**; an admin is as trusted as the machine holding its node key |
-| Mobile / small devices: `--profile mobile` (24 connections, DHT client mode, 256 MB quota, 24 h re-announce, no gateway, no relay server) | working as a configuration of the same Node.js node, tested on a desktop; **there is no native Android/iOS app, no iOS support, no background-execution handling, and it has not been run on a phone** (Android via Termux is the expected route, untested) |
-| NAT traversal: circuit-relay v2 client + server, AutoNAT v2, UPnP port mapping (DCUtR is enabled but does not succeed, see limits) | working, tested in a Linux NAT lab (`npm run test:natlab`, root): relayed delivery between two peers behind separate NATs over TCP and QUIC, symmetric NATs, the mobile profile, UPnP against a real router (miniupnpd). **Hole punching does not work** with the current transports. Not tested: real home routers, CGNAT, hairpin NAT |
+| Governance: signed proposals, one-member-one-vote ballots, frozen electorate, quorum, tally verifiable by any node; transitive delegated voting; discussion period, comments, withdrawal; **binding** proposals (rename, add or remove members) applied only after every node re-verifies the signed ballots | working, tested (including across real peers). Advisory proposals still change nothing; no history sync, so a node that missed events can disagree; the owner stays a trusted party for invitations; weighted voting, secret ballots and a community-wide governance charter are not built |
+| Node operator tools: persistent peer ban list enforced at the connection gater, disconnect, retention sweep, resource and rejected-traffic stats | working, tested; local dashboard only, no remote administration |
+| NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | working: relayed delivery tested on loopback; hole punching and UPnP depend on your NAT/router and are untested here |
 | Names + updates: `<name>.<publisher-key>`, signed by your identity key, higher `seq` replaces lower, so a site keeps its address when you republish | working, tested (publish on A, resolve + serve on B, update, forged/stale/tampered records rejected) |
 | Search: keyword search over names/titles/keywords that publishers announce on the DHT, every record signature-checked | working, tested; opt-in per site, unranked, spammable (see limits) |
 | DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID | working, tested (spec test vector) |
 | Verifiable credentials: issue/verify W3C VC-JWTs signed by your identity key, holder presentations bound to a verifier nonce, issuer-signed revocation | working, tested (tamper, alg-confusion, replay, wrong-holder cases); revocation is pull-only, no trust registry |
 | Zero-knowledge authentication: prove "I am one of these N identities" without saying which (linkable ring proof over the same Ed25519 keys, `@noble/curves`), bound to a verifier challenge, scope and audience; a per-scope tag lets a verifier allow each anonymous member one action (a vote, a claim) | working, tested (every signer position, replay, tamper, forged/small-order tags, one-per-scope, two nodes over the API); anonymity set = the ring (O(n), max 1024; default minimum 5, optional `ringId` fingerprint pin against padded rings); dashboard view **Anonymous Auth** and `frenet zk` CLI; **not a general-purpose zk-SNARK, not independently audited** |
 | Account recovery: passphrase-encrypted key backup and k-of-n Shamir recovery shares, CLI only | working, tested end to end; recovers the *same* key, cannot help if the key is stolen (see SECURITY.md) |
-| QUIC transport (`/udp/…/quic-v1`) next to TCP, on by default (`--no-quic` to disable); ban list and all other gating apply to it | working, tested on loopback (connect, messaging, ban); tested behind Linux NATs in the lab (outbound dial, relayed delivery, replies over the same connection); UDP-blocking firewalls, real routers and CGNAT untested; depends on the third-party native module `@chainsafe/libp2p-quic` |
+| QUIC transport (`/udp/…/quic-v1`) next to TCP, on by default (`--no-quic` to disable); ban list and all other gating apply to it | working, tested on loopback (connect, messaging, ban); behaviour behind real NATs/firewalls untested; depends on the third-party native module `@chainsafe/libp2p-quic` |
 | Sybil resistance: optional identity proof-of-work (`--min-identity-bits N`, `frenet identity mine`), per-subnet peer limits, cluster flagging | working, tested; **raises the cost of fake identities, does not prevent them** (see ARCHITECTURE.md) |
 | Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
-| Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification, signing, **download (https only, size-capped), atomic install with backup, and rollback** working, tested (`frenet update fetch | install | rollback`); operator-run only: **the node never checks for or applies updates by itself**, nothing is unpacked, executed or restarted for you, no trust roots are shipped (you pin them), root-key rotation not built |
+| Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
 | Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
 | Human-memorable global names, key rotation | **not built** |
 
@@ -58,8 +53,9 @@ Nothing in the dashboard is simulated. Empty states mean there is no data.
 
 ## Scope: deliberately not built
 
-This is **not in the spec's feature list**, so its absence is not a gap or a to-do:
+These are **not in the spec's feature list**, so their absence is not a gap or a to-do:
 
+- **General web browsing.** The Decentralized Browser section is only the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`). It does not browse the public web, so there is no HTTPS browsing, no tracker blocking and no permission manager. (Published sites are already locked down by a no-third-party CSP and a deny-all `Permissions-Policy`; that is site hardening, not a browser feature.)
 - **Encrypted group messaging.** Community chat is signed by its author and travels over the Noise-encrypted link to each member, but there is no group key and no end-to-end encryption beyond that link. Stored events stay signed and plaintext on each member's device.
 
 ## Run
@@ -84,24 +80,6 @@ Publish a folder from the dashboard (**Decentralized Browser**) or via `POST /ap
 Sites are **public**: no encryption, anyone with the ID can read them. The ID is the hash of the site manifest, so the content cannot be swapped.
 Open `http://<site-id>.localhost:7778/` (the gateway fetches from peers and verifies hashes). Sites can only load their own files (no third-party requests, no framing)
 and each has its own browser origin. `--gateway-port N` / `--no-gateway`. Limits: static files only.
-
-### Web browsing, tracker blocking and permissions
-
-The dashboard's **Decentralized Browser** view has the setup. The node runs a local proxy (`--proxy-port N`, default 7779, `--no-proxy` to turn it off):
-
-```bash
-# Proxy auto-config: normal https:// sites go through the proxy, *.localhost (FRENET sites) goes direct
-#   http://127.0.0.1:7779/proxy.pac
-# or set an HTTPS proxy of 127.0.0.1:7779 in your browser or OS
-```
-
-- **HTTPS only.** Plain `http://` requests get a 426. Only port 443 is tunnelled. TLS is passed through end to end: no certificate to install and nothing is decrypted, so the proxy cannot see, alter or log what you read.
-- **Tracker blocking** is by host name, before any DNS lookup, from a built-in list (about 180 well-known tracker and ad domains), your own block and "always allow" rules (a domain covers its subdomains), and any maintained blocklist you import from a file (hosts format, bare domains or Adblock `||domain^` rules; up to 8 MB / 300,000 rules; the node never downloads lists itself). It cannot filter by URL or strip cookies because it cannot see inside TLS, and that is deliberate: seeing inside would mean installing a certificate authority that can impersonate every site.
-- **No access to your own machine.** The proxy resolves the host itself, refuses if any answer is loopback, LAN, link-local or otherwise non-public, and connects to the address it checked. `--proxy-allow-private` turns this off for a deliberate LAN setup.
-- **No history.** Allowed destinations are never logged or stored; only counters exist, and the list of recently blocked hosts lives in memory.
-- **Upstream proxy.** `--proxy-upstream socks5://127.0.0.1:9050` sends every tunnel through a SOCKS5 proxy such as Tor. Host names go to it unresolved (no local DNS lookup), and sites see its address, not yours. Without an upstream, sites and your network see your IP and your resolver sees the host names. With one, only IP literals are checked locally for non-public targets, so use a proxy that refuses private destinations (Tor exits do). Anonymity is only as good as that proxy: FRENET does not provide it by itself.
-
-**Site permissions.** Every FRENET site is denied camera, microphone, location, fullscreen, clipboard-write and screen capture. Grant one per site origin in the dashboard (or `POST /api/browser/permissions/grant {origin, feature}` with `site:<id>` or `name:<n>.<key>`); it only lets that site ask, and your browser still prompts.
 
 ### Names, updates and search
 
@@ -192,11 +170,7 @@ npm start -- --relay /ip4/<relay-ip>/tcp/4001/p2p/<relay-peer-id>
 
 The node then advertises a `/p2p-circuit` address that other peers can dial. Relayed links are
 capacity-limited (relay default: 2 min / 2 MiB per connection); peers try to upgrade to a direct
-connection with DCUtR, but that does not currently succeed (TCP and QUIC dial from a fresh source
-port, not the listening one), so expect relayed links unless UPnP or a forwarded port gives a direct path.
-UPnP opens a port when the router allows it.
-A node on a public IP must be started with `--announce` too: libp2p does not advertise a public listen
-address that nobody has verified, so a lone relay would otherwise only advertise loopback/LAN addresses.
+connection with DCUtR hole punching, and UPnP opens a port when the router allows it.
 Use `--announce MULTIADDR` for a manually forwarded port or DNS name, `--no-nat` to disable all of this.
 
 Flags: `--ice-server stun:HOST[:PORT]` (repeatable; for calls across NATs, none by default so no third party learns your IP), `--relay MULTIADDR` (repeatable), `--relay-server`, `--announce MULTIADDR` (repeatable), `--no-nat`, `--gateway-port N`, `--no-gateway`, `--data DIR` (default `~/.frenet`), `--listen MULTIADDR`, `--bootstrap MULTIADDR`, `--api-port N`, `--quota-mb N` (1024), `--replica-ttl-days N` (7), `--reannounce-hours N` (12, 0 = never), `--no-mdns`.
