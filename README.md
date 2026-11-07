@@ -58,6 +58,13 @@ These are **not in the spec's feature list**, so their absence is not a gap or a
 - **General web browsing.** The Decentralized Browser section is only the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`). It does not browse the public web, so there is no HTTPS browsing, no tracker blocking and no permission manager. (Published sites are already locked down by a no-third-party CSP and a deny-all `Permissions-Policy`; that is site hardening, not a browser feature.)
 - **Encrypted group messaging.** Community chat is signed by its author and travels over the Noise-encrypted link to each member, but there is no group key and no end-to-end encryption beyond that link. Stored events stay signed and plaintext on each member's device.
 
+## Privacy and data ownership
+
+- **Local-first.** Messages, blocks, names and node state live in a local SQLite database in the data directory. Nothing is sent to a server we run, and there is no telemetry or analytics.
+- **Key custody.** The Ed25519 identity key is stored locally (`identity.key`, mode 0600), is never transmitted and is never returned by the HTTP API. It leaves the data directory only through the explicit backup and recovery commands (see SECURITY.md).
+- **Private by default.** The control API is loopback-only, blocks and files are encrypted by default, and links to encrypted content carry the key. Published sites are the exception: they are public by design.
+- **Anonymous authentication.** Beyond signatures and VC presentations, a linkable ring proof (`src/zkauth.ts`, `frenet zk`, dashboard **Anonymous Auth**) proves "I am one of these N identities" without revealing which, with one stable tag per scope. It is not a general zero-knowledge system (no SNARKs, no range proofs), VC presentations still disclose what they contain, anonymity is only as large as the ring, and it has not been independently audited.
+
 ## Run
 
 ```bash
