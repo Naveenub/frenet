@@ -176,6 +176,9 @@ export class FileStore {
 
   list () { return this.store.listFiles() }
 
+  /** Local record of a file this node added (size, encrypted flag, chunks), or null. */
+  info (cid: string) { return this.store.getFile(cid) }
+
   /** The full `frenet://cid#key` link, only for files added with `remember`; null otherwise (the key is not stored by default). */
   rememberedLink (cid: string): string | null { return this.store.getFileLink(cid) }
 

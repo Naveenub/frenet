@@ -1,7 +1,10 @@
 import assert from 'node:assert/strict'
+import { request } from 'node:http'
 import { after, describe, it } from 'node:test'
 import { startApi } from '../src/api.js'
 import { CHUNK_BYTES, MAX_FILE_BYTES, openBlock, sealBlock } from '../src/files.js'
+import { startGateway } from '../src/gateway.js'
+import { MAX_SITE_FILE_BYTES } from '../src/sites.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
 
 const L = ['/ip4/127.0.0.1/tcp/0']
@@ -105,3 +108,36 @@ describe('storage: big files and raw blocks', () => {
     } finally { server.close() }
   })
 })
+
+describe('storage: big site files', () => {
+  it('a site file can be as big as any file: uploaded streaming, referenced by cid, served streaming with a correct length', async () => {
+    assert.equal(MAX_SITE_FILE_BYTES, MAX_FILE_BYTES)
+    const n = await track()
+    const size = 20 * 1024 * 1024 + 4321                        // over the old 16 MB site cap, not chunk aligned
+    const big = await n.files.addStream('big.bin', pieces(size, 1024 * 1024, 9), { encrypt: false })
+    const enc = await n.files.addStream('secret.bin', pieces(1000, 1000), { encrypt: true })
+    const site = await n.sites.publish([{ path: 'index.html', data: Buffer.from('<p>hi</p>') }, { path: 'big.bin', cid: big.cid }])
+    assert.equal(site.bytes, 9 + size)
+    await assert.rejects(n.sites.publish([{ path: 'index.html', cid: enc.cid }]), /encrypted/)
+    await assert.rejects(n.sites.publish([{ path: 'index.html', cid: 'bafkreigh2akiscaildcqabsyg3dfr6chu3fgpregiymsck7e7aqa4s52zy' }]), /not stored on this node/)
+    await assert.rejects(n.sites.publish([{ path: 'index.html', data: Buffer.from('x'), cid: big.cid }]), /either data or cid/)
+    assert.ok(n.files.info(big.cid), 'a failed publish leaves referenced files alone')
+
+    const gw = await startGateway(n, 0)
+    try {
+      const host = `${site.cid}.localhost:${gw.port}`
+      const got = await new Promise<{ len: number, header: string | undefined, sum: number }>((resolve, reject) => {
+        request({ host: '127.0.0.1', port: gw.port, path: '/big.bin', headers: { host } }, (res) => {
+          let len = 0; let sum = 0
+          res.on('data', (d: Buffer) => { len += d.length; for (let i = 0; i < d.length; i += 4096) sum += d[i]! })
+          res.on('end', () => resolve({ len, header: res.headers['content-length'], sum }))
+          res.on('error', reject)
+        }).on('error', reject).end()
+      })
+      assert.equal(got.len, size)
+      assert.equal(got.header, String(size))
+      assert.ok(got.sum > 0)
+    } finally { gw.server.close() }
+  })
+})
+

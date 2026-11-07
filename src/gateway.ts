@@ -72,7 +72,7 @@ export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): 
       }
       let path: string
       try { path = decodeURIComponent(new URL(req.url ?? '/', 'http://x').pathname) } catch { return text(res, 400, 'bad path') }
-      const r = await n.sites.resolve(siteCid!, path)
+      const r = await n.sites.open(siteCid!, path)
       if (!r) return text(res, 404, 'no such file in this site')
       const type = MIME[r.path.slice(r.path.lastIndexOf('.') + 1).toLowerCase()]
       const origin = named ? nameOrigin(named.name, named.pub) : siteOrigin(siteCid!)
@@ -83,7 +83,7 @@ export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): 
       res.writeHead(200, {
         'content-type': asDownload && !type ? 'application/octet-stream' : (type ?? 'application/octet-stream'),
         ...(asDownload ? { 'content-disposition': `attachment; filename="${filename}"` } : {}),
-        'content-length': r.data.length,
+        'content-length': r.size,
         'content-security-policy': asDownload ? 'sandbox; default-src \'none\'' : SITE_CSP,
         'x-content-type-options': 'nosniff',
         'x-frame-options': 'DENY',
@@ -93,9 +93,14 @@ export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): 
         'x-frenet-file': r.cid,
         'cache-control': 'no-store'
       })
-      res.end(req.method === 'HEAD' ? undefined : r.data)
+      if (req.method === 'HEAD') { await r.chunks.return(); return void res.end() }
+      try {
+        for await (const part of r.chunks) { if (!res.write(part)) await new Promise<void>((ok) => res.once('drain', ok)) }
+        res.end()
+      } catch { res.destroy() }   // a failed chunk must not look like a complete file: cut the connection
     } catch (err) {
       if (err instanceof ContentBlocked) return blocked(res)   // e.g. one blocked file inside an otherwise fine site
+      if (res.headersSent) return void res.destroy()
       text(res, 502, (err as Error).message)
     }
   })

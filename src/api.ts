@@ -137,7 +137,8 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/sites') {
         const b = await body(req, 48 * 1024 * 1024)
         if (!Array.isArray(b.files)) throw new Error('files must be an array')
-        const entries = b.files.map((f: any) => ({ path: String(f?.path), data: Buffer.from(String(f?.data ?? ''), 'base64') }))
+        // each file is { path, data } (base64, small files) or { path, cid } (a public file uploaded earlier with PUT /api/files/stream?encrypt=false)
+        const entries = b.files.map((f: any) => f?.cid !== undefined && f?.data === undefined ? { path: String(f?.path), cid: String(f.cid) } : { path: String(f?.path), data: Buffer.from(String(f?.data ?? ''), 'base64') })
         const ttl = b.ttlDays ? Number(b.ttlDays) * DAY_MS : undefined
         // Validate the naming fields first so a bad name does not leave a published-but-unnamed site behind.
         const name = b.name === undefined || b.name === '' ? null : String(b.name)
