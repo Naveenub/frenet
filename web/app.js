@@ -315,9 +315,9 @@ function endCall (notify, note) {
 }
 
 function newPc () {
-  const pc = new RTCPeerConnection({ iceServers: (state.status.calls?.iceServers ?? []).map((urls) => ({ urls })) })
+  const pc = new RTCPeerConnection({ iceServers: (state.status.calls?.iceServers ?? []).map((urls) => /^turns?:/.test(urls) && state.status.calls?.turn ? { urls, username: state.status.calls.turn.username, credential: state.status.calls.turn.credential } : { urls }) })
   pc.ontrack = (e) => { media.remote.srcObject = e.streams[0] }
-  pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && call.pc === pc) endCall(true, { err: true, text: 'Call failed: no route between you and this peer. If you are behind NAT, start the node with --ice-server stun:HOST.' }) }
+  pc.onconnectionstatechange = () => { if (pc.connectionState === 'failed' && call.pc === pc) endCall(true, { err: true, text: 'Call failed: no route between you and this peer. If you are behind NAT, start the node with --ice-server stun:HOST (or turn:HOST with --turn-username and --turn-credential).' }) }
   call.pc = pc
   return pc
 }
@@ -399,7 +399,7 @@ const btn = (label, fn) => el('button', { className: 'btn', type: 'button', oncl
   try { await fn() } catch (x) { $('#view').querySelector('.err.top')?.remove(); $('#view').prepend(el('p', { className: 'err top' }, x.message)) } finally { e.target.disabled = false }
 } }, label)
 const ids = (text) => text.split(/[\s,]+/).filter(Boolean)
-const delivery = (r) => r.failed?.length ? `Not delivered to ${r.failed.length} member(s) who were unreachable; messages are not queued.` : ''
+const delivery = (r) => r.failed?.length ? (r.queued ? `${r.failed.length} member(s) were unreachable; ${r.queued} will be retried while this node is online (up to 7 days).` : `Not delivered to ${r.failed.length} member(s) who were unreachable.`) : ''
 const STATE_LABEL = { invited: 'invitation pending', joined: 'member', removed: 'removed by the owner', left: 'left' }
 
 async function communities (v) {
@@ -446,7 +446,7 @@ async function communities (v) {
   box.addEventListener('keydown', (e) => { if (e.key === 'Enter') send() })
   const members = el('div', {}, ...sel.members.map((m) => el('div', { className: 'mono' }, m + (m === sel.owner ? ' (owner)' : m === me ? ' (you)' : ''))))
   const card = el('div', { className: 'card' }, el('h3', {}, sel.name), log, el('div', { className: 'row' }, box, el('button', { className: 'btn', type: 'button', onclick: send }, 'Send')), perr,
-    el('p', { className: 'dim' }, 'Each message is signed by its author and delivered directly to every member that is online. There is no relay or history sync: members who were offline miss it.'),
+    el('p', { className: 'dim' }, 'Each message is signed by its author and delivered directly to every member that is online. Chat messages and invitations to members who were offline are retried from this node for up to 7 days; there is no relay and no history sync, so a member who was offline while this node was too misses them.'),
     el('h3', { style: 'margin-top:14px' }, 'Members'), members)
   if (sel.owner === me) {
     const mem = el('input', { value: sel.members.filter((m) => m !== me).join(', '), 'aria-label': 'Members (peer IDs)' })

@@ -27,6 +27,7 @@ import { Credentials, type RevocationCheck } from './credentials.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
+import { Outbox } from './outbox.js'
 import { Moderation } from './moderation.js'
 import { Names } from './names.js'
 import { SitePermissions } from './permissions.js'
@@ -59,8 +60,11 @@ export interface FrenetOptions {
   relayServer?: boolean
   /** Extra public multiaddrs to announce (e.g. a forwarded port or DNS name). */
   announce?: string[]
-  /** STUN servers (`stun:host[:port]`) handed to the dashboard's WebRTC calls. None by default: calls then work on LAN/public addresses only and no third party learns your IP. */
+  /** STUN/TURN servers (`stun:host[:port]`, `turn:host[:port]`, and the `stuns:`/`turns:` forms) handed to the dashboard's WebRTC calls. None by default: calls then work on LAN/public addresses only and no third party learns your IP. A TURN server relays the (DTLS-SRTP encrypted) media and sees both addresses and the traffic volume. */
   iceServers?: string[]
+  /** Credentials for every `turn:`/`turns:` entry in `iceServers` (required when there is one). They are handed to the local dashboard over the loopback API. */
+  turnUsername?: string
+  turnCredential?: string
   /** QUIC transport (UDP, `/quic-v1`) next to TCP. Default true. When `listen` is not given, a QUIC listener is added. */
   quic?: boolean
   /** Refuse peers whose key lacks this many bits of identity proof-of-work (see `frenet identity mine`). Default 0 (off). */
@@ -92,6 +96,7 @@ export interface FrenetNode {
   libp2p: Libp2p
   store: Store
   messaging: Messaging
+  outbox: Outbox
   blocks: Blocks
   files: FileStore
   sites: Sites
@@ -120,6 +125,7 @@ export interface FrenetNode {
   /** The verified key log of a rotatable identity, or null for a plain fixed-key identity. */
   identity: IdentityState | null
   iceServers: string[]
+  turn: { username: string, credential: string } | null
   startedAt: number
   stop: () => Promise<void>
 }
@@ -150,7 +156,12 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   if (profile !== 'default' && profile !== 'mobile') throw new Error('profile must be "default" or "mobile"')
   if (profile === 'mobile' && opts.relayServer) throw new Error('the mobile profile cannot run a relay server (it is rarely reachable and relaying drains battery and data)')
   const iceServers = opts.iceServers ?? []
-  for (const s of iceServers) if (!/^stuns?:[A-Za-z0-9.:[\]-]{1,200}$/.test(s)) throw new Error(`invalid ICE server "${s}" (use stun:host[:port] or stuns:host[:port])`)
+  for (const s of iceServers) if (!/^(stuns?|turns?):[A-Za-z0-9.:[\]-]{1,200}$/.test(s)) throw new Error(`invalid ICE server "${s}" (use stun[s]:host[:port] or turn[s]:host[:port])`)
+  const usesTurn = iceServers.some((s) => /^turns?:/.test(s))
+  const turnOk = (v: string | undefined): boolean => typeof v === 'string' && v.length >= 1 && v.length <= 256 && !/[\u0000-\u001f\u007f]/.test(v)
+  if (usesTurn && !(turnOk(opts.turnUsername) && turnOk(opts.turnCredential))) throw new Error('a turn: ICE server needs turnUsername and turnCredential (1-256 characters, no control characters)')
+  if (!usesTurn && (opts.turnUsername !== undefined || opts.turnCredential !== undefined)) throw new Error('turnUsername/turnCredential were given but no turn: ICE server is configured')
+  const turn = usesTurn ? { username: opts.turnUsername as string, credential: opts.turnCredential as string } : null
   const banned = new Set<string>()
   const store = new Store(opts.dataDir)
   const reputation = new Reputation(store, { ...(opts.autoBan === false ? { banThreshold: -Infinity } : {}), ...opts.reputation })
@@ -232,7 +243,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   })
 
   self = libp2p
-  const messaging = new Messaging(libp2p, store, privateKey)
+  const outbox = new Outbox(libp2p, store)
+  const messaging = new Messaging(libp2p, store, privateKey, outbox)
   const moderation = new Moderation(store, libp2p, privateKey)
   const blocks = new Blocks(libp2p, store, moderation, {
     ...(opts.quotaBytes ? { quotaBytes: opts.quotaBytes } : {}),
@@ -245,7 +257,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const sites = new Sites(blocks, files)
   const names = new Names(libp2p, store, blocks, privateKey, moderation)
   const calls = new Calls(libp2p, privateKey)
-  const groups = new Groups(libp2p, store, privateKey)
+  const groups = new Groups(libp2p, store, privateKey, outbox)
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
   const admin = new Admin(libp2p, store, privateKey, { operator, moderation, blocks }, opts.adminPeers)
   const identityLogs = new IdentityLogs(libp2p, store)
@@ -278,6 +290,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   await messaging.start()
   await calls.start()
   await groups.start()
+  outbox.start()
   await admin.start()
   await blocks.start()
   await names.start()
@@ -297,6 +310,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     libp2p,
     store,
     messaging,
+    outbox,
     blocks,
     files,
     sites,
@@ -319,9 +333,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     keyDid: credentials.keyDid,
     identity,
     iceServers,
+    turn,
     startedAt: Date.now(),
     stop: async () => {
       clearInterval(sweeper)
+      outbox.stop()
       await messaging.stop()
       await calls.stop()
       await groups.stop()

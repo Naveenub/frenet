@@ -88,6 +88,7 @@ export class Store {
       CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
       CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','blocked','dismissed')));
       CREATE INDEX IF NOT EXISTS reports_ts ON reports (ts);
+      CREATE TABLE IF NOT EXISTS outbox (kind TEXT NOT NULL CHECK (kind IN ('msg','group')), id TEXT NOT NULL, peer TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, next INTEGER NOT NULL, PRIMARY KEY (kind, id, peer));
       CREATE TABLE IF NOT EXISTS site_permissions (origin TEXT NOT NULL, feature TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (origin, feature));
       CREATE TABLE IF NOT EXISTS tracker_rules (host TEXT PRIMARY KEY, action TEXT NOT NULL CHECK (action IN ('block','allow')), ts INTEGER NOT NULL);
     `)
@@ -368,9 +369,32 @@ export class Store {
       .run(channel, seq, version, Date.now())
   }
 
+  hasMessage (id: string, direction: 'in' | 'out'): boolean {
+    return !!this.db.prepare('SELECT 1 FROM messages WHERE id = ? AND direction = ?').get(id, direction)
+  }
+
+  outboxAdd (r: { kind: string, id: string, peer: string, ts: number, payload: string, tries: number, next: number }): void {
+    this.db.prepare('INSERT OR IGNORE INTO outbox (kind, id, peer, ts, payload, tries, next) VALUES (?, ?, ?, ?, ?, ?, ?)').run(r.kind, r.id, r.peer, r.ts, r.payload, r.tries, r.next)
+  }
+  outboxCount (peer?: string): number {
+    const r = (peer ? this.db.prepare('SELECT COUNT(*) AS n FROM outbox WHERE peer = ?').get(peer) : this.db.prepare('SELECT COUNT(*) AS n FROM outbox').get()) as { n: number }
+    return Number(r.n)
+  }
+  outboxDue (now: number, peer: string | undefined, force: boolean, limit: number): Array<{ kind: 'msg' | 'group', id: string, peer: string, ts: number, payload: string, tries: number, next: number }> {
+    const rows = peer
+      ? this.db.prepare(`SELECT * FROM outbox WHERE peer = ? ${force ? '' : 'AND next <= ?'} ORDER BY ts LIMIT ?`).all(...(force ? [peer, limit] : [peer, now, limit]))
+      : this.db.prepare('SELECT * FROM outbox WHERE next <= ? ORDER BY ts LIMIT ?').all(now, limit)
+    return rows as never
+  }
+  outboxDone (kind: string, id: string, peer: string): void { this.db.prepare('DELETE FROM outbox WHERE kind = ? AND id = ? AND peer = ?').run(kind, id, peer) }
+  outboxRetry (kind: string, id: string, peer: string, next: number): void { this.db.prepare('UPDATE outbox SET tries = tries + 1, next = ? WHERE kind = ? AND id = ? AND peer = ?').run(next, kind, id, peer) }
+  outboxExpire (before: number): number { return Number(this.db.prepare('DELETE FROM outbox WHERE ts < ?').run(before).changes) }
+  outboxDropPeer (peer: string): void { this.db.prepare('DELETE FROM outbox WHERE peer = ?').run(peer) }
+
   /** Secure-ish local deletion: remove rows, checkpoint WAL, vacuum. */
   deletePeer (peer: string): void {
     this.db.prepare('DELETE FROM messages WHERE peer = ?').run(peer)
+    this.db.prepare("DELETE FROM outbox WHERE peer = ? AND kind = 'msg'").run(peer)
     this.db.exec('PRAGMA wal_checkpoint(TRUNCATE); VACUUM;')
   }
 

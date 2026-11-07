@@ -1,5 +1,6 @@
 import { randomBytes, randomUUID } from 'node:crypto'
 import { EventEmitter } from 'node:events'
+import { OUTBOX_TTL_MS, type Outbox } from './outbox.js'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
 import { canon, ID_RE, isPeerId, MAX_SKEW_MS, readFrame, signBytes, verifyBytes } from './channel.js'
@@ -25,9 +26,10 @@ type Kind = typeof KINDS[number]
 export const CHOICES = ['yes', 'no', 'abstain'] as const
 export type Choice = typeof CHOICES[number]
 
-export interface Wire { v: 1, community: string, kind: Kind, id: string, ts: number, body: string, sig: string }
+export interface Wire { v: 1, community: string, kind: Kind, id: string, ts: number, body: string, sig: string, q?: 1 }
 export interface GroupEvent { community: string, id: string, kind: Kind, author: string, ts: number }
-export interface Delivery { delivered: number, failed: string[] }
+/** `failed` = members not reached right now; `queued` = how many of those were put in the outbox for retry (chat and roster events only). */
+export interface Delivery { delivered: number, failed: string[], queued: number }
 
 /** A binding action. It only ever takes effect through an `enact` event whose evidence every node re-verifies. */
 export type Action = { type: 'rename', name: string } | { type: 'members', members: string[] }
@@ -114,7 +116,18 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
   clock: () => number = Date.now
   private timer: NodeJS.Timeout | null = null
 
-  constructor (private node: Libp2p, private store: Store, private key: PrivateKey) { super() }
+  constructor (private node: Libp2p, private store: Store, private key: PrivateKey, private outbox?: Outbox) {
+    super()
+    outbox?.register('group', async (peer, payload) => {
+      const w = JSON.parse(payload) as Wire
+      // A chat message is never delivered to someone who has left or been removed since it was queued.
+      if (w.kind === 'msg') {
+        const c = this.store.getCommunity(w.community)
+        if (!c || c.state !== 'joined' || !c.members.includes(peer)) return
+      }
+      await this.send(peer, { ...w, q: 1 })
+    })
+  }
 
   private get self (): string { return this.node.peerId.toString() }
 
@@ -150,7 +163,10 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
   async accept (author: string, w: Wire): Promise<string | null> {
     const now = this.clock()
     if (!(await verifyBytes(author, canon(GROUP_DOMAIN, [author, w.community, w.kind, w.id, String(w.ts)], w.body), w.sig))) return 'bad-signature'
-    const verdict = this.replay.check(author, `${w.community}:${w.id}`, w.ts, now)
+    const queued = w.q === 1
+    if (queued && w.kind !== 'msg' && w.kind !== 'roster') return 'malformed'   // governance events keep the strict clock window: their deadlines depend on it
+    if (queued && w.kind === 'msg' && this.store.getGroupEvent(w.community, w.id)) return null   // a retry of a message we already have
+    const verdict = this.replay.check(author, `${w.community}:${w.id}`, w.ts, now, queued ? OUTBOX_TTL_MS : undefined)
     if (verdict !== 'ok') return verdict
     if (w.kind === 'roster') return this.applyRoster(author, w, now)
     const c = this.store.getCommunity(w.community)
@@ -331,15 +347,21 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
     return { v: 1, community, kind, id, ts, body, sig: await signBytes(this.key, canon(GROUP_DOMAIN, [this.self, community, kind, id, String(ts)], body)) }
   }
 
+  private async send (member: string, w: Wire): Promise<void> {
+    const s = await this.node.dialProtocol(peerIdFromString(member), GROUP_PROTOCOL, { runOnLimitedConnection: true, signal: AbortSignal.timeout(8000) })
+    s.send(Buffer.from(JSON.stringify(w)))
+    await s.close()
+  }
+
   private async broadcast (members: string[], w: Wire): Promise<Delivery> {
     const targets = members.filter((m) => m !== this.self)
-    const data = Buffer.from(JSON.stringify(w))
-    const res = await Promise.allSettled(targets.map(async (m) => {
-      const s = await this.node.dialProtocol(peerIdFromString(m), GROUP_PROTOCOL, { runOnLimitedConnection: true, signal: AbortSignal.timeout(8000) })
-      s.send(data)
-      await s.close()
-    }))
-    return { delivered: res.filter((r) => r.status === 'fulfilled').length, failed: targets.filter((_, i) => res[i].status === 'rejected') }
+    const res = await Promise.allSettled(targets.map((m) => this.send(m, w)))
+    const failed = targets.filter((_, i) => res[i].status === 'rejected')
+    let queued = 0
+    if (w.kind === 'msg' || w.kind === 'roster') {
+      for (const m of failed) if (this.outbox?.enqueue('group', w.id, m, w.ts, JSON.stringify(w))) queued++
+    }
+    return { delivered: res.filter((r) => r.status === 'fulfilled').length, failed, queued }
   }
 
   private joined (id: string): CommunityRow {

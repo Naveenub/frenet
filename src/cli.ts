@@ -34,6 +34,8 @@ const { values } = parseArgs({
     'relay-server': { type: 'boolean', default: false },
     announce: { type: 'string', multiple: true },
     'ice-server': { type: 'string', multiple: true },
+    'turn-username': { type: 'string' },
+    'turn-credential': { type: 'string' },
     'no-nat': { type: 'boolean', default: false },
     'no-quic': { type: 'boolean', default: false },
     'min-identity-bits': { type: 'string', default: '0' },
@@ -53,7 +55,7 @@ const { values } = parseArgs({
 })
 
 if (values.help) {
-  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--reannounce-hours N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--no-quic] [--min-identity-bits N] [--max-peers-per-subnet N] [--no-auto-ban] [--gateway-port N] [--no-gateway] [--proxy-port N] [--no-proxy] [--proxy-allow-private] [--proxy-upstream socks5://HOST:PORT] [--no-mdns] [--admin-peer PEERID]... [--profile default|mobile]
+  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--reannounce-hours N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]|turn:HOST[:PORT]]... [--turn-username U] [--turn-credential C (or FRENET_TURN_CREDENTIAL)] [--no-nat] [--no-quic] [--min-identity-bits N] [--max-peers-per-subnet N] [--no-auto-ban] [--gateway-port N] [--no-gateway] [--proxy-port N] [--no-proxy] [--proxy-allow-private] [--proxy-upstream socks5://HOST:PORT] [--no-mdns] [--admin-peer PEERID]... [--profile default|mobile]
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777
   HTTPS browsing: a local HTTPS-only proxy with tracker blocking (default port 7779; PAC file at http://127.0.0.1:7779/proxy.pac). --proxy-allow-private also lets it tunnel to LAN/loopback addresses (off by default). --proxy-upstream socks5://127.0.0.1:9050 sends all web traffic through a SOCKS5 proxy such as Tor (names are resolved there, not here).
   --reannounce-hours N: announce every stored block on the DHT again at start-up and every N hours (default 12, 0 = never).
@@ -91,6 +93,8 @@ const node = await startFrenet({
   relayServer: values['relay-server'],
   announce: values.announce,
   iceServers: values['ice-server'],
+  turnUsername: values['turn-username'],
+  turnCredential: values['turn-credential'] ?? process.env.FRENET_TURN_CREDENTIAL,
   quotaBytes: Number(quotaMb) * 1024 * 1024,
   replicaTtlMs: Number(values['replica-ttl-days']) * 86_400_000,
   reannounceMs: Number(reannounceH) * 3_600_000

@@ -3,6 +3,7 @@ import { EventEmitter } from 'node:events'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PeerId, PrivateKey } from '@libp2p/interface'
 import type { Store } from './store.js'
+import { OUTBOX_TTL_MS, type Outbox } from './outbox.js'
 
 export const MSG_PROTOCOL = '/frenet/msg/1.0.0'
 export const MAX_BODY_BYTES = 16 * 1024
@@ -10,7 +11,7 @@ const MAX_FRAME_BYTES = 32 * 1024
 const MAX_SKEW_MS = 5 * 60 * 1000
 const SEEN_CAP = 10_000
 
-interface Wire { v: 2, id: string, ts: number, to: string, body: string, sig: string }
+interface Wire { v: 2, id: string, ts: number, to: string, body: string, sig: string, q?: 1 }
 
 const SIG_DOMAIN = 'frenet-msg/v2'
 const ID_RE = /^[A-Za-z0-9-]{1,64}$/
@@ -56,8 +57,10 @@ export class RateLimiter {
 /** Replay protection: bounded set of recently seen (peer,id) pairs + timestamp window. */
 export class ReplayGuard {
   private seen = new Set<string>()
-  check (peer: string, id: string, ts: number, now = Date.now()): 'ok' | 'replay' | 'stale' {
-    if (Math.abs(now - ts) > MAX_SKEW_MS) return 'stale'
+  /** `maxAgeMs` is longer than the skew window only for store-and-forward deliveries; a future timestamp never gets extra room. */
+  check (peer: string, id: string, ts: number, now = Date.now(), maxAgeMs = MAX_SKEW_MS): 'ok' | 'replay' | 'stale' {
+    const age = now - ts
+    if (age > maxAgeMs || -age > MAX_SKEW_MS) return 'stale'
     const k = `${peer}:${id}`
     if (this.seen.has(k)) return 'replay'
     this.seen.add(k)
@@ -66,6 +69,7 @@ export class ReplayGuard {
   }
 }
 
+export interface SendResult { id: string, ts: number, queued: boolean }
 export interface InboundMessage { id: string, peer: string, ts: number, body: string, sig: string }
 
 /**
@@ -78,7 +82,11 @@ export class Messaging extends EventEmitter<{ message: [InboundMessage], dropped
   private limiter = new RateLimiter()
   private replay = new ReplayGuard()
 
-  constructor (private node: Libp2p, private store: Store, private key: PrivateKey) { super() }
+  constructor (private node: Libp2p, private store: Store, private key: PrivateKey, private outbox?: Outbox) {
+    super()
+    // A retry carries the original signed message plus `q: 1`, which only widens the age limit on the receiving side.
+    outbox?.register('msg', async (peer, payload) => { await this.deliver(peerIdFromString(peer), { ...JSON.parse(payload), q: 1 } as Wire) })
+  }
 
   async start (): Promise<void> {
     await this.node.handle(MSG_PROTOCOL, async (stream, connection) => {
@@ -98,7 +106,9 @@ export class Messaging extends EventEmitter<{ message: [InboundMessage], dropped
         const self = this.node.peerId.toString()
         if (w.to !== self) { this.drop(peer, 'wrong-recipient'); return }
         if (!(await verifyMessage({ sender: peer, recipient: self, id: w.id, ts: w.ts, body: w.body, sig: w.sig }))) { this.drop(peer, 'bad-signature'); return }
-        const verdict = this.replay.check(peer, w.id, w.ts)
+        const queued = w.q === 1
+        if (queued && this.store.hasMessage(w.id, 'in')) return   // a retry of something we already have: nothing to do
+        const verdict = this.replay.check(peer, w.id, w.ts, Date.now(), queued ? OUTBOX_TTL_MS : undefined)
         if (verdict !== 'ok') { this.drop(peer, verdict); return }
         if (this.store.add({ id: w.id, peer, direction: 'in', ts: w.ts, body: w.body, sender: peer, recipient: self, sig: w.sig })) {
           this.emit('message', { id: w.id, peer, ts: w.ts, body: w.body, sig: w.sig })
@@ -111,7 +121,14 @@ export class Messaging extends EventEmitter<{ message: [InboundMessage], dropped
 
   async stop (): Promise<void> { await this.node.unhandle(MSG_PROTOCOL) }
 
-  async send (to: PeerId, body: string): Promise<{ id: string, ts: number }> {
+  private async deliver (to: PeerId, w: Wire): Promise<void> {
+    const stream = await this.node.dialProtocol(to, MSG_PROTOCOL, { runOnLimitedConnection: true, signal: AbortSignal.timeout(8000) })
+    stream.send(Buffer.from(JSON.stringify(w)))
+    await stream.close()
+  }
+
+  /** Sends now; if the peer cannot be reached the signed message is kept in the outbox and retried (`queued: true`). */
+  async send (to: PeerId, body: string): Promise<SendResult> {
     if (Buffer.byteLength(body) > MAX_BODY_BYTES) throw new Error(`message exceeds ${MAX_BODY_BYTES} bytes`)
     if (body.length === 0) throw new Error('empty message')
     const self = this.node.peerId.toString()
@@ -119,11 +136,16 @@ export class Messaging extends EventEmitter<{ message: [InboundMessage], dropped
     const ts = Date.now()
     const sig = await signMessage(this.key, self, to.toString(), id, ts, body)
     const w: Wire = { v: 2, id, ts, to: to.toString(), body, sig }
-    const stream = await this.node.dialProtocol(to, MSG_PROTOCOL, { runOnLimitedConnection: true })
-    stream.send(Buffer.from(JSON.stringify(w)))
-    await stream.close()
+    let queued = false
+    try {
+      await this.deliver(to, w)
+    } catch (err) {
+      if (!this.outbox) throw err
+      if (!this.outbox.enqueue('msg', w.id, to.toString(), w.ts, JSON.stringify(w))) throw new Error(`peer unreachable and the outbox is full (${(err as Error).message})`)
+      queued = true
+    }
     this.store.add({ id: w.id, peer: to.toString(), direction: 'out', ts: w.ts, body, sender: self, recipient: to.toString(), sig })
-    return { id: w.id, ts: w.ts }
+    return { id: w.id, ts: w.ts, queued }
   }
 
   private drop (peer: string, reason: string): void { this.emit('dropped', { peer, reason }) }
@@ -135,6 +157,6 @@ function parse (buf: Buffer): Wire | null {
     if (o?.v !== 2 || typeof o.id !== 'string' || typeof o.ts !== 'number' || typeof o.body !== 'string' || typeof o.to !== 'string' || typeof o.sig !== 'string') return null
     if (!ID_RE.test(o.id) || o.to.length > 128 || o.sig.length > 128 || o.body.length === 0 || Buffer.byteLength(o.body) > MAX_BODY_BYTES) return null
     if (!Number.isFinite(o.ts)) return null
-    return { v: 2, id: o.id, ts: o.ts, to: o.to, body: o.body, sig: o.sig }
+    return { v: 2, id: o.id, ts: o.ts, to: o.to, body: o.body, sig: o.sig, ...(o.q === 1 ? { q: 1 as const } : {}) }
   } catch { return null }
 }

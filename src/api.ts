@@ -199,7 +199,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/send') {
         const b = await body(req)
         const r = await n.messaging.send(peerIdFromString(String(b.peer)), String(b.body ?? ''))
-        push('message', { ...r, peer: b.peer, body: b.body, direction: 'out' })
+        push('message', { ...r, peer: b.peer, body: b.body, direction: 'out' })   // r.queued: kept in the outbox and retried, not delivered yet
         return json(res, 200, r)
       }
       if (req.method === 'POST' && url.pathname === '/api/call/signal') {
@@ -346,7 +346,7 @@ async function status (n: FrenetNode, gatewayPort?: number, proxy?: { port: numb
       relayServer: !!(l.services as any).relay,
       relayedAddresses: l.getMultiaddrs().map(String).filter((a) => a.includes('/p2p-circuit'))
     },
-    calls: { iceServers: n.iceServers },
+    calls: { iceServers: n.iceServers, turn: n.turn },
     uptimeMs: Date.now() - n.startedAt,
     dht: { protocol: '/frenet/kad/1.0.0', routingTableSize: dht?.routingTable?.size ?? 0 },
     messages: n.store.count(),
