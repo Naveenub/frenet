@@ -5,7 +5,8 @@ import type { PrivateKey } from '@libp2p/interface'
 import { base58btc } from 'multiformats/bases/base58'
 import { verifyCredential } from '../src/credentials.js'
 import { didFromPublicKeyRaw, toDid } from '../src/did.js'
-import { Handles, httpsJson, isNonPublicAddress, isWebDid, parseWebDidDocument, signHandleProof, webDidUrl, WebDids, type JsonFetcher } from '../src/webid.js'
+import { createInception, createRotation } from '../src/identity-log.js'
+import { HandleChanged, Handles, httpsJson, isNonPublicAddress, isWebDid, parseWebDidDocument, signHandleProof, webDidUrl, WebDids, type JsonFetcher } from '../src/webid.js'
 
 const multikey = (k: PrivateKey): string => base58btc.encode(Uint8Array.from([0xed, 0x01, ...k.publicKey.raw]))
 const docFor = (did: string, k: PrivateKey, extra: object = {}): object => ({
@@ -93,8 +94,8 @@ describe('handles (alice@example.com)', () => {
     const files = { [NAMES]: { v: 1, names: { alice: { did: aliceDid, proof }, bob: bobDid, mallory: { did: bobDid, proof }, carol: { did: aliceDid, proof: 'A'.repeat(86) } } } }
     const fetchJson = serve(files)
     const h = new Handles(new WebDids(fetchJson), { fetchJson })
-    assert.deepEqual(await h.resolve('alice@example.com'), { handle: 'alice@example.com', did: aliceDid, domain: 'example.com', proof: 'verified' })
-    assert.deepEqual(await h.resolve('@Alice@Example.com', { fresh: true }), { handle: 'alice@example.com', did: aliceDid, domain: 'example.com', proof: 'verified' })
+    assert.deepEqual(await h.resolve('alice@example.com'), { handle: 'alice@example.com', did: aliceDid, domain: 'example.com', proof: 'verified', pin: 'off' })
+    assert.deepEqual(await h.resolve('@Alice@Example.com', { fresh: true }), { handle: 'alice@example.com', did: aliceDid, domain: 'example.com', proof: 'verified', pin: 'off' })
     assert.equal((await h.resolve('bob@example.com')).proof, 'none')
     await assert.rejects(h.resolve('bob@example.com', { requireProof: true, fresh: true }), /no consent proof/)
     await assert.rejects(h.resolve('mallory@example.com'), /does not match/)                 // domain tried to hand alice's proof to bob's key
@@ -124,5 +125,55 @@ describe('handles (alice@example.com)', () => {
     const fetchJson = serve({ [NAMES]: { v: 1, names: { alice: { did, proof } } }, 'https://alice.example/.well-known/did.json': docFor(did, k) })
     const h = new Handles(new WebDids(fetchJson), { fetchJson })
     assert.equal((await h.resolve('alice@example.com')).proof, 'verified')
+  })
+})
+
+describe('handle pinning (trust on first use)', () => {
+  const NAMES = 'https://example.com/.well-known/frenet-names.json'
+  it('pins the first DID, refuses a silent change, and accepts it only with repin', async () => {
+    const a = await generateKeyPair('Ed25519'); const b = await generateKeyPair('Ed25519')
+    const da = didFromPublicKeyRaw(a.publicKey.raw); const db = didFromPublicKeyRaw(b.publicKey.raw)
+    const files: Record<string, unknown> = { [NAMES]: { v: 1, names: { alice: da } } }
+    const fetchJson: JsonFetcher = async (u) => files[u.toString()]
+    const pins = new Map<string, string>()
+    const h = new Handles(new WebDids(fetchJson), { fetchJson, pins: { get: (k) => pins.get(k) ?? null, set: (k, v) => { pins.set(k, v) } } })
+    assert.equal((await h.resolve('alice@example.com', { fresh: true })).pin, 'new')
+    assert.equal((await h.resolve('alice@example.com', { fresh: true })).pin, 'match')
+    files[NAMES] = { v: 1, names: { alice: db } }                                               // domain re-points the handle
+    await assert.rejects(h.resolve('alice@example.com', { fresh: true }), (e: unknown) => e instanceof HandleChanged && e.pinned === da && e.now === db)
+    assert.equal(pins.get('alice@example.com'), da)                                              // a failed check never moves the pin
+    assert.equal((await h.resolve('alice@example.com', { repin: true })).pin, 'repinned')
+    assert.equal(pins.get('alice@example.com'), db)
+  })
+})
+
+describe('handle proofs for did:frenet', () => {
+  const NAMES = 'https://example.com/.well-known/frenet-names.json'
+  it('verifies against the current key epoch and dies on rotation until re-signed', async () => {
+    const k0 = await generateKeyPair('Ed25519'); const k1 = await generateKeyPair('Ed25519'); const k2 = await generateKeyPair('Ed25519'); const k3 = await generateKeyPair('Ed25519')
+    const s0 = await createInception(k0, k1.publicKey)
+    const proof0 = await signHandleProof(k0, 'alice@example.com', s0.did)
+    let state = s0
+    const files: Record<string, unknown> = { [NAMES]: { v: 1, names: { alice: { did: s0.did, proof: proof0, kseq: 0 } } } }
+    const fetchJson: JsonFetcher = async (u) => files[u.toString()]
+    const h = new Handles(new WebDids(fetchJson), { fetchJson, resolveLog: async (id) => (id === state.id ? state : null) })
+    assert.equal((await h.resolve('alice@example.com', { fresh: true })).proof, 'verified')
+    files[NAMES] = { v: 1, names: { alice: { did: s0.did, proof: proof0, kseq: 1 } } }          // wrong epoch claimed
+    await assert.rejects(h.resolve('alice@example.com', { fresh: true }), /superseded|again|does not match/)
+    files[NAMES] = { v: 1, names: { alice: { did: s0.did, proof: proof0 } } }                   // epoch missing
+    await assert.rejects(h.resolve('alice@example.com', { fresh: true }), /key epoch/)
+    state = await createRotation(s0, k1, k2.publicKey)                                          // rotate: the old proof (and old key) no longer vouch
+    files[NAMES] = { v: 1, names: { alice: { did: s0.did, proof: proof0, kseq: 0 } } }
+    await assert.rejects(h.resolve('alice@example.com', { fresh: true }), /superseded/)
+    const proof1 = await signHandleProof(k1, 'alice@example.com', s0.did)
+    files[NAMES] = { v: 1, names: { alice: { did: s0.did, proof: proof1, kseq: 1 } } }
+    assert.equal((await h.resolve('alice@example.com', { fresh: true })).proof, 'verified')
+    const stolen = await signHandleProof(k0, 'alice@example.com', s0.did)                       // old key re-signing at the new epoch
+    files[NAMES] = { v: 1, names: { alice: { did: s0.did, proof: stolen, kseq: 1 } } }
+    await assert.rejects(h.resolve('alice@example.com', { fresh: true }), /does not match/)
+    void k3
+    const noLog = new Handles(new WebDids(fetchJson), { fetchJson })
+    files[NAMES] = { v: 1, names: { alice: { did: s0.did, proof: proof1, kseq: 1 } } }
+    await assert.rejects(noLog.resolve('alice@example.com'), /no key log resolver/)
   })
 })

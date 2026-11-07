@@ -5,7 +5,9 @@ import { publicKeyFromRaw } from '@libp2p/crypto/keys'
 import type { PrivateKey, PublicKey } from '@libp2p/interface'
 import { base58btc } from 'multiformats/bases/base58'
 import { base64url } from 'multiformats/bases/base64'
-import { parseDidKey } from './did.js'
+import { frenetId, isFrenetDid, parseDidKey } from './did.js'
+import type { IdentityState } from './identity-log.js'
+import { base32 } from 'multiformats/bases/base32'
 
 /**
  * `did:web` (Ed25519 only) and domain-anchored handles (`alice@example.com`).
@@ -156,7 +158,15 @@ export class WebDids {
 }
 
 // ---------------------------------------------------------------------------------------------------------------
-export interface HandleResolution { handle: string, did: string, domain: string, proof: 'verified' | 'none' }
+export interface HandleResolution { handle: string, did: string, domain: string, proof: 'verified' | 'none', pin: 'new' | 'match' | 'repinned' | 'off' }
+
+/** The domain now answers with a different DID than the one this node pinned for the handle. */
+export class HandleChanged extends Error {
+  constructor (readonly handle: string, readonly pinned: string, readonly now: string) { super(`handle ${handle} now points at a different DID than the one pinned (${pinned} -> ${now}); verify out of band, then resolve again with repin`); this.name = 'HandleChanged' }
+}
+
+/** Local trust-on-first-use memory: the first DID a handle resolved to. */
+export interface HandlePins { get: (handle: string) => string | null, set: (handle: string, did: string) => void }
 
 export const validHandle = (h: unknown): h is string => typeof h === 'string' && h.length <= 253 && HANDLE_RE.test(h)
 export const normalizeHandle = (h: string): string => h.trim().replace(/^@/, '').toLowerCase()
@@ -173,8 +183,22 @@ export class Handles {
   private cache = new Map<string, { r: HandleResolution, at: number }>()
   constructor (
     private web: WebDids,
-    private opts: { fetchJson?: JsonFetcher, keyForDid?: (did: string) => Promise<PublicKey | null> } = {}
+    private opts: { fetchJson?: JsonFetcher, keyForDid?: (did: string) => Promise<PublicKey | null>, pins?: HandlePins, resolveLog?: (id: string) => Promise<IdentityState | null> } = {}
   ) {}
+
+  /**
+   * A did:frenet proof is bound to the key epoch (`kseq`) that signed it and is valid only while that epoch is the
+   * identity's *current* key: after a rotation the old proof dies and the holder re-signs, so a stolen old key
+   * cannot keep vouching for a handle.
+   */
+  private async frenetProofKey (did: string, kseq: unknown): Promise<PublicKey> {
+    if (!this.opts.resolveLog) throw new Error('cannot check a did:frenet proof here (no key log resolver)')
+    if (!Number.isSafeInteger(kseq) || (kseq as number) < 0) throw new Error('did:frenet proof needs the key epoch (kseq)')
+    const st = await this.opts.resolveLog(frenetId(did))
+    if (!st) throw new Error('unknown did:frenet identity (no key log available)')
+    if (kseq !== st.seq) throw new Error('proof was made by a superseded key (or one not yet seen); the holder must sign it again')
+    return publicKeyFromRaw(base32.baseDecode(st.events[st.seq]!.key))
+  }
 
   private async proofKey (did: string): Promise<PublicKey | null> {
     if (this.opts.keyForDid) { const k = await this.opts.keyForDid(did); if (k) return k }
@@ -186,13 +210,13 @@ export class Handles {
    * `alice@example.com` -> DID. With `requireProof` the entry must carry a valid consent proof; a proof that is present
    * but wrong is always an error, so a domain cannot mislabel someone's key.
    */
-  async resolve (input: string, opts: { requireProof?: boolean, fresh?: boolean } = {}): Promise<HandleResolution> {
+  async resolve (input: string, opts: { requireProof?: boolean, fresh?: boolean, repin?: boolean } = {}): Promise<HandleResolution> {
     const handle = normalizeHandle(String(input))
     const m = HANDLE_RE.exec(handle)
     if (!m) throw new Error('invalid handle (local@domain, lowercase letters/digits/._-)')
     const [, local, domain] = m as unknown as [string, string, string]
     const hit = this.cache.get(handle)
-    if (hit && !opts.fresh && Date.now() - hit.at < CACHE_MS && (!opts.requireProof || hit.r.proof === 'verified')) return hit.r
+    if (hit && !opts.fresh && !opts.repin && Date.now() - hit.at < CACHE_MS && (!opts.requireProof || hit.r.proof === 'verified')) return hit.r
     const url = new URL(`https://${domain}/.well-known/frenet-names.json`)
     const doc = await (this.opts.fetchJson ?? httpsJson)(url) as any
     if (typeof doc !== 'object' || doc === null || doc.v !== 1 || typeof doc.names !== 'object' || doc.names === null || Array.isArray(doc.names)) throw new Error('domain has no valid frenet-names.json')
@@ -204,13 +228,23 @@ export class Handles {
     let status: 'verified' | 'none' = 'none'
     if (proof !== undefined) {
       if (typeof proof !== 'string' || !/^[A-Za-z0-9_-]{86}$/.test(proof)) throw new Error('malformed handle proof')
-      const key = did.startsWith('did:key:') ? parseDidKey(did).publicKey : await this.proofKey(did)
+      const key = did.startsWith('did:key:') ? parseDidKey(did).publicKey : isFrenetDid(did) ? await this.frenetProofKey(did, typeof e === 'object' ? e.kseq : undefined) : await this.proofKey(did)
       if (!key) throw new Error('cannot check the proof for this DID here (no key available)')
       if (!(await key.verify(proofBytes(handle, did), Buffer.from(proof, 'base64url')))) throw new Error('handle proof does not match the DID')
       status = 'verified'
     }
     if (opts.requireProof && status !== 'verified') throw new Error('handle entry carries no consent proof')
-    const r: HandleResolution = { handle, did, domain, proof: status }
+    // Trust on first use: a domain can re-point a handle at any time, so remember the first DID and refuse silent changes.
+    let pin: HandleResolution['pin'] = 'off'
+    const pins = this.opts.pins
+    if (pins) {
+      const known = pins.get(handle)
+      if (known === null) { pins.set(handle, did); pin = 'new' }
+      else if (known === did) pin = 'match'
+      else if (opts.repin) { pins.set(handle, did); pin = 'repinned' }
+      else throw new HandleChanged(handle, known, did)
+    }
+    const r: HandleResolution = { handle, did, domain, proof: status, pin }
     if (this.cache.size > 256) this.cache.clear()
     this.cache.set(handle, { r, at: Date.now() })
     return r

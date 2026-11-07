@@ -80,6 +80,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (issuer, id));
       CREATE TABLE IF NOT EXISTS identity_logs (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, events TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS zk_tags (scope TEXT NOT NULL, tag TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (scope, tag));
+      CREATE TABLE IF NOT EXISTS handle_pins (handle TEXT PRIMARY KEY, did TEXT NOT NULL, ts INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS file_links (cid TEXT PRIMARY KEY, link TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL CHECK (kind IN ('cid','name','publisher')), target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, target, parent));
       CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
@@ -284,6 +285,13 @@ export class Store {
     }
     return fresh
   }
+  getHandlePin (handle: string): string | null {
+    const r = this.db.prepare('SELECT did FROM handle_pins WHERE handle = ?').get(handle) as { did: string } | undefined
+    return r ? r.did : null
+  }
+  setHandlePin (handle: string, did: string): void { this.db.prepare('INSERT INTO handle_pins (handle, did, ts) VALUES (?, ?, ?) ON CONFLICT(handle) DO UPDATE SET did = excluded.did, ts = excluded.ts').run(handle, did, Date.now()) }
+  listHandlePins (): Array<{ handle: string, did: string, ts: number }> { return this.db.prepare('SELECT handle, did, ts FROM handle_pins ORDER BY handle').all() as Array<{ handle: string, did: string, ts: number }> }
+  deleteHandlePin (handle: string): boolean { return Number(this.db.prepare('DELETE FROM handle_pins WHERE handle = ?').run(handle).changes) > 0 }
   isRevoked (issuer: string, id: string): boolean { return !!this.db.prepare('SELECT 1 FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) }
   /** The stored statement (a JWT) for a revocation, or null. */
   getRevocation (issuer: string, id: string): string | null {

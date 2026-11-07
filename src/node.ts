@@ -91,7 +91,7 @@ export interface FrenetNode {
   web: WebDids
   handles: Handles
   /** Consent proof (did:key signature) for a handle; the private key itself is never exposed. */
-  handleProof: (handle: string) => Promise<string>
+  handleProof: (handle: string) => Promise<{ did: string, proof: string, entry: Record<string, unknown> }>
   /** Anonymous membership proofs (linkable ring proofs) and single-use verifier challenges. */
   zk: ZkAuth
   identityLogs: IdentityLogs
@@ -218,7 +218,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const identityLogs = new IdentityLogs(libp2p, store)
   const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
   const web = new WebDids()
-  const handles = new Handles(web)
+  const handles = new Handles(web, { pins: { get: (h) => store.getHandlePin(h), set: (h, d) => store.setHandlePin(h, d) }, resolveLog: (id) => identityLogs.resolve(id, { network: true }) })
   const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations, web })
   const zk = new ZkAuth(store, privateKey, { resolveFrenet: frenetKeyResolver((id) => identityLogs.resolve(id, { network: false })) })
   // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
@@ -277,7 +277,12 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     credentials,
     web,
     handles,
-    handleProof: (handle) => signHandleProof(privateKey, handle, credentials.keyDid),
+    handleProof: async (handle) => {
+      // Signed under the primary DID: did:frenet (with the current key epoch) when the identity is rotatable, else did:key.
+      const did = credentials.did
+      const proof = await signHandleProof(privateKey, handle, did)
+      return { did, proof, entry: { [handle.split('@')[0]!]: { did, proof, ...(identity ? { kseq: identity.seq } : {}) } } }
+    },
     zk,
     identityLogs,
     revocations,

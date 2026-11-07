@@ -9,7 +9,7 @@ import { ContentBlocked, DAY_MS } from './blocks.js'
 import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
-import { isWebDid, validHandle, normalizeHandle } from './webid.js'
+import { HandleChanged, isWebDid, validHandle, normalizeHandle } from './webid.js'
 import { REPORT_CATEGORIES } from './moderation.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
@@ -159,15 +159,21 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         return json(res, 200, resolveDid(q.startsWith('did:') ? q : toDid(q)).document)
       }
       if (req.method === 'GET' && url.pathname === '/api/handle/resolve') {
-        // alice@example.com -> DID, via https://example.com/.well-known/frenet-names.json (see src/webid.ts)
-        return json(res, 200, await n.handles.resolve(String(url.searchParams.get('handle') ?? ''), { fresh: true, requireProof: url.searchParams.get('requireProof') === '1' }))
+        // alice@example.com -> DID, via https://example.com/.well-known/frenet-names.json (see src/webid.ts).
+        // 409 when the domain now answers with a different DID than the pinned one; repin=1 accepts the new one.
+        try {
+          return json(res, 200, await n.handles.resolve(String(url.searchParams.get('handle') ?? ''), { fresh: true, requireProof: url.searchParams.get('requireProof') === '1', repin: url.searchParams.get('repin') === '1' }))
+        } catch (e) {
+          if (e instanceof HandleChanged) return json(res, 409, { error: e.message, handle: e.handle, pinned: e.pinned, now: e.now })
+          throw e
+        }
       }
+      if (req.method === 'GET' && url.pathname === '/api/handle/pins') return json(res, 200, { pins: n.store.listHandlePins() })
       if (req.method === 'POST' && url.pathname === '/api/handle/proof') {
         // Consent proof (signature by this node's did:key) for a handle you are about to publish at your own domain. The key never leaves the node.
         const handle = normalizeHandle(String((await body(req)).handle ?? ''))
         if (!validHandle(handle)) return json(res, 400, { error: 'invalid handle (local@domain)' })
-        const proof = await n.handleProof(handle)
-        return json(res, 200, { handle, did: n.keyDid, proof, entry: { [handle.split('@')[0]!]: { did: n.keyDid, proof } } })
+        return json(res, 200, { handle, ...(await n.handleProof(handle)) })
       }
       if (req.method === 'GET' && url.pathname === '/api/credentials') return json(res, 200, { did: n.did, credentials: n.credentials.list(), revocations: n.store.listRevocations().length })
       if (req.method === 'POST' && url.pathname === '/api/credentials/issue') {

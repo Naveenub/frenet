@@ -47,7 +47,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
 | Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
 | Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
-| Human-memorable global names: `alice@example.com` resolves through `https://example.com/.well-known/frenet-names.json` to a DID, optionally with a consent proof signed by that DID's key (`frenet identity handle-proof`, `GET /api/handle/resolve`) | working, tested with an injected fetcher (no live-network test); **uniqueness comes from DNS and the domain owner, not from FRENET**: it depends on DNS and TLS certificates and a domain can reassign a name unless you require the consent proof |
+| Human-memorable global names: `alice@example.com` resolves through `https://example.com/.well-known/frenet-names.json` to a DID, optionally with a consent proof signed by that DID's key (`frenet identity handle-proof`, `GET /api/handle/resolve`) | working, tested with an injected fetcher (no live-network test); **uniqueness comes from DNS and the domain owner, not from FRENET**. Mitigations: this node pins the first DID a handle resolves to and refuses a later change (HTTP 409 / `HandleChanged`) until you resolve with `repin=1`; the consent proof works for `did:key`, `did:web` and `did:frenet` (bound to the current key epoch, dies on rotation until re-signed). Still depends on DNS and TLS, and a first resolution is trust-on-first-use |
 | `did:web` (Ed25519 keys only) next to `did:key` and `did:frenet`: resolved over HTTPS, usable as a VC-JWT issuer or subject | working, tested with an injected fetcher; depends on DNS and TLS; no live-network test; fetches refuse non-public addresses, redirects, ports and bodies over 64 KB |
 | Global names with no DNS and no registry (a decentralized Namecoin/ENS equivalent) | **not built**: needs a consensus layer or a trusted registry; `<n>.<key>` names stay the registry-free option |
 
@@ -132,7 +132,8 @@ Limits: local only (nothing is sent anywhere, no shared or gossiped blocklists, 
 ```bash
 frenet identity                              # peer ID + DID (did:key:z6Mk...)
 frenet identity handle-proof alice@example.com   # entry to publish at https://example.com/.well-known/frenet-names.json
-curl 'http://127.0.0.1:PORT/api/handle/resolve?handle=alice@example.com&requireProof=1'   # -> {handle, did, domain, proof}
+curl 'http://127.0.0.1:PORT/api/handle/resolve?handle=alice@example.com&requireProof=1'   # add &repin=1 to accept a changed DID; GET /api/handle/pins lists pins
+#   # -> {handle, did, domain, proof}
 frenet backup --out ~/frenet.backup          # passphrase-encrypted key backup (node stopped)
 frenet recovery split -k 3 -n 5              # 5 shares, any 3 recover the key
 frenet restore ~/frenet.backup               # or: frenet recovery restore SHARE SHARE SHARE

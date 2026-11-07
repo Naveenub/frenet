@@ -19,7 +19,7 @@ export const IDENTITY_COMMANDS = ['identity', 'backup', 'restore', 'recovery']
 const USAGE = `frenet identity [--data DIR]                         show peer ID and DID(s)
 frenet identity rotation-init --next-out FILE [--passphrase-file F]   make the identity rotatable (did:frenet); writes the offline NEXT-key backup
 frenet identity rotate --next-key FILE --next-out FILE2 [--log F] [--passphrase-file F] [--next-passphrase-file F]   rotate to the next key (also the recovery path for a lost/stolen key)
-frenet identity handle-proof alice@example.com [--data DIR]   print the entry to put in https://example.com/.well-known/frenet-names.json (signed by your did:key)
+frenet identity handle-proof alice@example.com [--data DIR]   print the entry to put in https://example.com/.well-known/frenet-names.json (did:frenet if rotatable, else did:key; re-run after every rotation)
 frenet identity log [--data DIR]                                  print the public key log (keep a copy with your next-key backup)
 frenet backup --out FILE [--data DIR] [--passphrase-file F]       write a passphrase-encrypted backup of the key only
 frenet backup --full --out FILE [--blocks] [--data DIR]           key + messages, files, file links, names, communities, credentials (+ own blocks with --blocks)
@@ -112,9 +112,11 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
         const handle = normalizeHandle(positionals[1] ?? '')
         if (!validHandle(handle)) throw new Error('usage: frenet identity handle-proof local@domain')
         const { key } = await loadOrCreateIdentity(data)
-        const did = didFromPublicKeyRaw(key.publicKey.raw)
+        const log = readIdentityLog(data)
+        const st = log ? await verifyLog(log) : null
+        const did = st ? st.did : didFromPublicKeyRaw(key.publicKey.raw)   // did:frenet (with key epoch) when the identity is rotatable
         const proof = await signHandleProof(key, handle, did)
-        console.log(JSON.stringify({ v: 1, names: { [handle.split('@')[0]!]: { did, proof } } }, null, 2))
+        console.log(JSON.stringify({ v: 1, names: { [handle.split('@')[0]!]: { did, proof, ...(st ? { kseq: st.seq } : {}) } } }, null, 2))
         console.log(`\nServe this (merge into an existing file) at https://${handle.split('@')[1]}/.well-known/frenet-names.json`, '\n')
         return 0
       }
