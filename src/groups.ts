@@ -4,16 +4,22 @@ import { OUTBOX_TTL_MS, type Outbox } from './outbox.js'
 import { peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
 import { canon, ID_RE, isPeerId, MAX_SKEW_MS, readFrame, signBytes, verifyBytes } from './channel.js'
+import { MAX_ENVELOPE_BYTES, open as openEnvelope, parseEnvelope, seal, sealedTextBytes, tagOf } from './groupcrypto.js'
 import { RateLimiter, ReplayGuard } from './messaging.js'
 import type { CommunityRow, GroupEventRow, Store } from './store.js'
 
 export const GROUP_PROTOCOL = '/frenet/group/1.0.0'
 export const GROUP_DOMAIN = 'frenet-group/v1'
+export const GROUP_SYNC_PROTOCOL = '/frenet/group-sync/1.0.0'
 export const MAX_MEMBERS = 100
 export const MAX_TEXT_BYTES = 4096
 const MAX_BODY_BYTES = 16 * 1024
 const MAX_ENACT_BYTES = 256 * 1024 // an enactment carries its evidence: up to one ballot and one delegation per member
 const MAX_GROUP_FRAME = 320 * 1024
+const SYNC_MAX_EVENTS = 200
+const SYNC_MAX_REQUEST = 64 * 1024
+const SYNC_MAX_FRAME = 4 * 1024 * 1024
+const SYNC_MIN_GAP_MS = 5 * 60_000
 export const MIN_DISCUSSION_MS = 60_000
 export const MAX_DISCUSSION_MS = 14 * 86_400_000
 const MAX_COMMENT_BYTES = 2048
@@ -115,6 +121,9 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
   /** Injectable clock (tests move it; production uses wall time). */
   clock: () => number = Date.now
   private timer: NodeJS.Timeout | null = null
+  private syncLimiter = new RateLimiter(10, 0.2)
+  private lastSync = new Map<string, number>()
+  private onConnect = (evt: CustomEvent<{ toString(): string }>): void => { void this.syncWith(evt.detail.toString()).catch(() => {}) }
 
   constructor (private node: Libp2p, private store: Store, private key: PrivateKey, private outbox?: Outbox) {
     super()
@@ -146,6 +155,30 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
         this.drop(peer, `error: ${(err as Error).message}`)
       }
     }, { maxInboundStreams: 64, maxOutboundStreams: 64, runOnLimitedConnection: true })
+    await this.node.handle(GROUP_SYNC_PROTOCOL, async (stream, connection) => {
+      const peer = connection.remotePeer.toString()
+      try {
+        if (!this.syncLimiter.allow(peer)) { this.drop(peer, 'sync-rate-limited'); stream.abort(new Error('rate limited')); return }
+        const buf = await readFrame(stream, SYNC_MAX_REQUEST)
+        if (!buf) { this.drop(peer, 'oversize'); return }
+        const req = json(buf.toString('utf8'))
+        const c = typeof req?.community === 'string' && COMMUNITY_RE.test(req.community) ? this.store.getCommunity(req.community) : null
+        if (!c || c.state !== 'joined' || !c.members.includes(peer)) { this.drop(peer, 'sync-not-a-member'); stream.abort(new Error('not a member')); return }
+        const have = new Set<string>((Array.isArray(req.have) ? req.have : []).filter((x: unknown): x is string => typeof x === 'string' && ID_RE.test(x)).slice(0, 500))
+        // Only chat addressed to the requester (it carries a key wrapped for them) and not older than the outbox lifetime.
+        const tag = tagOf(peer)
+        const cutoff = this.clock() - OUTBOX_TTL_MS
+        const events = this.store.listGroupEvents(c.id, 'msg', SYNC_MAX_EVENTS * 5)
+          .filter((e) => e.ts >= cutoff && !have.has(e.id) && !!parseEnvelope(e.body)?.k[tag])
+          .slice(-SYNC_MAX_EVENTS)
+          .map((e) => ({ author: e.author, id: e.id, ts: e.ts, body: e.body, sig: e.sig }))
+        stream.send(Buffer.from(JSON.stringify({ v: 1, events })))
+        await stream.close()
+      } catch (err) {
+        this.drop(peer, `error: ${(err as Error).message}`)
+      }
+    }, { maxInboundStreams: 8, maxOutboundStreams: 8, runOnLimitedConnection: true })
+    this.node.addEventListener('peer:connect', this.onConnect as EventListener)
     // Enforcement is not optional goodwill: the proposer's node enacts its own passed binding proposals; anyone else can too.
     this.timer = setInterval(() => { void this.sweep().catch(() => {}) }, 30_000)
     this.timer.unref()
@@ -154,6 +187,8 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
   async stop (): Promise<void> {
     if (this.timer) clearInterval(this.timer)
     this.timer = null
+    this.node.removeEventListener('peer:connect', this.onConnect as EventListener)
+    await this.node.unhandle(GROUP_SYNC_PROTOCOL)
     await this.node.unhandle(GROUP_PROTOCOL)
   }
 
@@ -251,7 +286,14 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
     let meta: string | null = null
     let enact: { p: GroupEventRow, action: Action } | null = null
     if (w.kind === 'msg') {
-      if (!w.body || Buffer.byteLength(w.body) > MAX_TEXT_BYTES) return 'malformed'
+      const env = parseEnvelope(w.body)
+      if (env) {
+        // Encrypted chat: it must carry a key for us and really open (a sender cannot park junk under a valid signature).
+        const n = sealedTextBytes(env)
+        if (n < 1 || n > MAX_TEXT_BYTES) return 'malformed'
+        if (!env.k[tagOf(this.self)]) return 'not-addressed'
+        if (openEnvelope(env, c.id, author, this.self, this.key) === null) return 'undecryptable'
+      } else if (!w.body || Buffer.byteLength(w.body) > MAX_TEXT_BYTES) return 'malformed' // plaintext from a node that predates encryption
     } else if (w.kind === 'proposal') {
       const b = json(w.body)
       if (!cleanLine(b?.title, 80) || typeof b?.text !== 'string' || b.text.length > 2000 || !Number.isSafeInteger(b?.closes)) return 'malformed'
@@ -414,7 +456,11 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
   }
 
   async post (id: string, text: unknown): Promise<{ id: string } & Delivery> {
-    return this.emitOwn(this.joined(id), 'msg', typeof text === 'string' ? text : '')
+    const c = this.joined(id)
+    const t = typeof text === 'string' ? text : ''
+    if (!t || Buffer.byteLength(t) > MAX_TEXT_BYTES) throw new Error('invalid msg')
+    // Sealed for the members named in this node's current roster; each of them can open it, nobody else can.
+    return this.emitOwn(c, 'msg', seal(t, c.id, this.self, c.members))
   }
 
   /**
@@ -497,8 +543,56 @@ export class Groups extends EventEmitter<{ event: [GroupEvent], community: [stri
     return done
   }
 
-  messages (id: string, limit = 200): Array<{ id: string, author: string, ts: number, text: string, own: boolean }> {
-    return this.store.listGroupEvents(id, 'msg', limit).map((e) => ({ id: e.id, author: e.author, ts: e.ts, text: e.body, own: e.author === this.self }))
+  /** Chat, decrypted for this node. `encrypted: false` marks plaintext from a node that predates encryption. */
+  messages (id: string, limit = 200): Array<{ id: string, author: string, ts: number, text: string, own: boolean, encrypted: boolean }> {
+    type Msg = { id: string, author: string, ts: number, text: string, own: boolean, encrypted: boolean }
+    return this.store.listGroupEvents(id, 'msg', limit).flatMap((e): Msg[] => {
+      const env = parseEnvelope(e.body)
+      if (!env) return [{ id: e.id, author: e.author, ts: e.ts, text: e.body, own: e.author === this.self, encrypted: false }]
+      const text = openEnvelope(env, id, e.author, this.self, this.key)
+      return text === null ? [] : [{ id: e.id, author: e.author, ts: e.ts, text, own: e.author === this.self, encrypted: true }]
+    })
+  }
+
+  /**
+   * History sync. Asks other members for chat that was addressed to us and that we do not hold (we were offline, and
+   * so was its sender). Events are relayed with the author's original signature, which is checked as for a direct
+   * delivery; only chat sealed to us is ever served, so a member added later gets nothing from before they joined.
+   * Chat only: governance events stay on their strict clock window. Returns how many new messages arrived.
+   */
+  async sync (id: string, peers?: string[]): Promise<{ received: number, asked: number }> {
+    const c = this.joined(id)
+    const targets = (peers ?? c.members).filter((m) => m !== this.self && c.members.includes(m))
+    const have = this.store.listGroupEvents(id, 'msg', 500).map((e) => e.id)
+    const fresh = new Set<string>()   // several members may serve the same message; count it once
+    const results = await Promise.allSettled(targets.map(async (m) => {
+      const s = await this.node.dialProtocol(peerIdFromString(m), GROUP_SYNC_PROTOCOL, { runOnLimitedConnection: true, signal: AbortSignal.timeout(8000) })
+      s.send(Buffer.from(JSON.stringify({ v: 1, community: id, have })))
+      await s.close()
+      const buf = await readFrame(s, SYNC_MAX_FRAME)
+      const events = json(buf?.toString('utf8') ?? '')?.events
+      if (!Array.isArray(events)) return
+      for (const ev of events.slice(0, SYNC_MAX_EVENTS)) {
+        if (!isPeerId(ev?.author) || ev.author === this.self || typeof ev.id !== 'string' || !ID_RE.test(ev.id) || !Number.isFinite(ev.ts) ||
+            typeof ev.body !== 'string' || Buffer.byteLength(ev.body) > MAX_ENVELOPE_BYTES || typeof ev.sig !== 'string' || ev.sig.length > 128) continue
+        const had = !!this.store.getGroupEvent(id, ev.id)
+        if (await this.accept(ev.author, { v: 1, community: id, kind: 'msg', id: ev.id, ts: ev.ts, body: ev.body, sig: ev.sig, q: 1 }) === null && !had) fresh.add(ev.id)
+      }
+    }))
+    void results
+    return { received: fresh.size, asked: targets.length }
+  }
+
+  /** On a new connection, catch up with that peer for every community we both belong to (at most every few minutes per peer and community). */
+  private async syncWith (peer: string): Promise<void> {
+    const now = this.clock()
+    for (const c of this.store.listCommunities()) {
+      if (c.state !== 'joined' || !c.members.includes(peer) || peer === this.self) continue
+      const k = `${c.id}:${peer}`
+      if (now - (this.lastSync.get(k) ?? 0) < SYNC_MIN_GAP_MS) continue
+      this.lastSync.set(k, now)
+      await this.sync(c.id, [peer]).catch(() => {})
+    }
   }
 
   comments (id: string, proposal: string): Array<{ id: string, author: string, ts: number, text: string, own: boolean }> {
@@ -555,7 +649,7 @@ function parse (buf: Buffer): Wire | null {
     if (o?.v !== 1 || typeof o.community !== 'string' || typeof o.kind !== 'string' || typeof o.id !== 'string' || typeof o.ts !== 'number' ||
         typeof o.body !== 'string' || typeof o.sig !== 'string') return null
     if (!COMMUNITY_RE.test(o.community) || !(KINDS as readonly string[]).includes(o.kind) || !ID_RE.test(o.id)) return null
-    if (!Number.isFinite(o.ts) || o.sig.length > 128 || Buffer.byteLength(o.body) > (o.kind === 'enact' ? MAX_ENACT_BYTES : MAX_BODY_BYTES)) return null
+    if (!Number.isFinite(o.ts) || o.sig.length > 128 || Buffer.byteLength(o.body) > (o.kind === 'enact' ? MAX_ENACT_BYTES : o.kind === 'msg' ? MAX_ENVELOPE_BYTES : MAX_BODY_BYTES)) return null
     return o as Wire
   } catch { return null }
 }

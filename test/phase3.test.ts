@@ -7,6 +7,7 @@ import { startApi } from '../src/api.js'
 import { CALL_PROTOCOL, MAX_SIGNAL_BYTES } from '../src/calls.js'
 import { canon, MAX_SKEW_MS, signBytes } from '../src/channel.js'
 import { GROUP_DOMAIN, MIN_DISCUSSION_MS, tally, type Wire } from '../src/groups.js'
+import { ReplayGuard } from '../src/messaging.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
 import { Operator } from '../src/operator.js'
 
@@ -84,6 +85,55 @@ describe('communities and group chat', () => {
     assert.equal(a.groups.messages(cid)[0].author, id(b))
     assert.equal(b.groups.messages(cid)[0].own, true)
     await assert.rejects(d.groups.post(cid, 'outsider'), /not a member/)
+  })
+
+  it('seals group chat end to end and syncs history to a member who was offline', async () => {
+    const a = await track(); const b = await track(); const c = await track()
+    await link(a, b); await link(a, c); await link(b, c)
+    const cid = (await a.groups.create('secret', [id(b), id(c)])).community.id
+    await waitFor(() => b.store.getCommunity(cid)?.state === 'invited' && c.store.getCommunity(cid)?.state === 'invited')
+    b.groups.join(cid); c.groups.join(cid)
+    await b.groups.post(cid, 'top secret plan')
+    await waitFor(() => a.groups.messages(cid).length === 1 && c.groups.messages(cid).length === 1)
+    for (const n of [a, b, c]) {
+      const m = n.groups.messages(cid)[0]
+      assert.equal(m.text, 'top secret plan'); assert.equal(m.encrypted, true)
+      const stored = n.store.listGroupEvents(cid, 'msg')[0]
+      assert.ok(!stored.body.includes('top secret plan'), 'stored body is ciphertext')
+    }
+    // A node outside the roster, and the roster's own keys, cannot open it: tampering with the recipient list fails.
+    const d = await track()
+    const env = JSON.parse(a.store.listGroupEvents(cid, 'msg')[0].body)
+    assert.equal(Object.keys(env.k).length, 3)
+    assert.equal(d.groups.messages(cid).length, 0)
+
+    // History sync: c misses a message (sender b cannot reach c and c is not reachable by a either), then syncs from a.
+    const missed = await b.groups.post(cid, 'while you were away')
+    await waitFor(() => a.groups.messages(cid).length === 2 && c.groups.messages(cid).length === 2)
+    // Simulate a restart that lost the message: drop the stored row and the in-memory replay memory.
+    ;(c.store as any).db.prepare('DELETE FROM group_events WHERE community = ? AND id = ?').run(cid, missed.id)
+    ;(c.groups as any).replay = new ReplayGuard()
+    assert.equal(c.groups.messages(cid).length, 1)
+    const r = await c.groups.sync(cid)
+    assert.equal(r.received, 1)
+    assert.deepEqual(c.groups.messages(cid).map((m) => m.text), ['top secret plan', 'while you were away'])
+    assert.equal((await c.groups.sync(cid)).received, 0)
+  })
+
+  it('does not serve history to non-members or messages not addressed to the requester', async () => {
+    const a = await track(); const b = await track(); const late = await track()
+    await link(a, b); await link(a, late)
+    const cid = (await a.groups.create('club', [id(b)])).community.id
+    await waitFor(() => b.store.getCommunity(cid)?.state === 'invited')
+    b.groups.join(cid)
+    await a.groups.post(cid, 'before late joined')
+    await waitFor(() => b.groups.messages(cid).length === 1)
+    await a.groups.setMembers(cid, [id(b), id(late)])
+    await waitFor(() => late.store.getCommunity(cid)?.state === 'invited')
+    late.groups.join(cid)
+    const r = await late.groups.sync(cid)
+    assert.equal(r.received, 0)
+    assert.equal(late.groups.messages(cid).length, 0)
   })
 
   it('enforces roster, membership, replay and freshness rules on inbound events', async () => {

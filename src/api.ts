@@ -256,6 +256,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/communities/join') { n.groups.join(String((await body(req)).id)); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/communities/leave') { n.groups.leave(String((await body(req)).id)); return json(res, 200, { ok: true }) }
       if (req.method === 'GET' && url.pathname === '/api/communities/messages') return json(res, 200, n.groups.messages(String(url.searchParams.get('id') ?? '')))
+      if (req.method === 'POST' && url.pathname === '/api/communities/sync') { const b = await body(req); return json(res, 200, await n.groups.sync(String(b.id))) }
       if (req.method === 'POST' && url.pathname === '/api/communities/post') { const b = await body(req); return json(res, 200, await n.groups.post(String(b.id), b.text)) }
       if (req.method === 'GET' && url.pathname === '/api/communities/proposals') return json(res, 200, n.groups.proposals(String(url.searchParams.get('id') ?? '')))
       if (req.method === 'POST' && url.pathname === '/api/communities/propose') {

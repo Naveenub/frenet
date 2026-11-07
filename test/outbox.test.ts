@@ -107,7 +107,7 @@ describe('store-and-forward (sender-side outbox)', () => {
     c = await track({ dataDir: dir })
     await a.libp2p.dial(c.libp2p.getMultiaddrs()[0])
     await waitFor(() => c.store.listGroupEvents(made.community.id, 'msg').length === 1)
-    assert.equal(c.store.listGroupEvents(made.community.id, 'msg')[0].body, 'see you later')
+    assert.equal(c.groups.messages(made.community.id)[0].text, 'see you later')   // stored sealed, opened on read
     await waitFor(() => a.outbox.pending(cid) === 0)
   })
 

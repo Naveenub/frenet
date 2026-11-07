@@ -412,7 +412,7 @@ async function communities (v) {
   const picks = state.peers.map((p) => ({ p: p.peer, box: el('input', { type: 'checkbox', style: 'flex:none' }) }))
   const extra = el('input', { placeholder: 'other peer IDs, comma separated (optional)', 'aria-label': 'Other members' })
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Create a community'),
-    el('p', { className: 'dim' }, 'You become its owner and are the only one who can change who is a member. Everyone you add must accept before they receive anything. Up to 100 members. Messages are signed and sent over encrypted peer links, but there is no group-wide end-to-end encryption.'),
+    el('p', { className: 'dim' }, 'You become its owner and are the only one who can change who is a member. Everyone you add must accept before they receive anything. Up to 100 members. Messages are signed and end-to-end encrypted to the members at the time they are sent. There is no forward secrecy: a stolen identity key opens every message sent to it.'),
     el('div', { className: 'row' }, name),
     ...picks.map(({ p, box }) => el('label', { className: 'row mono' }, box, p)), el('div', { className: 'row' }, extra),
     el('div', { className: 'row' }, btn('Create', async () => {
