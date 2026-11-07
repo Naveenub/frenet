@@ -6,7 +6,11 @@ import { peerIdFromString } from '@libp2p/peer-id'
 import { startFrenet } from '../../src/node.js'
 
 const out = (o: object): void => { process.stdout.write(`${JSON.stringify(o)}\n`) }
-const node = await startFrenet({ dataDir: ':memory:', ...JSON.parse(process.argv[2] ?? '{}') })
+const { fillers = 0, ...opts } = JSON.parse(process.argv[2] ?? '{}') as { fillers?: number } & Record<string, unknown>
+// `fillers`: extra bare nodes in this process, one per address 24.0.<i>.10 (see lab.sh), to give another peer something to connect to
+const fillerNodes = await Promise.all(Array.from({ length: fillers }, (_, i) =>
+  startFrenet({ dataDir: ':memory:', mdns: false, nat: false, listen: [`/ip4/24.0.${i + 1}.10/tcp/4002`], announce: [`/ip4/24.0.${i + 1}.10/tcp/4002`] })))
+const node = await startFrenet({ dataDir: ':memory:', ...opts })
 const lp = node.libp2p
 
 const state = () => ({
@@ -17,7 +21,7 @@ const state = () => ({
 })
 
 node.messaging.on('message', (m) => out({ ev: 'message', peer: m.peer, body: m.body }))
-out({ ev: 'ready', ...state() })
+out({ ev: 'ready', ...state(), fillerAddrs: fillerNodes.map((f) => f.libp2p.getMultiaddrs().map(String).find((a) => a.startsWith('/ip4/24.')) ?? '') })
 
 createInterface({ input: process.stdin }).on('line', (line) => {
   void (async () => {
@@ -26,7 +30,7 @@ createInterface({ input: process.stdin }).on('line', (line) => {
       if (c.cmd === 'state') out({ ev: 'reply', id: c.id, ...state() })
       else if (c.cmd === 'dial') { const conn = await lp.dial(multiaddr(c.addr!)); out({ ev: 'reply', id: c.id, addr: conn.remoteAddr.toString(), limited: conn.limits != null }) }
       else if (c.cmd === 'send') { await node.messaging.send(peerIdFromString(c.peer!), c.body!); out({ ev: 'reply', id: c.id }) }
-      else if (c.cmd === 'stop') { await node.stop(); out({ ev: 'reply', id: c.id }); process.exit(0) }
+      else if (c.cmd === 'stop') { await node.stop(); await Promise.all(fillerNodes.map((f) => f.stop())); out({ ev: 'reply', id: c.id }); process.exit(0) }
       else throw new Error(`unknown cmd ${c.cmd}`)
     } catch (e) { out({ ev: 'reply', id: c.id, error: (e as Error).message }) }
   })()

@@ -14,7 +14,7 @@ const skip = enabled ? false : 'set FRENET_NATLAB=1 and run as root (Linux names
 const have = (bin: string): boolean => { try { execFileSync('which', [bin], { stdio: 'ignore' }); return true } catch { return false } }
 
 interface Conn { peer: string, addr: string, dir: string, limited: boolean }
-interface State { peer: string, addrs: string[], conns: Conn[] }
+interface State { peer: string, addrs: string[], conns: Conn[], fillerAddrs?: string[] }
 
 class Peer {
   private proc: ChildProcessWithoutNullStreams
@@ -240,6 +240,38 @@ describe('NAT lab', { skip }, () => {
         await b.send(a.id, 'through the UPnP mapping')
         await a.until(() => a.messages.length === 1, 10_000, 'the message')
         assert.equal(a.messages[0]!.body, 'through the UPnP mapping')
+      } finally { await stopAll(); lab('upnp', 'frnatA', 'stop') }
+    })
+  })
+
+  describe('mobile profile with a busy connection table', { skip: have('miniupnpd') && have('nft') ? false : 'miniupnpd and nft are not installed' }, () => {
+    // AutoNAT v2 skips a verification when open connections are at 80% of the limit or more (20 of the mobile profile's 24),
+    // because a dial-back needs a free slot. FRENET raises that to 95% for the mobile profile, so a phone holding 20 peers
+    // still gets the address its router mapped confirmed.
+    it('still gets its UPnP mapping confirmed while it already holds 20 of its 24 connections', async () => {
+      lab('upnp', 'frnatA', 'start')
+      const pubs = [['frrelay', '20.20.20.10'], ['frP1', '21.21.21.10'], ['frP2', '22.22.22.10'], ['frP3', '23.23.23.10']]
+        .map(([ns, ip]) => start(ns!, { listen: TCP, announce: [`/ip4/${ip}/tcp/4001`] }))
+      const crowd = start('frP1', { fillers: 20, listen: ['/ip4/127.0.0.1/tcp/0'], nat: false })
+      const boot = (await Promise.all(pubs.map((p) => p.ready))).map((s) => s.addrs.find((x) => !x.startsWith('/ip4/127.'))!)
+      const fill = (await crowd.ready).fillerAddrs!
+      assert.equal(fill.filter((a) => a.includes('/p2p/')).length, 20, `fillers must advertise their address: ${fill.join(' ')}`)
+      const phone = start('frA', { profile: 'mobile', listen: ['/ip4/0.0.0.0/tcp/4001'] })
+      const router = (): string => execFileSync('ip', ['netns', 'exec', 'frnatA', 'nft', 'list', 'ruleset'], { encoding: 'utf8' })
+      try {
+        await phone.ready
+        const t = Date.now()
+        while (!/dnat ip to 192\.168\.1\.10:4001/.test(router())) {
+          if (Date.now() - t > 40_000) assert.fail(`the router never got a forwarding rule for 4001:\n${router()}`)
+          await new Promise((r) => setTimeout(r, 500))
+        }
+        for (const addr of fill) await phone.dial(addr)
+        assert.ok((await phone.state()).conns.length >= 20, 'the phone is already holding 20 connections')
+        for (const addr of boot) await phone.dial(addr)
+        const mapped = `/ip4/${PUBLIC}.2/tcp/4001`
+        // Advertised only once AutoNAT v2 has confirmed it. (The phone then holds 24 of 24 connections, so it takes no more
+        // inbound ones; reachability through a UPnP mapping is covered by the UPnP test above.)
+        await phone.until((x) => x.addrs.some((m) => m.startsWith(mapped)), 40_000, `the confirmed UPnP address ${mapped}`)
       } finally { await stopAll(); lab('upnp', 'frnatA', 'stop') }
     })
   })

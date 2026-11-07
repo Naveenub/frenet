@@ -185,7 +185,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   if (useNat) {
     // v2, not v1: the v1 server answers a QUIC client's check by "dialing" the connection it already has, then closes it
     // (@libp2p/autonat 3.0.32), which drops the client's relay reservation. v2 dials back on a fresh connection.
-    services.autonat = autoNATv2()
+    // The mobile profile holds at most 24 connections and AutoNAT v2 skips verification at 80% (20 of 24), so a phone with 20 peers
+    // never got an address confirmed. 96% allows it up to 23 of 24 and still leaves the one free slot a dial-back needs.
+    services.autonat = autoNATv2(profile === 'mobile' ? { connectionThreshold: 96 } : {})
     services.dcutr = dcutr()
     services.upnp = uPnPNAT()
   }

@@ -64,6 +64,8 @@ up() {
   # the NATed hosts reach the internet only through their router; frrelay needs no route (same /24)
   # three more public peers in other /8s: AutoNAT v2 only confirms an address after 4 dial-backs from 4 different first octets
   local i=1; for o in 21 22 23; do mk "frP$i"; attach frpub "frP$i" "$o.$o.$o.10/4"; i=$((i+1)); done
+  # 22 more addresses on frP1, each in its own /24 (the node limits peers per /24), for tests that need a busy node
+  for i in $(seq 1 22); do ns frP1 ip addr add "24.0.$i.10/4" dev eth0; done
   mk frL1; mk frL2
   attach frlan frL1 10.201.0.1/24; attach frlan frL2 10.201.0.2/24
   for n in frL1 frL2; do ns "$n" ip route add 224.0.0.0/4 dev eth0; done
