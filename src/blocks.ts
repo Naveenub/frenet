@@ -52,7 +52,10 @@ export function verify (cid: CID, data: Uint8Array): boolean {
 /**
  * Content-addressed blocks: stored locally, announced as DHT provider records,
  * fetched from providers and verified against the CID (hash) before use.
- * Raw blocks are readable by anyone with the CID. Use FileStore for encrypted files.
+ * At this layer a block is bytes-as-stored: the block protocol serves it to anyone who asks for
+ * its CID, so confidentiality comes from encryption done before `put`. The HTTP API seals blocks
+ * with a fresh AES-256-GCM key by default (`public: true` opts out); FileStore does the same
+ * for files (256 KB chunks, encrypted manifest, up to 1 GiB, streamed).
  *
  * Retention: own blocks are kept until deleted (or until their ttl, if given);
  * replicas fetched from peers expire after `replicaTtlMs`; a byte quota bounds local storage.
