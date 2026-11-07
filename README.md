@@ -30,6 +30,9 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
+| Web browsing: local HTTPS-only CONNECT proxy (`127.0.0.1:7779`, PAC file), host-based tracker blocking with your own allow/block rules, no browsing log | working, tested against a local TCP target; **not tested against real HTTPS sites or in real browsers**; blocks by host only (TLS is never decrypted) |
+| Site permissions: per-origin grants for camera, microphone, location, fullscreen, clipboard-write, screen capture; all off by default, listed and revocable in the dashboard | working, tested (the gateway's `Permissions-Policy` changes for that origin only); the browser's own prompt still applies |
+| Secure downloads: files that are not on the render allow-list (and any file with `?download=1`) are sandboxed attachments with a validated filename and `X-Frenet-File` id | working, tested |
 | Decentralized sites: publish a static folder (<= 64 files, 32 MB), content-addressed, served by a local gateway on an isolated per-site origin (`<site-id>.localhost`) with a no-third-party CSP; dashboard Browser view | working, tested (publish on A, serve via B over the DHT) |
 | Voice/video: WebRTC calls from the dashboard, signed signalling over `/frenet/call/1.0.0` (ephemeral, rate limited, accept/decline) | signalling tested on two real nodes; dashboard call flow tested only with a stubbed WebRTC stack, so **real camera/microphone media across browsers and NATs is untested** |
 | Communities + group chat: owner-managed signed rosters, invitations need explicit join, signed messages fanned out to members (`/frenet/group/1.0.0`) | working, tested (3 nodes); no history sync, no store-and-forward |
@@ -47,17 +50,14 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
 | Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
 | Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
-| Human-memorable global names: `alice@example.com` resolves through `https://example.com/.well-known/frenet-names.json` to a DID, optionally with a consent proof signed by that DID's key (`frenet identity handle-proof`, `GET /api/handle/resolve`) | working, tested with an injected fetcher (no live-network test); **uniqueness comes from DNS and the domain owner, not from FRENET**. Mitigations: this node pins the first DID a handle resolves to and refuses a later change (HTTP 409 / `HandleChanged`) until you resolve with `repin=1`; the consent proof works for `did:key`, `did:web` and `did:frenet` (bound to the current key epoch, dies on rotation until re-signed). Still depends on DNS and TLS, and a first resolution is trust-on-first-use |
-| `did:web` (Ed25519 keys only) next to `did:key` and `did:frenet`: resolved over HTTPS, usable as a VC-JWT issuer or subject | working, tested with an injected fetcher; depends on DNS and TLS; no live-network test; fetches refuse non-public addresses, redirects, ports and bodies over 64 KB |
-| Global names with no DNS and no registry (a decentralized Namecoin/ENS equivalent) | **not built**: needs a consensus layer or a trusted registry; `<n>.<key>` names stay the registry-free option |
+| Human-memorable global names, key rotation | **not built** |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
 ## Scope: deliberately not built
 
-These are **not in the spec's feature list**, so their absence is not a gap or a to-do:
+This is **not in the spec's feature list**, so its absence is not a gap or a to-do:
 
-- **General web browsing.** The Decentralized Browser section is only the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`). It does not browse the public web, so there is no HTTPS browsing, no tracker blocking and no permission manager. (Published sites are already locked down by a no-third-party CSP and a deny-all `Permissions-Policy`; that is site hardening, not a browser feature.)
 - **Encrypted group messaging.** Community chat is signed by its author and travels over the Noise-encrypted link to each member, but there is no group key and no end-to-end encryption beyond that link. Stored events stay signed and plaintext on each member's device.
 
 ## Run
@@ -83,6 +83,24 @@ Sites are **public**: no encryption, anyone with the ID can read them. The ID is
 Open `http://<site-id>.localhost:7778/` (the gateway fetches from peers and verifies hashes). Sites can only load their own files (no third-party requests, no framing)
 and each has its own browser origin. `--gateway-port N` / `--no-gateway`. Limits: static files only.
 
+### Web browsing, tracker blocking and permissions
+
+The dashboard's **Decentralized Browser** view has the setup. The node runs a local proxy (`--proxy-port N`, default 7779, `--no-proxy` to turn it off):
+
+```bash
+# Proxy auto-config: normal https:// sites go through the proxy, *.localhost (FRENET sites) goes direct
+#   http://127.0.0.1:7779/proxy.pac
+# or set an HTTPS proxy of 127.0.0.1:7779 in your browser or OS
+```
+
+- **HTTPS only.** Plain `http://` requests get a 426. Only port 443 is tunnelled. TLS is passed through end to end: no certificate to install and nothing is decrypted, so the proxy cannot see, alter or log what you read.
+- **Tracker blocking** is by host name, before any DNS lookup, from a short built-in list plus your own block and "always allow" rules (a domain covers its subdomains). It cannot filter by URL or strip cookies because it cannot see inside TLS. The built-in list is hand-picked and small: it does not replace a maintained blocklist.
+- **No access to your own machine.** The proxy resolves the host itself, refuses if any answer is loopback, LAN, link-local or otherwise non-public, and connects to the address it checked. `--proxy-allow-private` turns this off for a deliberate LAN setup.
+- **No history.** Allowed destinations are never logged or stored; only counters exist, and the list of recently blocked hosts lives in memory.
+- Not an anonymity tool: the sites and your network see your IP, and your resolver sees the host names.
+
+**Site permissions.** Every FRENET site is denied camera, microphone, location, fullscreen, clipboard-write and screen capture. Grant one per site origin in the dashboard (or `POST /api/browser/permissions/grant {origin, feature}` with `site:<id>` or `name:<n>.<key>`); it only lets that site ask, and your browser still prompts.
+
 ### Names, updates and search
 
 A site ID is a hash, so an update used to mean a new ID. Give the site a **name** and it keeps one address:
@@ -95,12 +113,12 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 # -> name.link = frenet-name://my-blog.<your-publisher-key>, url = http://my-blog.<key>.localhost:7778/
 ```
 
-- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that the key is part of the address. For a memorable global name use a domain-anchored handle (`alice@example.com`, below).
+- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that names are not globally human-memorable: the key is part of the address.
 - **Updates:** publishing again under the same name signs a record with `seq + 1`; resolvers take the highest valid `seq`. The immutable `frenet-site://<id>` link of each version keeps working.
 - **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
-Limits: `<n>.<key>` names are not human-memorable (key is in the address; see handles for that); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
+Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
 
 ### Content safety (reports and blocking)
 
@@ -131,9 +149,6 @@ Limits: local only (nothing is sent anywhere, no shared or gossiped blocklists, 
 
 ```bash
 frenet identity                              # peer ID + DID (did:key:z6Mk...)
-frenet identity handle-proof alice@example.com   # entry to publish at https://example.com/.well-known/frenet-names.json
-curl 'http://127.0.0.1:PORT/api/handle/resolve?handle=alice@example.com&requireProof=1'   # add &repin=1 to accept a changed DID; GET /api/handle/pins lists pins
-#   # -> {handle, did, domain, proof}
 frenet backup --out ~/frenet.backup          # passphrase-encrypted key backup (node stopped)
 frenet recovery split -k 3 -n 5              # 5 shares, any 3 recover the key
 frenet restore ~/frenet.backup               # or: frenet recovery restore SHARE SHARE SHARE

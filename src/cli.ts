@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util'
 import { startApi } from './api.js'
 import { IDENTITY_COMMANDS, runIdentityCommand } from './cli-identity.js'
 import { startGateway } from './gateway.js'
+import { startWebProxy } from './webproxy.js'
 import { runUpdateCommand } from './cli-update.js'
 import { runZkCommand } from './cli-zk.js'
 import { startFrenet } from './node.js'
@@ -38,14 +39,18 @@ const { values } = parseArgs({
     'no-auto-ban': { type: 'boolean', default: false },
     'gateway-port': { type: 'string', default: '7778' },
     'no-gateway': { type: 'boolean', default: false },
+    'proxy-port': { type: 'string', default: '7779' },
+    'no-proxy': { type: 'boolean', default: false },
+    'proxy-allow-private': { type: 'boolean', default: false },
     'no-mdns': { type: 'boolean', default: false },
     help: { type: 'boolean', short: 'h', default: false }
   }
 })
 
 if (values.help) {
-  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--reannounce-hours N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--no-quic] [--min-identity-bits N] [--max-peers-per-subnet N] [--no-auto-ban] [--gateway-port N] [--no-gateway] [--no-mdns]
+  console.log(`frenet [--data DIR] [--listen MULTIADDR]... [--bootstrap MULTIADDR]... [--api-port N] [--quota-mb N] [--replica-ttl-days N] [--reannounce-hours N] [--relay MULTIADDR]... [--relay-server] [--announce MULTIADDR]... [--ice-server stun:HOST[:PORT]]... [--no-nat] [--no-quic] [--min-identity-bits N] [--max-peers-per-subnet N] [--no-auto-ban] [--gateway-port N] [--no-gateway] [--proxy-port N] [--no-proxy] [--proxy-allow-private] [--no-mdns]
   default data dir: ~/.frenet   default listen: /ip4/0.0.0.0/tcp/0   dashboard: http://127.0.0.1:7777
+  HTTPS browsing: a local HTTPS-only proxy with tracker blocking (default port 7779; PAC file at http://127.0.0.1:7779/proxy.pac). --proxy-allow-private also lets it tunnel to LAN/loopback addresses (off by default).
   --reannounce-hours N: announce every stored block on the DHT again at start-up and every N hours (default 12, 0 = never).
   QUIC is on by default (udp, /quic-v1) next to TCP. --min-identity-bits N refuses peers whose key lacks N bits of work (see: frenet identity mine --bits N).
   anonymous membership proofs (zero-knowledge): frenet zk challenge | ring | tag | prove | verify   (frenet zk --help)
@@ -73,13 +78,15 @@ const node = await startFrenet({
   reannounceMs: Number(values['reannounce-hours']) * 3_600_000
 })
 const gateway = values['no-gateway'] ? null : await startGateway(node, Number(values['gateway-port']))
-const api = await startApi(node, Number(values['api-port']), '127.0.0.1', gateway?.port)
+const proxy = values['no-proxy'] ? null : await startWebProxy(node.trackers, Number(values['proxy-port']), { allowPrivate: values['proxy-allow-private'] })
+const api = await startApi(node, Number(values['api-port']), '127.0.0.1', gateway?.port, proxy ?? undefined)
 
 console.log(`FRENET node ${node.libp2p.peerId.toString()}`)
 for (const a of node.libp2p.getMultiaddrs()) console.log(`  listening ${a.toString()}`)
 console.log(`dashboard http://127.0.0.1:${api.port}`)
 if (gateway) console.log(`site gateway http://<site-id>.localhost:${gateway.port}/`)
+if (proxy) console.log(`web proxy (HTTPS only, tracker blocking) 127.0.0.1:${proxy.port}  PAC http://127.0.0.1:${proxy.port}/proxy.pac`)
 
-const shutdown = async (): Promise<void> => { api.server.close(); gateway?.server.close(); await node.stop(); process.exit(0) }
+const shutdown = async (): Promise<void> => { api.server.close(); gateway?.server.close(); proxy?.server.close(); await node.stop(); process.exit(0) }
 process.on('SIGINT', shutdown)
 process.on('SIGTERM', shutdown)

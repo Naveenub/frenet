@@ -84,7 +84,7 @@ export class Sites {
   }
 
   /** Resolve a request path ("" or trailing "/" means directory index) to file bytes. null = no such path. */
-  async resolve (siteCid: string, reqPath: string): Promise<{ path: string, data: Buffer } | null> {
+  async resolve (siteCid: string, reqPath: string): Promise<{ path: string, data: Buffer, cid: string } | null> {
     const m = await this.manifest(siteCid)
     let p = reqPath.replace(/^\/+/, '')
     if (p === '') p = m.index
@@ -93,6 +93,6 @@ export class Sites {
     const fileCid = Object.hasOwn(m.files, p) ? m.files[p] : undefined
     if (!fileCid) return null
     const f = await this.files.get(fileCid, null)
-    return { path: p, data: f.data }
+    return { path: p, data: f.data, cid: fileCid }
   }
 }

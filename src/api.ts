@@ -9,8 +9,9 @@ import { ContentBlocked, DAY_MS } from './blocks.js'
 import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
-import { HandleChanged, isWebDid, validHandle, normalizeHandle } from './webid.js'
 import { REPORT_CATEGORIES } from './moderation.js'
+import { PERMISSION_FEATURES } from './permissions.js'
+import type { ProxyStats } from './webproxy.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
 
@@ -27,7 +28,7 @@ const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js
  * Local control API. Binds to loopback only, rejects foreign Host headers (DNS rebinding)
  * and cross-origin state-changing requests (CSRF).
  */
-export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number): Promise<{ server: Server, port: number }> {
+export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number, proxy?: { port: number, stats: () => ProxyStats }): Promise<{ server: Server, port: number }> {
   const clients = new Set<ServerResponse>()
   const push = (event: string, data: unknown): void => {
     const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -58,7 +59,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         if (streamUpload ? !ct.startsWith('application/octet-stream') : !ct.startsWith('application/json')) return json(res, 415, { error: streamUpload ? 'octet-stream only' : 'json only' })
       }
 
-      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort))
+      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort, proxy?.port))
       if (req.method === 'GET' && url.pathname === '/api/peers') return json(res, 200, await peers(n))
       if (req.method === 'GET' && url.pathname === '/api/messages') {
         return json(res, 200, n.store.list(url.searchParams.get('peer') ?? undefined))
@@ -155,25 +156,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'GET' && url.pathname === '/api/did/resolve') {
         // Accepts a DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network.
         const q = String(url.searchParams.get('did') ?? url.searchParams.get('peer') ?? '')
-        if (isWebDid(q.split('#')[0])) return json(res, 200, (await n.web.resolve(q.split('#')[0]!, { fresh: true })).document)   // did:web: fetched over HTTPS
         return json(res, 200, resolveDid(q.startsWith('did:') ? q : toDid(q)).document)
-      }
-      if (req.method === 'GET' && url.pathname === '/api/handle/resolve') {
-        // alice@example.com -> DID, via https://example.com/.well-known/frenet-names.json (see src/webid.ts).
-        // 409 when the domain now answers with a different DID than the pinned one; repin=1 accepts the new one.
-        try {
-          return json(res, 200, await n.handles.resolve(String(url.searchParams.get('handle') ?? ''), { fresh: true, requireProof: url.searchParams.get('requireProof') === '1', repin: url.searchParams.get('repin') === '1' }))
-        } catch (e) {
-          if (e instanceof HandleChanged) return json(res, 409, { error: e.message, handle: e.handle, pinned: e.pinned, now: e.now })
-          throw e
-        }
-      }
-      if (req.method === 'GET' && url.pathname === '/api/handle/pins') return json(res, 200, { pins: n.store.listHandlePins() })
-      if (req.method === 'POST' && url.pathname === '/api/handle/proof') {
-        // Consent proof (signature by this node's did:key) for a handle you are about to publish at your own domain. The key never leaves the node.
-        const handle = normalizeHandle(String((await body(req)).handle ?? ''))
-        if (!validHandle(handle)) return json(res, 400, { error: 'invalid handle (local@domain)' })
-        return json(res, 200, { handle, ...(await n.handleProof(handle)) })
       }
       if (req.method === 'GET' && url.pathname === '/api/credentials') return json(res, 200, { did: n.did, credentials: n.credentials.list(), revocations: n.store.listRevocations().length })
       if (req.method === 'POST' && url.pathname === '/api/credentials/issue') {
@@ -218,6 +201,14 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         await n.calls.send(peerIdFromString(String(b.peer)), String(b.call), String(b.kind), String(b.data ?? ''))
         return json(res, 200, { ok: true })
       }
+      // Browser: web proxy status, tracker rules and per-site permissions.
+      if (req.method === 'GET' && url.pathname === '/api/browser') return json(res, 200, browserState(n, proxy))
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers') { const b = await body(req); n.trackers.addRule(b.host, b.action === 'allow' ? 'allow' : 'block'); return json(res, 200, browserState(n, proxy)) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/remove') { const b = await body(req); return json(res, 200, { removed: n.trackers.removeRule(b.host) }) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/clear-recent') { n.trackers.clearRecent(); return json(res, 200, { ok: true }) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/grant') { const b = await body(req); n.permissions.grant(b.origin, b.feature); return json(res, 200, browserState(n, proxy)) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/revoke') { const b = await body(req); return json(res, 200, { removed: n.permissions.revoke(b.origin, b.feature) }) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/permissions/reset') { const b = await body(req); return json(res, 200, { removed: n.permissions.reset(b.origin) }) }
       if (req.method === 'GET' && url.pathname === '/api/operator') return json(res, 200, n.operator.snapshot())
       if (req.method === 'GET' && url.pathname === '/api/reputation') return json(res, 200, { threshold: n.reputation.opts.banThreshold, blocked: n.reputation.blockedCount(), peers: n.reputation.list(200), clusters: n.sybil.clusters() })
       if (req.method === 'POST' && url.pathname === '/api/reputation/reset') { const b = await body(req); if (!isPeerId(b.peer)) return json(res, 400, { error: 'invalid peer ID' }); return json(res, 200, { removed: n.reputation.reset(b.peer) }) }
@@ -310,7 +301,15 @@ async function body (req: IncomingMessage, max = 64 * 1024): Promise<Record<stri
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
 }
 
-async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
+function browserState (n: FrenetNode, proxy?: { port: number, stats: () => ProxyStats }): unknown {
+  return {
+    proxy: proxy ? { port: proxy.port, pacUrl: `http://127.0.0.1:${proxy.port}/proxy.pac`, httpsOnly: true, stats: proxy.stats() } : null,
+    trackers: n.trackers.snapshot(),
+    permissions: { features: PERMISSION_FEATURES, origins: n.permissions.list() }
+  }
+}
+
+async function status (n: FrenetNode, gatewayPort?: number, proxyPort?: number): Promise<unknown> {
   const l = n.libp2p
   const dht = (l.services as any).dht
   return {
@@ -319,6 +318,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
     gatewayPort: gatewayPort ?? null,
+    proxyPort: proxyPort ?? null,
     nat: {
       enabled: !!(l.services as any).autonat,
       relayServer: !!(l.services as any).relay,

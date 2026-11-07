@@ -171,7 +171,7 @@ describe('decentralized sites + gateway', () => {
       assert.equal((await get(gw.port, host, '/docs/')).body.toString(), '<p>docs</p>')
       const bin = await get(gw.port, host, '/blob.bin')
       assert.equal(bin.headers['content-type'], 'application/octet-stream')
-      assert.equal(bin.headers['content-disposition'], 'attachment')
+      assert.equal(bin.headers['content-disposition'], 'attachment; filename="blob.bin"')
       assert.equal((await get(gw.port, host, '/nope.html')).status, 404)
       assert.equal((await get(gw.port, host, '/../../etc/passwd')).status, 404)
       assert.equal((await get(gw.port, host, '/%2e%2e/%2e%2e/x')).status, 404)

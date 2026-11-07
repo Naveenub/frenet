@@ -238,7 +238,7 @@ function browser (v) {
     window.open(u, '_blank', 'noopener,noreferrer')
   } }, 'Open')
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Open a site'), el('div', { className: 'row' }, link, open), omsg,
-    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do). This is a gateway for FRENET sites only, not a web browser: no HTTPS browsing, tracker blocking or permission manager.')))
+    el('p', { className: 'dim' }, 'The node fetches the site from peers and verifies every block against its hash. A name link is resolved to the newest version signed by its publisher. Your browser must resolve *.localhost to this machine (Chrome, Firefox and Edge do).')))
 
   const q = el('input', { placeholder: 'search names by keyword, e.g. vegan recipes', 'aria-label': 'Search' }); const smsg = el('p', { className: 'dim' }); const sres = el('div')
   const doSearch = async () => {
@@ -259,6 +259,9 @@ function browser (v) {
   v.append(el('div', { className: 'card' }, el('h3', {}, 'Search'), el('div', { className: 'row' }, q, el('button', { className: 'btn', type: 'button', onclick: doSearch }, 'Search')), smsg,
     el('p', { className: 'dim' }, 'Matches names, titles and keywords that publishers announced on the network, checking each record’s signature. There is no central index and no ranking, so treat results as unvetted: anyone can publish under any keyword.'), sres))
 
+  webBrowsing(v)
+  sitePermissions(v)
+
   api('/api/names').then((r) => {
     const mine = r.names.filter((n) => n.own)
     if (!mine.length) return
@@ -266,6 +269,59 @@ function browser (v) {
     for (const n of mine) card.append(el('p', {}, el('a', { href: `http://${n.name}.${n.pub}.localhost:${gw}/`, target: '_blank', rel: 'noopener noreferrer' }, n.name), ` · version ${n.seq}`), el('div', { className: 'mono' }, n.link))
     v.append(card)
   }).catch(() => {})
+}
+
+/** HTTPS browsing through the local proxy: setup, tracker blocking, counters. */
+function webBrowsing (v) {
+  const card = el('div', { className: 'card' }, el('h3', {}, 'Web browsing (HTTPS) and tracker blocking'))
+  v.append(card)
+  const draw = (b) => {
+    card.replaceChildren(el('h3', {}, 'Web browsing (HTTPS) and tracker blocking'))
+    if (!b.proxy) { card.append(el('p', { className: 'dim' }, 'The web proxy is off. Restart the node without --no-proxy to browse HTTPS sites through it.')); return }
+    const st = b.proxy.stats
+    card.append(
+      el('p', { className: 'dim' }, 'Point your everyday browser at this node’s proxy to load normal https:// sites with tracker blocking. FRENET sites on *.localhost bypass it. The proxy only tunnels TLS: it never decrypts, re-signs or logs your traffic, refuses plain http://, and refuses to reach your own machine or LAN.'),
+      el('p', {}, 'Proxy auto-config URL: '), el('div', { className: 'mono' }, b.proxy.pacUrl),
+      el('p', { className: 'dim' }, `Or set an HTTPS proxy of 127.0.0.1 port ${b.proxy.port} by hand.`),
+      el('table', {}, el('tbody', {}, ...Object.entries({ 'Tunnels opened': st.tunnels, 'Open now': st.active, 'Trackers blocked': st.trackersBlocked, 'Plain-HTTP refused': st.refusedHttp, 'Local/LAN targets refused': st.refusedPrivate, 'Other ports refused': st.refusedPort }).map(([k, val]) => el('tr', {}, el('th', {}, k), el('td', {}, String(val)))))),
+      el('p', { className: 'dim' }, `Built-in list: ${b.trackers.builtinCount} well-known tracker and ad domains (short, hand-picked; it will miss many). Blocking is by host name only, because encrypted traffic cannot be inspected. It does not make you anonymous: sites and your network still see your IP address.`))
+    const host = el('input', { placeholder: 'domain, e.g. ads.example.com', 'aria-label': 'Domain' }); const msg = el('p', { className: 'err' })
+    const rule = (action) => async () => { msg.textContent = ''; try { draw(await api('/api/browser/trackers', { host: host.value, action })) } catch (e) { msg.textContent = e.message } }
+    card.append(el('div', { className: 'row' }, host, el('button', { className: 'btn', type: 'button', onclick: rule('block') }, 'Block'), el('button', { className: 'btn', type: 'button', onclick: rule('allow') }, 'Always allow')), msg,
+      el('p', { className: 'dim' }, 'A domain covers its subdomains. “Always allow” overrides the built-in list, for a site that breaks.'))
+    if (b.trackers.rules.length) {
+      const t = el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Your rules'), el('th', {}, ''), el('th', {}, ''))), el('tbody', {}, ...b.trackers.rules.map((r) => el('tr', {}, el('td', { className: 'mono' }, r.host), el('td', {}, r.action), el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/remove', { host: r.host }); draw(await api('/api/browser')) } }, 'Remove'))))))
+      card.append(t)
+    }
+    if (b.trackers.recent.length) {
+      card.append(el('p', { className: 'dim' }, 'Recently blocked (kept in memory only, never saved):'),
+        el('div', { className: 'mono' }, b.trackers.recent.map((r) => r.host).join('\n')),
+        el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/clear-recent', {}); draw(await api('/api/browser')) } }, 'Clear'))
+    }
+  }
+  api('/api/browser').then(draw).catch((e) => card.append(el('p', { className: 'err' }, e.message)))
+}
+
+/** Per-site permission manager: everything is off until you grant it, and every grant is listed here. */
+function sitePermissions (v) {
+  const card = el('div', { className: 'card' }, el('h3', {}, 'Site permissions'))
+  v.append(card)
+  const draw = (b) => {
+    card.replaceChildren(el('h3', {}, 'Site permissions'),
+      el('p', { className: 'dim' }, 'Every FRENET site starts with camera, microphone, location, fullscreen, clipboard and screen capture switched off. A grant here only lets that one site ask: your browser still shows its own prompt, and you can still say no. A name keeps its grants when its publisher updates the site, so grant only to names you trust.'))
+    const origins = b.permissions.origins
+    if (!origins.length) card.append(el('p', { className: 'dim' }, 'No site has any permission.'))
+    for (const o of origins) {
+      card.append(el('div', { className: 'mono' }, o.origin),
+        el('p', {}, ...o.grants.map((g) => el('button', { className: 'btn', type: 'button', title: `granted ${new Date(g.since).toLocaleString()}; click to revoke`, onclick: async () => { await api('/api/browser/permissions/revoke', { origin: o.origin, feature: g.feature }); draw(await api('/api/browser')) } }, `${g.feature} ✕`)),
+          el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/permissions/reset', { origin: o.origin }); draw(await api('/api/browser')) } }, 'Revoke all')))
+    }
+    const origin = el('input', { placeholder: 'site:<id> or name:<n>.<publisher-key>', 'aria-label': 'Site origin' })
+    const feature = el('select', { 'aria-label': 'Permission' }, ...b.permissions.features.map((f) => el('option', { value: f }, f)))
+    const msg = el('p', { className: 'err' })
+    card.append(el('div', { className: 'row' }, origin, feature, el('button', { className: 'btn', type: 'button', onclick: async () => { msg.textContent = ''; try { draw(await api('/api/browser/permissions/grant', { origin: origin.value.trim(), feature: feature.value })) } catch (e) { msg.textContent = e.message } } }, 'Grant')), msg)
+  }
+  api('/api/browser').then(draw).catch((e) => card.append(el('p', { className: 'err' }, e.message)))
 }
 
 function identity (v) {

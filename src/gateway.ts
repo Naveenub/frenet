@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { CID } from 'multiformats/cid'
 import { ContentBlocked } from './blocks.js'
 import { NameNotFound, NAME_RE, validPub } from './names.js'
+import { nameOrigin, siteOrigin } from './permissions.js'
 import type { FrenetNode } from './node.js'
 
 /** Only types we are willing to render. Anything else is downloaded, never interpreted. */
@@ -74,16 +75,22 @@ export function startGateway (n: FrenetNode, port: number, host = '127.0.0.1'): 
       const r = await n.sites.resolve(siteCid!, path)
       if (!r) return text(res, 404, 'no such file in this site')
       const type = MIME[r.path.slice(r.path.lastIndexOf('.') + 1).toLowerCase()]
+      const origin = named ? nameOrigin(named.name, named.pub) : siteOrigin(siteCid!)
+      // Secure downloads: anything not on the render allow-list, or anything asked for with ?download=1, is an attachment
+      // with a sandboxing CSP, so it is saved, never interpreted. The filename comes from the validated manifest path.
+      const asDownload = !type || new URL(req.url ?? '/', 'http://x').searchParams.get('download') === '1'
+      const filename = r.path.slice(r.path.lastIndexOf('/') + 1)
       res.writeHead(200, {
-        'content-type': type ?? 'application/octet-stream',
-        ...(type ? {} : { 'content-disposition': 'attachment' }),
+        'content-type': asDownload && !type ? 'application/octet-stream' : (type ?? 'application/octet-stream'),
+        ...(asDownload ? { 'content-disposition': `attachment; filename="${filename}"` } : {}),
         'content-length': r.data.length,
-        'content-security-policy': SITE_CSP,
+        'content-security-policy': asDownload ? 'sandbox; default-src \'none\'' : SITE_CSP,
         'x-content-type-options': 'nosniff',
         'x-frame-options': 'DENY',
         'referrer-policy': 'no-referrer',
         'cross-origin-resource-policy': 'same-origin',
-        'permissions-policy': 'camera=(), microphone=(), geolocation=(), interest-cohort=()',
+        'permissions-policy': n.permissions.policy(origin),
+        'x-frenet-file': r.cid,
         'cache-control': 'no-store'
       })
       res.end(req.method === 'HEAD' ? undefined : r.data)

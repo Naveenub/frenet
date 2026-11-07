@@ -22,12 +22,13 @@ import { Revocations } from './revocations.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
 import { Credentials, type RevocationCheck } from './credentials.js'
-import { Handles, signHandleProof, WebDids } from './webid.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
 import { Moderation } from './moderation.js'
 import { Names } from './names.js'
+import { SitePermissions } from './permissions.js'
+import { TrackerBlocker } from './trackers.js'
 import { Operator } from './operator.js'
 import { Reputation, type ReputationEvent, type ReputationOptions } from './reputation.js'
 import { Sites } from './sites.js'
@@ -84,14 +85,13 @@ export interface FrenetNode {
   groups: Groups
   operator: Operator
   moderation: Moderation
+  /** Per-origin permission grants for sites served by the gateway (default: everything off). */
+  permissions: SitePermissions
+  /** Host-based tracker blocking used by the web proxy. */
+  trackers: TrackerBlocker
   reputation: Reputation
   sybil: SybilGuard
   credentials: Credentials
-  /** did:web resolver and domain-anchored handles (`alice@example.com`); both fetch over HTTPS. */
-  web: WebDids
-  handles: Handles
-  /** Consent proof (did:key signature) for a handle; the private key itself is never exposed. */
-  handleProof: (handle: string) => Promise<{ did: string, proof: string, entry: Record<string, unknown> }>
   /** Anonymous membership proofs (linkable ring proofs) and single-use verifier challenges. */
   zk: ZkAuth
   identityLogs: IdentityLogs
@@ -217,9 +217,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
   const identityLogs = new IdentityLogs(libp2p, store)
   const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
-  const web = new WebDids()
-  const handles = new Handles(web, { pins: { get: (h) => store.getHandlePin(h), set: (h, d) => store.setHandlePin(h, d) }, resolveLog: (id) => identityLogs.resolve(id, { network: true }) })
-  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations, web })
+  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations })
   const zk = new ZkAuth(store, privateKey, { resolveFrenet: frenetKeyResolver((id) => identityLogs.resolve(id, { network: false })) })
   // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
   const report = (peer: string, ev: ReputationEvent, detail = ''): void => {
@@ -272,17 +270,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     groups,
     operator,
     moderation,
+    permissions: new SitePermissions(store),
+    trackers: new TrackerBlocker(store),
     reputation,
     sybil,
     credentials,
-    web,
-    handles,
-    handleProof: async (handle) => {
-      // Signed under the primary DID: did:frenet (with the current key epoch) when the identity is rotatable, else did:key.
-      const did = credentials.did
-      const proof = await signHandleProof(privateKey, handle, did)
-      return { did, proof, entry: { [handle.split('@')[0]!]: { did, proof, ...(identity ? { kseq: identity.seq } : {}) } } }
-    },
     zk,
     identityLogs,
     revocations,

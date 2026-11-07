@@ -80,12 +80,13 @@ export class Store {
       CREATE TABLE IF NOT EXISTS revocations (issuer TEXT NOT NULL, id TEXT NOT NULL, ts INTEGER NOT NULL, jwt TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (issuer, id));
       CREATE TABLE IF NOT EXISTS identity_logs (id TEXT PRIMARY KEY, seq INTEGER NOT NULL, events TEXT NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS zk_tags (scope TEXT NOT NULL, tag TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (scope, tag));
-      CREATE TABLE IF NOT EXISTS handle_pins (handle TEXT PRIMARY KEY, did TEXT NOT NULL, ts INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS file_links (cid TEXT PRIMARY KEY, link TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS content_blocks (kind TEXT NOT NULL CHECK (kind IN ('cid','name','publisher')), target TEXT NOT NULL, parent TEXT NOT NULL DEFAULT '', reason TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (kind, target, parent));
       CREATE INDEX IF NOT EXISTS content_blocks_parent ON content_blocks (parent);
       CREATE TABLE IF NOT EXISTS reports (id TEXT PRIMARY KEY, kind TEXT NOT NULL, target TEXT NOT NULL, category TEXT NOT NULL, note TEXT NOT NULL, ts INTEGER NOT NULL, reporter TEXT NOT NULL, sig TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open' CHECK (status IN ('open','blocked','dismissed')));
       CREATE INDEX IF NOT EXISTS reports_ts ON reports (ts);
+      CREATE TABLE IF NOT EXISTS site_permissions (origin TEXT NOT NULL, feature TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (origin, feature));
+      CREATE TABLE IF NOT EXISTS tracker_rules (host TEXT PRIMARY KEY, action TEXT NOT NULL CHECK (action IN ('block','allow')), ts INTEGER NOT NULL);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     try { this.db.exec('ALTER TABLE revocations ADD COLUMN own INTEGER NOT NULL DEFAULT 0') } catch { /* column already present */ }
@@ -234,6 +235,22 @@ export class Store {
     this.db.prepare("DELETE FROM reports WHERE id IN (SELECT id FROM reports WHERE status != 'open' ORDER BY ts ASC LIMIT ?)").run(n)
   }
 
+  /** Browser permission grants per site origin (see SitePermissions). Absence of a row means denied. */
+  grantPermission (origin: string, feature: string): void { this.db.prepare('INSERT OR IGNORE INTO site_permissions (origin, feature, ts) VALUES (?, ?, ?)').run(origin, feature, Date.now()) }
+  revokePermission (origin: string, feature: string): boolean { return Number(this.db.prepare('DELETE FROM site_permissions WHERE origin = ? AND feature = ?').run(origin, feature).changes) > 0 }
+  revokeAllPermissions (origin: string): number { return Number(this.db.prepare('DELETE FROM site_permissions WHERE origin = ?').run(origin).changes) }
+  listPermissions (origin?: string): Array<{ origin: string, feature: string, ts: number }> {
+    const rows = (origin ? this.db.prepare('SELECT * FROM site_permissions WHERE origin = ? ORDER BY feature').all(origin) : this.db.prepare('SELECT * FROM site_permissions ORDER BY origin, feature').all()) as any[]
+    return rows.map((r) => ({ origin: r.origin, feature: r.feature, ts: Number(r.ts) }))
+  }
+
+  /** The user's own tracker-blocking rules (see TrackerBlocker). */
+  setTrackerRule (host: string, action: 'block' | 'allow'): void { this.db.prepare('INSERT OR REPLACE INTO tracker_rules (host, action, ts) VALUES (?, ?, ?)').run(host, action, Date.now()) }
+  removeTrackerRule (host: string): boolean { return Number(this.db.prepare('DELETE FROM tracker_rules WHERE host = ?').run(host).changes) > 0 }
+  listTrackerRules (): Array<{ host: string, action: 'block' | 'allow', ts: number }> { return (this.db.prepare('SELECT * FROM tracker_rules ORDER BY host').all() as any[]).map((r) => ({ host: r.host, action: r.action, ts: Number(r.ts) })) }
+  countTrackerRules (): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM tracker_rules').get() as any).n) }
+  countPermissionOrigins (): number { return Number((this.db.prepare('SELECT COUNT(DISTINCT origin) AS n FROM site_permissions').get() as any).n) }
+
   addBan (peer: string, reason: string): void { this.db.prepare('INSERT OR REPLACE INTO bans (peer, reason, ts) VALUES (?, ?, ?)').run(peer, reason, Date.now()) }
   removeBan (peer: string): boolean { return Number(this.db.prepare('DELETE FROM bans WHERE peer = ?').run(peer).changes) > 0 }
   listBans (): Array<{ peer: string, reason: string, ts: number }> { return (this.db.prepare('SELECT * FROM bans ORDER BY ts DESC').all() as any[]).map((r) => ({ peer: r.peer, reason: r.reason, ts: Number(r.ts) })) }
@@ -285,13 +302,6 @@ export class Store {
     }
     return fresh
   }
-  getHandlePin (handle: string): string | null {
-    const r = this.db.prepare('SELECT did FROM handle_pins WHERE handle = ?').get(handle) as { did: string } | undefined
-    return r ? r.did : null
-  }
-  setHandlePin (handle: string, did: string): void { this.db.prepare('INSERT INTO handle_pins (handle, did, ts) VALUES (?, ?, ?) ON CONFLICT(handle) DO UPDATE SET did = excluded.did, ts = excluded.ts').run(handle, did, Date.now()) }
-  listHandlePins (): Array<{ handle: string, did: string, ts: number }> { return this.db.prepare('SELECT handle, did, ts FROM handle_pins ORDER BY handle').all() as Array<{ handle: string, did: string, ts: number }> }
-  deleteHandlePin (handle: string): boolean { return Number(this.db.prepare('DELETE FROM handle_pins WHERE handle = ?').run(handle).changes) > 0 }
   isRevoked (issuer: string, id: string): boolean { return !!this.db.prepare('SELECT 1 FROM revocations WHERE issuer = ? AND id = ?').get(issuer, id) }
   /** The stored statement (a JWT) for a revocation, or null. */
   getRevocation (issuer: string, id: string): string | null {
