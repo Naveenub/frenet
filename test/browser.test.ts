@@ -9,8 +9,9 @@ import { startApi } from '../src/api.js'
 import { startGateway } from '../src/gateway.js'
 import { startFrenet, type FrenetNode } from '../src/node.js'
 import { PERMISSION_FEATURES, validOrigin } from '../src/permissions.js'
-import { normalizeHost } from '../src/trackers.js'
-import { isNonPublicAddress, parseAuthority, startWebProxy } from '../src/webproxy.js'
+import { createArchive, restoreArchive } from '../src/archive.js'
+import { BUILTIN_TRACKERS, normalizeHost } from '../src/trackers.js'
+import { isNonPublicAddress, parseAuthority, parseUpstream, startWebProxy } from '../src/webproxy.js'
 
 const nodes: FrenetNode[] = []
 const dirs: string[] = []
@@ -202,5 +203,112 @@ describe('site permissions and secure downloads', () => {
       assert.equal(t.json.proxy.httpsOnly, true)
       assert.equal(n.trackers.check('ads.example.net').blocked, true)
     } finally { api.server.close(); proxy.server.close() }
+  })
+})
+
+describe('imported tracker lists', () => {
+  it('parses hosts, bare-domain and Adblock domain lines, skips the rest, and never overrides an allow rule', async () => {
+    const n = await track()
+    n.trackers.addRule('keep.example.com', 'allow')
+    const r = n.trackers.importList([
+      '# a comment', '! another', '[Adblock Plus 2.0]', '',
+      '0.0.0.0 ads.one.test', '127.0.0.1 track.two.test  # trailing comment', 'bare.three.test', '||adblock.four.test^', '||adblock.five.test^$third-party',
+      '0.0.0.0 keep.example.com', '127.0.0.1 localhost', '::1 ip6-localhost', '0.0.0.0 0.0.0.0',
+      '||example.org/path^', '##.banner', 'not a domain line', '@@||allow.six.test^', '0.0.0.0 foo.local'
+    ].join('\n'))
+    assert.equal(r.added, 5)
+    for (const h of ['ads.one.test', 'x.track.two.test', 'bare.three.test', 'adblock.four.test', 'adblock.five.test']) assert.equal(n.trackers.check(h).blocked, true, h)
+    assert.equal(n.trackers.check('keep.example.com').blocked, false)
+    assert.equal(n.trackers.check('example.org').blocked, false)
+    assert.equal(n.trackers.snapshot().ruleCount, 6)                   // 5 imported + the allow rule
+    assert.equal(n.trackers.importList('ads.one.test\nnew.seven.test').added, 1)   // re-import adds only what is new
+    assert.throws(() => n.trackers.importList('x'.repeat(9 * 1024 * 1024)), /larger than/)
+    assert.throws(() => n.trackers.importList(42), /text/)
+    assert.equal(n.trackers.clearRules('block'), 6)
+    assert.equal(n.trackers.check('ads.one.test').blocked, false)
+    assert.equal(n.trackers.check('keep.example.com').blocked, false)
+  })
+  it('ships a built-in list of well over a hundred well-known domains with no duplicates or malformed entries', () => {
+    assert.ok(BUILTIN_TRACKERS.length >= 150, String(BUILTIN_TRACKERS.length))
+    for (const h of BUILTIN_TRACKERS) assert.equal(normalizeHost(h), h, h)
+    assert.equal(new Set(BUILTIN_TRACKERS).size, BUILTIN_TRACKERS.length)
+  })
+})
+
+describe('archive carries browser settings', () => {
+  it('restores permission grants and tracker rules into a fresh data directory', async () => {
+    const src = mkdtempSync(join(tmpdir(), 'frenet-ba-')); const dst = mkdtempSync(join(tmpdir(), 'frenet-bb-')); dirs.push(src, dst)
+    const a = await startFrenet({ dataDir: src, listen: ['/ip4/127.0.0.1/tcp/0'], mdns: false, nat: false })
+    const site = await a.sites.publish([{ path: 'index.html', data: bytes('<p>a</p>') }])
+    a.permissions.grant(`site:${site.cid}`, 'camera'); a.permissions.grant(`site:${site.cid}`, 'fullscreen')
+    a.trackers.addRule('ads.example.net', 'block'); a.trackers.addRule('fine.example.net', 'allow')
+    await a.stop()
+    const { bytes: arc, counts } = await createArchive(src, 'correct horse battery', { N: 2 ** 10 })
+    assert.equal(counts.site_permissions, 2); assert.equal(counts.tracker_rules, 2)
+    await restoreArchive(dst, arc, 'correct horse battery')
+    const b = await track({ dataDir: dst })
+    assert.deepEqual(b.permissions.granted(`site:${site.cid}`).sort(), ['camera', 'fullscreen'])
+    assert.equal(b.trackers.check('ads.example.net').blocked, true)
+    assert.equal(b.trackers.check('ok.fine.example.net').blocked, false)
+  })
+})
+
+describe('SOCKS5 upstream', () => {
+  it('parses upstream specs strictly', () => {
+    assert.deepEqual(parseUpstream('socks5://127.0.0.1:9050'), { host: '127.0.0.1', port: 9050 })
+    assert.deepEqual(parseUpstream('socks5h://localhost:9150'), { host: 'localhost', port: 9150 })
+    for (const bad of ['http://127.0.0.1:9050', 'socks5://127.0.0.1', 'socks5://:9050', 'socks5://127.0.0.1:0', '127.0.0.1:9050']) assert.throws(() => parseUpstream(bad), /upstream/, bad)
+  })
+
+  it('hands the host name to the upstream unresolved (no local DNS), still blocks trackers first, and reports failures', async () => {
+    const n = await track()
+    const seen: Array<{ atyp: number, host: string, port: number }> = []
+    const echo = tcpServer((s) => s.pipe(s)); await new Promise<void>((r) => echo.listen(0, '127.0.0.1', r))
+    // A minimal no-auth SOCKS5 server that records what it was asked for, then bridges to the echo server.
+    const socks = tcpServer((c) => {
+      let stage = 0; let buf = Buffer.alloc(0)
+      c.on('error', () => {})
+      c.on('data', (d) => {
+        if (stage === 2) return
+        buf = Buffer.concat([buf, d])
+        if (stage === 0 && buf.length >= 3) { c.write(Buffer.from([5, 0])); buf = buf.subarray(3); stage = 1 }
+        if (stage === 1 && buf.length >= 5) {
+          const atyp = buf[3]!; const len = atyp === 3 ? buf[4]! : atyp === 1 ? 4 : 16
+          const need = 4 + (atyp === 3 ? 1 : 0) + len + 2
+          if (buf.length < need) return
+          const off = 4 + (atyp === 3 ? 1 : 0)
+          const host = atyp === 3 ? buf.subarray(off, off + len).toString() : atyp === 1 ? [...buf.subarray(off, off + 4)].join('.') : 'v6'
+          const port = buf.readUInt16BE(off + len)
+          seen.push({ atyp, host, port }); stage = 2
+          if (host.startsWith('refuse.')) { c.end(Buffer.from([5, 2, 0, 1, 0, 0, 0, 0, 0, 0])); return }
+          const up = connect((echo.address() as { port: number }).port, '127.0.0.1', () => {
+            c.write(Buffer.from([5, 0, 0, 1, 0, 0, 0, 0, 0, 0])); c.pipe(up); up.pipe(c)
+          })
+          up.on('error', () => c.destroy())
+        }
+      })
+    })
+    await new Promise<void>((r) => socks.listen(0, '127.0.0.1', r))
+    const proxy = await startWebProxy(n.trackers, 0, { upstream: { host: '127.0.0.1', port: (socks.address() as { port: number }).port } })
+    try {
+      assert.equal(proxy.stats().upstream, `socks5://127.0.0.1:${(socks.address() as { port: number }).port}`)
+      // This name cannot be resolved by this machine; it only works because resolution is left to the upstream.
+      const ok = await connectVia(proxy.port, 'only-the-upstream-knows-me.invalid:443')
+      assert.equal(ok.status, 200)
+      const back = await new Promise<string>((resolve) => { ok.sock.once('data', (d) => resolve(String(d))); ok.sock.write('via socks') })
+      assert.equal(back, 'via socks'); ok.sock.destroy()
+      assert.deepEqual(seen[0], { atyp: 3, host: 'only-the-upstream-knows-me.invalid', port: 443 })
+      // Non-public IP literals are still refused locally and never reach the upstream.
+      const lit = await connectVia(proxy.port, '10.0.0.5:443'); lit.sock.destroy()
+      assert.equal(lit.status, 403)
+      // Trackers are refused before the upstream is contacted.
+      const trk = await connectVia(proxy.port, 'ad.doubleclick.net:443'); trk.sock.destroy()
+      assert.equal(trk.status, 403)
+      assert.equal(seen.length, 1)
+      // An upstream refusal comes back as a 502.
+      const refused = await connectVia(proxy.port, 'refuse.example.com:443'); refused.sock.destroy()
+      assert.equal(refused.status, 502)
+      assert.match(refused.text, /upstream proxy refused/)
+    } finally { proxy.server.close(); socks.close(); echo.close() }
   })
 })

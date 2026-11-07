@@ -14,16 +14,21 @@ import type { Store } from './store.js'
  * not a substitute for a maintained list and will miss most trackers. Add your own with `block`.
  */
 export const BUILTIN_TRACKERS: readonly string[] = [
-  'doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'google-analytics.com', 'googletagmanager.com', 'googletagservices.com',
-  'adservice.google.com', 'connect.facebook.net', 'pixel.facebook.com', 'facebook.net', 'analytics.twitter.com', 'ads-twitter.com',
-  'static.ads-twitter.com', 'ads.linkedin.com', 'analytics.tiktok.com', 'ads.tiktok.com', 'analytics.yahoo.com', 'ads.yahoo.com',
-  'adnxs.com', 'adsrvr.org', 'criteo.com', 'criteo.net', 'taboola.com', 'outbrain.com', 'scorecardresearch.com', 'quantserve.com',
-  'hotjar.com', 'mixpanel.com', 'segment.io', 'fullstory.com', 'mouseflow.com', 'crazyegg.com', 'bat.bing.com', 'clarity.ms',
-  'amazon-adsystem.com', 'rubiconproject.com', 'pubmatic.com', 'openx.net', 'casalemedia.com', 'moatads.com', 'omtrdc.net', 'demdex.net'
+  // Google / Alphabet advertising and measurement
+  'doubleclick.net', 'googlesyndication.com', 'googleadservices.com', 'google-analytics.com', 'googletagmanager.com', 'googletagservices.com', 'adservice.google.com', 'app-measurement.com', 'admob.com', 'adsense.com', 'analytics.google.com', 'stats.g.doubleclick.net', '2mdn.net', 'adgoogle.net',
+  // Meta, Microsoft, X, LinkedIn, TikTok, Snap, Pinterest, Reddit, Yahoo, Amazon, Apple/Verizon ads
+  'connect.facebook.net', 'pixel.facebook.com', 'facebook.net', 'an.facebook.com', 'analytics.twitter.com', 'ads-twitter.com', 'ads-api.twitter.com', 'ads.linkedin.com', 'px.ads.linkedin.com', 'snap.licdn.com', 'analytics.tiktok.com', 'ads.tiktok.com', 'business-api.tiktok.com', 'sc-static.net', 'tr.snapchat.com', 'ads.snapchat.com', 'ct.pinterest.com', 'analytics.pinterest.com', 'ads.pinterest.com', 'events.redditmedia.com', 'alb.reddit.com', 'ads.reddit.com', 'analytics.yahoo.com', 'ads.yahoo.com', 'advertising.com', 'bat.bing.com', 'clarity.ms', 'ads.microsoft.com', 'amazon-adsystem.com', 'aax.amazon-adsystem.com', 'advertising.amazon.com',
+  // Ad exchanges, DSPs, SSPs, retargeting
+  'adnxs.com', 'adsrvr.org', 'criteo.com', 'criteo.net', 'taboola.com', 'outbrain.com', 'revcontent.com', 'mgid.com', 'rubiconproject.com', 'pubmatic.com', 'openx.net', 'casalemedia.com', 'indexww.com', 'smartadserver.com', 'sharethrough.com', 'triplelift.com', 'media.net', 'bidswitch.net', 'contextweb.com', 'lijit.com', 'sovrn.com', 'yieldmo.com', 'gumgum.com', 'adform.net', 'adition.com', 'teads.tv', 'spotxchange.com', 'springserve.com', 'tapad.com', 'bluekai.com', 'krxd.net', 'exelator.com', 'eyeota.net', 'rlcdn.com', 'liveramp.com', 'agkn.com', 'mathtag.com', 'turn.com', 'serving-sys.com', 'flashtalking.com', 'adroll.com', 'perfectaudience.com', 'rfihub.com', 'everesttech.net', 'adtechus.com', 'adtech.de', 'advertising.io', 'yieldlab.net', 'ml314.com', '33across.com', 'permutive.com', 'id5-sync.com', 'uidapi.com',
+  // Measurement, audience, session replay, product analytics, fingerprinting
+  'scorecardresearch.com', 'quantserve.com', 'quantcount.com', 'chartbeat.com', 'chartbeat.net', 'parsely.com', 'newrelic.com', 'nr-data.net', 'hotjar.com', 'hotjar.io', 'mixpanel.com', 'segment.io', 'segment.com', 'amplitude.com', 'heap.io', 'heapanalytics.com', 'fullstory.com', 'mouseflow.com', 'crazyegg.com', 'luckyorange.com', 'luckyorange.net', 'inspectlet.com', 'smartlook.com', 'logrocket.com', 'logrocket.io', 'sessioncam.com', 'clicktale.net', 'contentsquare.net', 'moatads.com', 'doubleverify.com', 'adsafeprotected.com', 'iasds01.com', 'omtrdc.net', 'demdex.net', '2o7.net', 'btstatic.com', 'bounceexchange.com', 'tags.tiqcdn.com', 'tealiumiq.com', 'ensighten.com', 'mookie1.com', 'branch.io', 'adjust.com', 'appsflyer.com', 'kochava.com', 'singular.net', 'braze.com', 'onesignal.com', 'optimizely.com', 'abtasty.com', 'vwo.com', 'visualwebsiteoptimizer.com', 'cdn.mxpnl.com', 'cloudflareinsights.com', 'stats.wp.com', 'pixel.wp.com', 'pippio.com', 'bizible.com', 'marketo.net', 'mktoresp.com', 'pardot.com', 'hubspot.com', 'hs-analytics.net', 'hs-scripts.com', 'hsadspixel.net', 'hsleadflows.net', 'intercom.io', 'drift.com', 'zdassets.com',
+  // Telemetry/trackers of widely used platforms
+  'sentry.io', 'bugsnag.com', 'datadoghq.com', 'browser-intake-datadoghq.com', 'mc.yandex.ru', 'metrika.yandex.ru', 'an.yandex.ru', 'top-fwz1.mail.ru', 'counter.yadro.ru', 'hm.baidu.com', 'cnzz.com', 'umeng.com'
 ]
 
 const HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/
-export const MAX_TRACKER_RULES = 5000
+export const MAX_TRACKER_RULES = 300_000
+export const MAX_IMPORT_BYTES = 8 * 1024 * 1024
 
 /** Lower-case, strip one trailing dot, require a dotted DNS name. Returns null for anything else (IP literals included). */
 export function normalizeHost (input: unknown): string | null {
@@ -43,7 +48,8 @@ export class TrackerBlocker {
   private builtin = new Set(BUILTIN_TRACKERS)
 
   constructor (private store: Store) {
-    for (const r of store.listTrackerRules()) (r.action === 'block' ? this.block : this.allow).add(r.host)
+    // Rows can come from an imported archive: keep only well-formed hosts.
+    for (const r of store.listTrackerRules()) if (normalizeHost(r.host) === r.host) (r.action === 'block' ? this.block : this.allow).add(r.host)
   }
 
   /** The rule that covers `host` in `set`, matched on a label boundary, most specific first. */
@@ -95,12 +101,49 @@ export class TrackerBlocker {
     return this.store.removeTrackerRule(host)
   }
 
+  /**
+   * Add a maintained blocklist the user obtained themselves (the node never downloads one). Accepted per line:
+   * hosts format (`0.0.0.0 ads.example.com`, `127.0.0.1 ...`), a bare domain, or an Adblock domain rule (`||ads.example.com^`).
+   * Comments (`#`, `!`), cosmetic/URL rules and anything that is not a plain domain are skipped and counted. Domains the user
+   * has an allow rule for are never overridden. Nothing is fetched and nothing leaves the machine.
+   */
+  importList (text: unknown): { added: number, skipped: number, total: number } {
+    if (typeof text !== 'string') throw new Error('list must be text')
+    if (Buffer.byteLength(text) > MAX_IMPORT_BYTES) throw new Error(`list is larger than ${MAX_IMPORT_BYTES} bytes`)
+    const hosts = new Set<string>(); let skipped = 0
+    for (const raw of text.split(/\r?\n/)) {
+      const line = raw.replace(/\s+#.*$/, '').trim()
+      if (!line || line.startsWith('#') || line.startsWith('!') || line.startsWith('[')) continue
+      let cand: string | undefined
+      const adb = /^\|\|([a-z0-9.-]+)\^(?:\$third-party)?$/i.exec(line)
+      const parts = line.split(/\s+/)
+      if (adb) cand = adb[1]
+      else if (parts.length === 2 && /^(?:0\.0\.0\.0|127\.0\.0\.1|::1?)$/.test(parts[0]!)) cand = parts[1]
+      else if (parts.length === 1) cand = parts[0]
+      const h = normalizeHost(cand)
+      if (!h || h === 'localhost' || h.endsWith('.localhost') || h.endsWith('.local') || h.endsWith('.arpa')) { skipped++; continue }
+      if (!this.allow.has(h) && !this.block.has(h)) hosts.add(h)
+    }
+    if (this.block.size + this.allow.size + hosts.size > MAX_TRACKER_RULES) throw new Error(`too many rules (max ${MAX_TRACKER_RULES})`)
+    const list = [...hosts]
+    this.store.setTrackerRules(list, 'block')
+    for (const h of list) this.block.add(h)
+    return { added: list.length, skipped, total: this.block.size }
+  }
+
+  /** Remove every rule of one kind (e.g. an imported list you no longer want). */
+  clearRules (action: 'block' | 'allow'): number {
+    ;(action === 'block' ? this.block : this.allow).clear()
+    return this.store.clearTrackerRules(action)
+  }
+
   clearRecent (): void { this.recent = [] }
 
-  snapshot (): { builtinCount: number, rules: Array<{ host: string, action: 'block' | 'allow' }>, blocked: number, allowedOverrides: number, recent: Array<{ host: string, at: number, rule: string }> } {
+  snapshot (): { builtinCount: number, rules: Array<{ host: string, action: 'block' | 'allow' }>, ruleCount: number, blocked: number, allowedOverrides: number, recent: Array<{ host: string, at: number, rule: string }> } {
     return {
       builtinCount: this.builtin.size,
-      rules: this.store.listTrackerRules().map((r) => ({ host: r.host, action: r.action })),
+      rules: this.store.listTrackerRules().slice(0, 200).map((r) => ({ host: r.host, action: r.action })),
+      ruleCount: this.store.countTrackerRules(),
       blocked: this.counters.blocked,
       allowedOverrides: this.counters.allowedOverrides,
       recent: [...this.recent]

@@ -204,6 +204,8 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       // Browser: web proxy status, tracker rules and per-site permissions.
       if (req.method === 'GET' && url.pathname === '/api/browser') return json(res, 200, browserState(n, proxy))
       if (req.method === 'POST' && url.pathname === '/api/browser/trackers') { const b = await body(req); n.trackers.addRule(b.host, b.action === 'allow' ? 'allow' : 'block'); return json(res, 200, browserState(n, proxy)) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/import') { const b = await body(req, 9 * 1024 * 1024); return json(res, 200, { ...n.trackers.importList(b.text), state: browserState(n, proxy) }) }
+      if (req.method === 'POST' && url.pathname === '/api/browser/trackers/clear') { const b = await body(req); return json(res, 200, { removed: n.trackers.clearRules(b.action === 'allow' ? 'allow' : 'block') }) }
       if (req.method === 'POST' && url.pathname === '/api/browser/trackers/remove') { const b = await body(req); return json(res, 200, { removed: n.trackers.removeRule(b.host) }) }
       if (req.method === 'POST' && url.pathname === '/api/browser/trackers/clear-recent') { n.trackers.clearRecent(); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/browser/permissions/grant') { const b = await body(req); n.permissions.grant(b.origin, b.feature); return json(res, 200, browserState(n, proxy)) }

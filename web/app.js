@@ -284,13 +284,21 @@ function webBrowsing (v) {
       el('p', {}, 'Proxy auto-config URL: '), el('div', { className: 'mono' }, b.proxy.pacUrl),
       el('p', { className: 'dim' }, `Or set an HTTPS proxy of 127.0.0.1 port ${b.proxy.port} by hand.`),
       el('table', {}, el('tbody', {}, ...Object.entries({ 'Tunnels opened': st.tunnels, 'Open now': st.active, 'Trackers blocked': st.trackersBlocked, 'Plain-HTTP refused': st.refusedHttp, 'Local/LAN targets refused': st.refusedPrivate, 'Other ports refused': st.refusedPort }).map(([k, val]) => el('tr', {}, el('th', {}, k), el('td', {}, String(val)))))),
-      el('p', { className: 'dim' }, `Built-in list: ${b.trackers.builtinCount} well-known tracker and ad domains (short, hand-picked; it will miss many). Blocking is by host name only, because encrypted traffic cannot be inspected. It does not make you anonymous: sites and your network still see your IP address.`))
+      el('p', { className: 'dim' }, `Built-in list: ${b.trackers.builtinCount} well-known tracker and ad domains, plus ${b.trackers.ruleCount} of your own rules. Import a maintained blocklist below for wider coverage. Blocking is by host name only, because encrypted traffic cannot be inspected.`),
+      el('p', { className: 'dim' }, st.upstream ? `All web traffic goes through ${st.upstream}; host names are resolved there, not on this machine. That only hides your address if that proxy does (e.g. Tor).` : 'Without an upstream proxy, sites and your network see your IP address and this machine’s resolver sees every host name. Start the node with --proxy-upstream socks5://127.0.0.1:9050 to route through Tor or another SOCKS5 proxy.'))
     const host = el('input', { placeholder: 'domain, e.g. ads.example.com', 'aria-label': 'Domain' }); const msg = el('p', { className: 'err' })
     const rule = (action) => async () => { msg.textContent = ''; try { draw(await api('/api/browser/trackers', { host: host.value, action })) } catch (e) { msg.textContent = e.message } }
     card.append(el('div', { className: 'row' }, host, el('button', { className: 'btn', type: 'button', onclick: rule('block') }, 'Block'), el('button', { className: 'btn', type: 'button', onclick: rule('allow') }, 'Always allow')), msg,
       el('p', { className: 'dim' }, 'A domain covers its subdomains. “Always allow” overrides the built-in list, for a site that breaks.'))
+    const file = el('input', { type: 'file', accept: '.txt,.hosts,text/plain', 'aria-label': 'Blocklist file' }); const imsg = el('p', { className: 'dim' })
+    card.append(el('div', { className: 'row' }, file, el('button', { className: 'btn', type: 'button', onclick: async () => {
+      imsg.textContent = ''
+      const f = file.files[0]; if (!f) { imsg.textContent = 'Choose a blocklist file (hosts format, one domain per line, or Adblock ||domain^ rules).'; return }
+      try { const r = await api('/api/browser/trackers/import', { text: await f.text() }); draw(r.state); card.append(el('p', { className: 'dim' }, `Imported ${r.added} domains, skipped ${r.skipped} lines that were not plain domains.`)) } catch (e) { imsg.textContent = e.message }
+    } }, 'Import list'), el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/clear', { action: 'block' }); draw(await api('/api/browser')) } }, 'Remove all my block rules')), imsg,
+    el('p', { className: 'dim' }, 'The node never downloads a list itself: get one from a source you trust and import the file here. Your “always allow” rules are never overridden.'))
     if (b.trackers.rules.length) {
-      const t = el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Your rules'), el('th', {}, ''), el('th', {}, ''))), el('tbody', {}, ...b.trackers.rules.map((r) => el('tr', {}, el('td', { className: 'mono' }, r.host), el('td', {}, r.action), el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/remove', { host: r.host }); draw(await api('/api/browser')) } }, 'Remove'))))))
+      const t = el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, b.trackers.ruleCount > b.trackers.rules.length ? `Your rules (first ${b.trackers.rules.length} of ${b.trackers.ruleCount})` : 'Your rules'), el('th', {}, ''), el('th', {}, ''))), el('tbody', {}, ...b.trackers.rules.map((r) => el('tr', {}, el('td', { className: 'mono' }, r.host), el('td', {}, r.action), el('td', {}, el('button', { className: 'btn', type: 'button', onclick: async () => { await api('/api/browser/trackers/remove', { host: r.host }); draw(await api('/api/browser')) } }, 'Remove'))))))
       card.append(t)
     }
     if (b.trackers.recent.length) {

@@ -43,9 +43,65 @@ export interface WebProxyOptions {
   maxTunnels?: number
   idleMs?: number
   connectTimeoutMs?: number
+  /**
+   * Send every tunnel through a SOCKS5 proxy (no authentication), e.g. Tor at 127.0.0.1:9050. The host name is handed to
+   * it unresolved, so this machine does not look it up (no DNS leak) and the destination site sees the upstream's address,
+   * not yours. The non-public-address check can then only cover IP literals: the upstream resolves names, so use one that
+   * refuses private destinations (Tor exits do). The tracker list and port rules still apply first.
+   */
+  upstream?: { host: string, port: number }
 }
 
-export interface ProxyStats { active: number, tunnels: number, trackersBlocked: number, refusedPrivate: number, refusedPort: number, refusedHttp: number, failed: number }
+/** `socks5://host:port` (host may be `[v6]`). Throws on anything else. */
+export function parseUpstream (spec: string): { host: string, port: number } {
+  const m = /^socks5h?:\/\/(?:\[([0-9a-fA-F:]+)\]|([A-Za-z0-9.-]+)):(\d{1,5})$/.exec(spec.trim())
+  const port = m ? Number(m[3]) : 0
+  if (!m || port < 1 || port > 65535) throw new Error('upstream must look like socks5://127.0.0.1:9050')
+  return { host: (m[1] ?? m[2])!, port }
+}
+
+/** Read exactly n bytes from a socket in paused (readable) mode, so nothing is lost between handshake steps. */
+function readExact (s: Socket, n: number, ms: number): Promise<Buffer> {
+  return new Promise((resolve, reject) => {
+    const finish = (e: Error | null, b?: Buffer): void => {
+      clearTimeout(timer); s.off('readable', tryRead); s.off('error', onErr); s.off('close', onClose)
+      if (e) reject(e); else resolve(b!)
+    }
+    const tryRead = (): void => { const b = s.read(n) as Buffer | null; if (b) finish(null, b) }
+    const onErr = (e: Error): void => finish(e)
+    const onClose = (): void => finish(new Error('upstream closed'))
+    const timer = setTimeout(() => finish(new Error('upstream timed out')), ms)
+    s.on('readable', tryRead); s.once('error', onErr); s.once('close', onClose)
+    tryRead()
+  })
+}
+
+/** SOCKS5 CONNECT with no authentication. Resolves once the upstream says the tunnel is open. */
+async function socks5Connect (s: Socket, host: string, port: number, ms: number): Promise<void> {
+  s.write(Buffer.from([5, 1, 0]))
+  const m = await readExact(s, 2, ms)
+  if (m[0] !== 5 || m[1] !== 0) throw new Error('upstream refused no-auth SOCKS5')
+  const v = isIP(host)
+  if (v === 6 && host.includes('.')) throw new Error('unsupported IPv6 form')
+  const addr = v === 4 ? Buffer.from([1, ...host.split('.').map(Number)])
+    : v === 6 ? Buffer.concat([Buffer.from([4]), ipv6Bytes(host)])
+      : Buffer.concat([Buffer.from([3, Buffer.byteLength(host)]), Buffer.from(host)])
+  s.write(Buffer.concat([Buffer.from([5, 1, 0]), addr, Buffer.from([port >> 8, port & 255])]))
+  const h = await readExact(s, 4, ms)
+  if (h[0] !== 5 || h[1] !== 0) throw new Error(`upstream connect failed (code ${h[1]})`)
+  const tail = h[3] === 1 ? 6 : h[3] === 4 ? 18 : h[3] === 3 ? (await readExact(s, 1, ms))[0]! + 2 : -1
+  if (tail < 0) throw new Error('bad upstream reply')
+  await readExact(s, tail, ms)   // bound address and port: not needed
+}
+
+function ipv6Bytes (ip: string): Buffer {
+  const [head, tail = ''] = ip.split('::')
+  const parse = (x: string): number[] => x ? x.split(':').flatMap((g) => { const n = parseInt(g, 16); return [n >> 8, n & 255] }) : []
+  const a = parse(head!); const b = ip.includes('::') ? parse(tail) : []
+  return Buffer.from(ip.includes('::') ? [...a, ...new Array(16 - a.length - b.length).fill(0), ...b] : a)
+}
+
+export interface ProxyStats { upstream: string | null, active: number, tunnels: number, trackersBlocked: number, refusedPrivate: number, refusedPort: number, refusedHttp: number, failed: number }
 
 /** `host:port` or `[v6]:port` -> parts, or null. No userinfo, no paths. */
 export function parseAuthority (a: string): { host: string, port: number } | null {
@@ -71,7 +127,7 @@ export function startWebProxy (trackers: TrackerBlocker, port: number, opts: Web
   const maxTunnels = opts.maxTunnels ?? 256
   const idleMs = opts.idleMs ?? 5 * 60_000
   const connectMs = opts.connectTimeoutMs ?? 10_000
-  const stats: ProxyStats = { active: 0, tunnels: 0, trackersBlocked: 0, refusedPrivate: 0, refusedPort: 0, refusedHttp: 0, failed: 0 }
+  const stats: ProxyStats = { upstream: opts.upstream ? `socks5://${opts.upstream.host}:${opts.upstream.port}` : null, active: 0, tunnels: 0, trackersBlocked: 0, refusedPrivate: 0, refusedPort: 0, refusedHttp: 0, failed: 0 }
   let listenPort = port
 
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
@@ -101,16 +157,22 @@ export function startWebProxy (trackers: TrackerBlocker, port: number, opts: Web
 
       let addr: string
       try {
-        const answers = isIP(t.host) ? [{ address: t.host }] : await lookup(t.host, { all: true, verbatim: true })
-        if (answers.length === 0) throw new Error('no address')
-        // Every answer must be public: one private record is enough to refuse (no picking the "good" one for an attacker-controlled name).
-        if (!opts.allowPrivate && answers.some((a) => isNonPublicAddress(a.address))) { stats.refusedPrivate++; return deny(client, 403, 'Forbidden', 'refusing to connect to a non-public address') }
-        addr = answers[0]!.address
+        if (opts.upstream) {
+          // Names are resolved by the upstream, not here; only IP literals can be checked locally.
+          if (isIP(t.host) && !opts.allowPrivate && isNonPublicAddress(t.host)) { stats.refusedPrivate++; return deny(client, 403, 'Forbidden', 'refusing to connect to a non-public address') }
+          addr = opts.upstream.host
+        } else {
+          const answers = isIP(t.host) ? [{ address: t.host }] : await lookup(t.host, { all: true, verbatim: true })
+          if (answers.length === 0) throw new Error('no address')
+          // Every answer must be public: one private record is enough to refuse (no picking the "good" one for an attacker-controlled name).
+          if (!opts.allowPrivate && answers.some((a) => isNonPublicAddress(a.address))) { stats.refusedPrivate++; return deny(client, 403, 'Forbidden', 'refusing to connect to a non-public address') }
+          addr = answers[0]!.address
+        }
       } catch { stats.failed++; return deny(client, 502, 'Bad Gateway', 'could not resolve host') }
       if (!client.writable) return
 
-      // Connect to the exact address that was checked, not to the name again.
-      const upstream: Socket = connect({ host: addr, port: t.port })
+      // Connect to the exact address that was checked (or to the SOCKS5 upstream), not to the name again.
+      const upstream: Socket = connect({ host: addr, port: opts.upstream ? opts.upstream.port : t.port })
       upstream.setNoDelay(true)
       const cleanup = (): void => { client.destroy(); upstream.destroy() }
       let connected = false
@@ -120,7 +182,10 @@ export function startWebProxy (trackers: TrackerBlocker, port: number, opts: Web
         if (connected) return cleanup()
         stats.failed++; deny(client, 502, 'Bad Gateway', 'connection failed'); upstream.destroy()
       })
-      upstream.once('connect', () => {
+      upstream.once('connect', () => { void (async () => {
+        if (opts.upstream) {
+          try { await socks5Connect(upstream, t.host, t.port, connectMs) } catch { clearTimeout(timer); stats.failed++; deny(client, 502, 'Bad Gateway', 'upstream proxy refused the connection'); upstream.destroy(); return }
+        }
         clearTimeout(timer); connected = true
         stats.active++; stats.tunnels++
         let done = false
@@ -130,7 +195,7 @@ export function startWebProxy (trackers: TrackerBlocker, port: number, opts: Web
         client.write('HTTP/1.1 200 Connection Established\r\n\r\n')
         if (head.length) upstream.write(head)
         client.pipe(upstream); upstream.pipe(client)
-      })
+      })() })
     })().catch(() => client.destroy())
   })
 

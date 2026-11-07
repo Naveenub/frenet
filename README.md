@@ -30,7 +30,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Direct encrypted messaging, local SQLite storage | working |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
-| Web browsing: local HTTPS-only CONNECT proxy (`127.0.0.1:7779`, PAC file), host-based tracker blocking with your own allow/block rules, no browsing log | working, tested against a local TCP target; **not tested against real HTTPS sites or in real browsers**; blocks by host only (TLS is never decrypted) |
+| Web browsing: local HTTPS-only CONNECT proxy (`127.0.0.1:7779`, PAC file), host-based tracker blocking with your own allow/block rules, no browsing log | working, tested against local TCP targets and a fake SOCKS5 server; **not tested against real HTTPS sites, real browsers or a real Tor**; blocks by host only (TLS is never decrypted) |
 | Site permissions: per-origin grants for camera, microphone, location, fullscreen, clipboard-write, screen capture; all off by default, listed and revocable in the dashboard | working, tested (the gateway's `Permissions-Policy` changes for that origin only); the browser's own prompt still applies |
 | Secure downloads: files that are not on the render allow-list (and any file with `?download=1`) are sandboxed attachments with a validated filename and `X-Frenet-File` id | working, tested |
 | Decentralized sites: publish a static folder (<= 64 files, 32 MB), content-addressed, served by a local gateway on an isolated per-site origin (`<site-id>.localhost`) with a no-third-party CSP; dashboard Browser view | working, tested (publish on A, serve via B over the DHT) |
@@ -94,10 +94,10 @@ The dashboard's **Decentralized Browser** view has the setup. The node runs a lo
 ```
 
 - **HTTPS only.** Plain `http://` requests get a 426. Only port 443 is tunnelled. TLS is passed through end to end: no certificate to install and nothing is decrypted, so the proxy cannot see, alter or log what you read.
-- **Tracker blocking** is by host name, before any DNS lookup, from a short built-in list plus your own block and "always allow" rules (a domain covers its subdomains). It cannot filter by URL or strip cookies because it cannot see inside TLS. The built-in list is hand-picked and small: it does not replace a maintained blocklist.
+- **Tracker blocking** is by host name, before any DNS lookup, from a built-in list (about 180 well-known tracker and ad domains), your own block and "always allow" rules (a domain covers its subdomains), and any maintained blocklist you import from a file (hosts format, bare domains or Adblock `||domain^` rules; up to 8 MB / 300,000 rules; the node never downloads lists itself). It cannot filter by URL or strip cookies because it cannot see inside TLS, and that is deliberate: seeing inside would mean installing a certificate authority that can impersonate every site.
 - **No access to your own machine.** The proxy resolves the host itself, refuses if any answer is loopback, LAN, link-local or otherwise non-public, and connects to the address it checked. `--proxy-allow-private` turns this off for a deliberate LAN setup.
 - **No history.** Allowed destinations are never logged or stored; only counters exist, and the list of recently blocked hosts lives in memory.
-- Not an anonymity tool: the sites and your network see your IP, and your resolver sees the host names.
+- **Upstream proxy.** `--proxy-upstream socks5://127.0.0.1:9050` sends every tunnel through a SOCKS5 proxy such as Tor. Host names go to it unresolved (no local DNS lookup), and sites see its address, not yours. Without an upstream, sites and your network see your IP and your resolver sees the host names. With one, only IP literals are checked locally for non-public targets, so use a proxy that refuses private destinations (Tor exits do). Anonymity is only as good as that proxy: FRENET does not provide it by itself.
 
 **Site permissions.** Every FRENET site is denied camera, microphone, location, fullscreen, clipboard-write and screen capture. Grant one per site origin in the dashboard (or `POST /api/browser/permissions/grant {origin, feature}` with `site:<id>` or `name:<n>.<key>`); it only lets that site ask, and your browser still prompts.
 

@@ -21,7 +21,9 @@ const ARCHIVE_TABLES: Record<string, { cols: Col[], where?: string }> = {
   group_events: { cols: [T('community'), T('id'), T('kind'), T('author'), I('ts'), T('body'), T('sig'), T('meta', true)] },
   credentials: { cols: [T('id'), T('role'), T('issuer'), T('subject'), T('type'), I('issued'), I('expires', true), T('jwt')] },
   revocations: { cols: [T('issuer'), T('id'), I('ts'), T('jwt'), I('own')], where: 'own = 1' },
-  bans: { cols: [T('peer'), T('reason'), I('ts')] }
+  bans: { cols: [T('peer'), T('reason'), I('ts')] },
+  site_permissions: { cols: [T('origin'), T('feature'), I('ts')] },
+  tracker_rules: { cols: [T('host'), T('action'), I('ts')] }
 }
 
 export interface StoredMessage {
@@ -246,6 +248,13 @@ export class Store {
 
   /** The user's own tracker-blocking rules (see TrackerBlocker). */
   setTrackerRule (host: string, action: 'block' | 'allow'): void { this.db.prepare('INSERT OR REPLACE INTO tracker_rules (host, action, ts) VALUES (?, ?, ?)').run(host, action, Date.now()) }
+  /** Many rules in one transaction (list import). Existing rules for a host are replaced. */
+  setTrackerRules (hosts: string[], action: 'block' | 'allow'): void {
+    const stmt = this.db.prepare('INSERT OR REPLACE INTO tracker_rules (host, action, ts) VALUES (?, ?, ?)'); const ts = Date.now()
+    this.db.exec('BEGIN')
+    try { for (const h of hosts) stmt.run(h, action, ts); this.db.exec('COMMIT') } catch (e) { try { this.db.exec('ROLLBACK') } catch { /* already rolled back */ } throw e }
+  }
+  clearTrackerRules (action: 'block' | 'allow'): number { return Number(this.db.prepare('DELETE FROM tracker_rules WHERE action = ?').run(action).changes) }
   removeTrackerRule (host: string): boolean { return Number(this.db.prepare('DELETE FROM tracker_rules WHERE host = ?').run(host).changes) > 0 }
   listTrackerRules (): Array<{ host: string, action: 'block' | 'allow', ts: number }> { return (this.db.prepare('SELECT * FROM tracker_rules ORDER BY host').all() as any[]).map((r) => ({ host: r.host, action: r.action, ts: Number(r.ts) })) }
   countTrackerRules (): number { return Number((this.db.prepare('SELECT COUNT(*) AS n FROM tracker_rules').get() as any).n) }
