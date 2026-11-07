@@ -277,7 +277,7 @@ function identity (v) {
 function privacy (v) {
   const p = state.status.privacy
   v.append(el('div', { className: 'card' }, el('h3', {}, 'What this node does with your data'),
-    el('table', {}, el('tbody', {}, ...Object.entries({ 'Transport encryption': p.transportEncryption, Identity: p.identity, Telemetry: p.telemetry, 'Control API': p.apiBind, 'Message storage': 'Local SQLite, this device only' }).map(([k, val]) => el('tr', {}, el('th', {}, k), el('td', {}, val)))))))
+    el('table', {}, el('tbody', {}, ...Object.entries({ 'Transport encryption': p.transportEncryption, Identity: p.identity, 'Anonymous auth': p.anonymousAuth, Telemetry: p.telemetry, 'Control API': p.apiBind, 'Message storage': 'Local SQLite, this device only' }).map(([k, val]) => el('tr', {}, el('th', {}, k), el('td', {}, val)))))))
 }
 
 function security (v) {
