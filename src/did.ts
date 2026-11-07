@@ -3,6 +3,7 @@ import type { PublicKey } from '@libp2p/interface'
 import { peerIdFromPublicKey, peerIdFromString } from '@libp2p/peer-id'
 import { base32 } from 'multiformats/bases/base32'
 import { base58btc } from 'multiformats/bases/base58'
+import { isWebDid } from './webid.js'
 
 /**
  * `did:key` for Ed25519 (https://w3c-ccg.github.io/did-method-key/). A FRENET identity already is an Ed25519 key,
@@ -76,6 +77,7 @@ export const frenetId = (did: string): string => { if (!isFrenetDid(did)) throw 
 export function toDid (subject: unknown): string {
   if (typeof subject !== 'string' || subject === '') throw new Error('missing DID or peer ID')
   if (isFrenetDid(subject)) return subject
+  if (isWebDid(subject)) return subject
   if (subject.startsWith('did:')) return parseDidKey(subject).did
   return didFromPeerId(subject)
 }

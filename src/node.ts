@@ -22,6 +22,7 @@ import { Revocations } from './revocations.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
 import { Credentials, type RevocationCheck } from './credentials.js'
+import { Handles, signHandleProof, WebDids } from './webid.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
@@ -86,6 +87,11 @@ export interface FrenetNode {
   reputation: Reputation
   sybil: SybilGuard
   credentials: Credentials
+  /** did:web resolver and domain-anchored handles (`alice@example.com`); both fetch over HTTPS. */
+  web: WebDids
+  handles: Handles
+  /** Consent proof (did:key signature) for a handle; the private key itself is never exposed. */
+  handleProof: (handle: string) => Promise<string>
   /** Anonymous membership proofs (linkable ring proofs) and single-use verifier challenges. */
   zk: ZkAuth
   identityLogs: IdentityLogs
@@ -211,7 +217,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
   const identityLogs = new IdentityLogs(libp2p, store)
   const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
-  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations })
+  const web = new WebDids()
+  const handles = new Handles(web)
+  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations, web })
   const zk = new ZkAuth(store, privateKey, { resolveFrenet: frenetKeyResolver((id) => identityLogs.resolve(id, { network: false })) })
   // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
   const report = (peer: string, ev: ReputationEvent, detail = ''): void => {
@@ -267,6 +275,9 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     reputation,
     sybil,
     credentials,
+    web,
+    handles,
+    handleProof: (handle) => signHandleProof(privateKey, handle, credentials.keyDid),
     zk,
     identityLogs,
     revocations,

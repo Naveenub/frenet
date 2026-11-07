@@ -20,7 +20,8 @@
 - Reputation thresholds and proof-of-work levels are untuned guesses.
 - Equivocation by a community owner (different rosters to different members) is not detected.
 - Update trust roots cannot be rotated; there is no installer.
-- A key (`did:key`) cannot be rotated or revoked.
+- A `did:key` cannot be rotated or revoked (use `did:frenet`).
+- `did:web` and handles (`src/webid.ts`) trust DNS and TLS; they fetch attacker-influenced URLs (SSRF guard in `isNonPublicAddress`/`httpsJson`, no live-network test: review the DNS-rebinding window between lookup and connect, which is closed by connecting to the vetted IP).
 
 ## Before and during the engagement
 - Freeze a commit; run `npm audit`, the full test suite, and a fuzz pass over every `parse`/`validate` function (not yet written).

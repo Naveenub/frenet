@@ -107,7 +107,7 @@ describe('verifiable credentials (VC-JWT)', () => {
     await assert.rejects(issuer.c.issue(alice.did, 'T', [1] as any), /object/)
     await assert.rejects(issuer.c.issue(alice.did, 'T', { big: 'x'.repeat(9000) }), /at most/)
     await assert.rejects(issuer.c.issue(alice.did, 'T', { n: 1 }, { ttlMs: -1 }), /expiry/)
-    await assert.rejects(issuer.c.issue('did:web:x.example', 'T', {}), /unsupported DID/)
+    await assert.rejects(issuer.c.issue('did:example:x', 'T', {}), /unsupported DID/)
   })
 
   it('rejects tampering, alg games, wrong typ, kid mismatch and expiry', async () => {

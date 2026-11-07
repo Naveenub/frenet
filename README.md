@@ -47,7 +47,9 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
 | Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
 | Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
-| Human-memorable global names, key rotation | **not built** |
+| Human-memorable global names: `alice@example.com` resolves through `https://example.com/.well-known/frenet-names.json` to a DID, optionally with a consent proof signed by that DID's key (`frenet identity handle-proof`, `GET /api/handle/resolve`) | working, tested with an injected fetcher (no live-network test); **uniqueness comes from DNS and the domain owner, not from FRENET**: it depends on DNS and TLS certificates and a domain can reassign a name unless you require the consent proof |
+| `did:web` (Ed25519 keys only) next to `did:key` and `did:frenet`: resolved over HTTPS, usable as a VC-JWT issuer or subject | working, tested with an injected fetcher; depends on DNS and TLS; no live-network test; fetches refuse non-public addresses, redirects, ports and bodies over 64 KB |
+| Global names with no DNS and no registry (a decentralized Namecoin/ENS equivalent) | **not built**: needs a consensus layer or a trusted registry; `<n>.<key>` names stay the registry-free option |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -93,12 +95,12 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 # -> name.link = frenet-name://my-blog.<your-publisher-key>, url = http://my-blog.<key>.localhost:7778/
 ```
 
-- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that names are not globally human-memorable: the key is part of the address.
+- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that the key is part of the address. For a memorable global name use a domain-anchored handle (`alice@example.com`, below).
 - **Updates:** publishing again under the same name signs a record with `seq + 1`; resolvers take the highest valid `seq`. The immutable `frenet-site://<id>` link of each version keeps working.
 - **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
-Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
+Limits: `<n>.<key>` names are not human-memorable (key is in the address; see handles for that); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
 
 ### Content safety (reports and blocking)
 
@@ -129,6 +131,8 @@ Limits: local only (nothing is sent anywhere, no shared or gossiped blocklists, 
 
 ```bash
 frenet identity                              # peer ID + DID (did:key:z6Mk...)
+frenet identity handle-proof alice@example.com   # entry to publish at https://example.com/.well-known/frenet-names.json
+curl 'http://127.0.0.1:PORT/api/handle/resolve?handle=alice@example.com&requireProof=1'   # -> {handle, did, domain, proof}
 frenet backup --out ~/frenet.backup          # passphrase-encrypted key backup (node stopped)
 frenet recovery split -k 3 -n 5              # 5 shares, any 3 recover the key
 frenet restore ~/frenet.backup               # or: frenet recovery restore SHARE SHARE SHARE

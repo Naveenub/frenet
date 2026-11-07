@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 import type { PrivateKey } from '@libp2p/interface'
 import { didFromPublicKeyRaw, frenetId, isFrenetDid, keyForKid, parseDidKey, toDid } from './did.js'
+import { isWebDid, webKeyForKid, type WebDids } from './webid.js'
 import { keyForSignature, type IdentityLogs, type IdentityState } from './identity-log.js'
 import type { Revocations } from './revocations.js'
 import type { CredentialRow, Store } from './store.js'
@@ -59,6 +60,8 @@ export interface VerifyOptions {
   isRevoked?: (issuer: string, id: string) => boolean
   /** Needed to verify did:frenet signers; without it they are rejected. */
   resolveLog?: LogResolver
+  /** Needed to verify did:web signers; without it they are rejected. */
+  web?: WebDids
   /** Refuse signatures by superseded keys even if dated before the rotation. */
   strict?: boolean
 }
@@ -110,6 +113,11 @@ async function checkSignature (p: Parsed, typ: string, o: VerifyOptions): Promis
     if (!(await keyForSignature(st, seq, p.payload.iat * 1000, o.strict).verify(p.input, p.sig))) throw new Error('bad signature')
     return iss
   }
+  if (isWebDid(iss)) {
+    if (!o.web) throw new Error('cannot resolve did:web here')
+    if (!(await webKeyForKid(await o.web.resolve(iss), p.header.kid).verify(p.input, p.sig))) throw new Error('bad signature')
+    return iss
+  }
   const did = parseDidKey(iss).did
   if (!(await keyForKid(did, p.header.kid).verify(p.input, p.sig))) throw new Error('bad signature')
   return did
@@ -117,7 +125,7 @@ async function checkSignature (p: Parsed, typ: string, o: VerifyOptions): Promis
 
 const subjectDid = (sub: unknown): string => {
   if (typeof sub !== 'string') throw new Error('missing subject')
-  return isFrenetDid(sub) ? sub : parseDidKey(sub).did
+  return isFrenetDid(sub) || isWebDid(sub) ? sub : parseDidKey(sub).did
 }
 
 function checkJson (v: unknown, depth = 0): void {
@@ -164,7 +172,7 @@ export async function verifyCredential (jwt: unknown, opts: VerifyOptions = {}):
   } catch (e) { return { valid: false, error: msg(e) } }
 }
 
-export async function verifyRevocation (jwt: unknown, opts: Pick<VerifyOptions, 'resolveLog' | 'strict'> = {}): Promise<RevocationCheck> {
+export async function verifyRevocation (jwt: unknown, opts: Pick<VerifyOptions, 'resolveLog' | 'strict' | 'web'> = {}): Promise<RevocationCheck> {
   try {
     const p = parseJwt(jwt, MAX_REVOCATION_JWT)
     const issuer = await checkSignature(p, REVOCATION_TYP, opts)
@@ -220,6 +228,8 @@ export interface CredentialsOptions {
   logs?: IdentityLogs
   /** Revocation distribution (network). Without it, only locally imported statements count. */
   revocations?: Revocations
+  /** did:web resolver (network). Without it, did:web issuers are rejected. */
+  web?: WebDids
 }
 
 /** Issuer, holder and verifier operations for this node's identity key, backed by the local store. */
@@ -288,7 +298,7 @@ export class Credentials {
    */
   async verify (jwt: unknown, opts: { online?: boolean, strict?: boolean } = {}): Promise<CredentialCheck> {
     const online = opts.online !== false
-    const r = await verifyCredential(jwt, { isRevoked: this.isRevoked, resolveLog: this.resolver(online), ...(opts.strict ? { strict: true } : {}) })
+    const r = await verifyCredential(jwt, { isRevoked: this.isRevoked, resolveLog: this.resolver(online), ...(this.opts.web && online ? { web: this.opts.web } : {}), ...(opts.strict ? { strict: true } : {}) })
     if (r.valid && online && this.opts.revocations && await this.opts.revocations.lookup(r.credential.issuer, r.credential.id)) return { valid: false, error: 'revoked' }
     return r
   }
@@ -328,7 +338,7 @@ export class Credentials {
 
   /** Accept a signed revocation statement from any issuer. It only ever affects that issuer's own credentials. */
   async importRevocation (jwt: unknown): Promise<{ issuer: string, id: string }> {
-    const r = await verifyRevocation(jwt, { resolveLog: this.resolver(true) })
+    const r = await verifyRevocation(jwt, { resolveLog: this.resolver(true), ...(this.opts.web ? { web: this.opts.web } : {}) })
     if (!r.valid) throw new Error(`revocation rejected: ${r.error}`)
     if (this.opts.revocations) await this.opts.revocations.accept(r.issuer, r.id, jwt as string)
     else this.store.addRevocation(r.issuer, r.id, jwt as string)
@@ -336,7 +346,7 @@ export class Credentials {
   }
 
   /** Verifier for revocation statements, for the network handler (shares the DID resolver). */
-  checkRevocation = (jwt: unknown): Promise<RevocationCheck> => verifyRevocation(jwt, { resolveLog: this.resolver(true) })
+  checkRevocation = (jwt: unknown): Promise<RevocationCheck> => verifyRevocation(jwt, { resolveLog: this.resolver(true), ...(this.opts.web ? { web: this.opts.web } : {}) })
 
   /**
    * Present held credentials (by id) to a verifier. `nonce` is the verifier's challenge; short-lived by default. All
@@ -378,7 +388,7 @@ export class Credentials {
 
   async verifyPresentation (jwt: unknown, nonce: string, audience?: string, opts: { online?: boolean, strict?: boolean } = {}): Promise<PresentationCheck> {
     const online = opts.online !== false
-    const r = await verifyPresentation(jwt, { nonce, ...(audience !== undefined ? { audience } : {}), isRevoked: this.isRevoked, resolveLog: this.resolver(online), ...(opts.strict ? { strict: true } : {}) })
+    const r = await verifyPresentation(jwt, { nonce, ...(audience !== undefined ? { audience } : {}), isRevoked: this.isRevoked, resolveLog: this.resolver(online), ...(this.opts.web && online ? { web: this.opts.web } : {}), ...(opts.strict ? { strict: true } : {}) })
     if (r.valid && online && this.opts.revocations) {
       for (const c of r.credentials) if (await this.opts.revocations.lookup(c.issuer, c.id)) return { valid: false, error: `credential: revoked` }
     }

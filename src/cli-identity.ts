@@ -3,7 +3,10 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { createArchive, isArchive, restoreArchive } from './archive.js'
+import { didFromPublicKeyRaw } from './did.js'
+import { loadOrCreateIdentity } from './identity.js'
 import { verifyLog } from './identity-log.js'
+import { normalizeHandle, signHandleProof, validHandle } from './webid.js'
 import { combineShares, createBackup, describeKey, installKey, MAX_SHARES, MIN_PASSPHRASE, openBackup, readIdentityLog, readKeyFile, splitSecret } from './recovery.js'
 import { initRotation, rotateIdentity } from './rotation.js'
 
@@ -16,6 +19,7 @@ export const IDENTITY_COMMANDS = ['identity', 'backup', 'restore', 'recovery']
 const USAGE = `frenet identity [--data DIR]                         show peer ID and DID(s)
 frenet identity rotation-init --next-out FILE [--passphrase-file F]   make the identity rotatable (did:frenet); writes the offline NEXT-key backup
 frenet identity rotate --next-key FILE --next-out FILE2 [--log F] [--passphrase-file F] [--next-passphrase-file F]   rotate to the next key (also the recovery path for a lost/stolen key)
+frenet identity handle-proof alice@example.com [--data DIR]   print the entry to put in https://example.com/.well-known/frenet-names.json (signed by your did:key)
 frenet identity log [--data DIR]                                  print the public key log (keep a copy with your next-key backup)
 frenet backup --out FILE [--data DIR] [--passphrase-file F]       write a passphrase-encrypted backup of the key only
 frenet backup --full --out FILE [--blocks] [--data DIR]           key + messages, files, file links, names, communities, credentials (+ own blocks with --blocks)
@@ -102,6 +106,16 @@ export async function runIdentityCommand (cmd: string, argv: string[]): Promise<
         if (r.replaced) console.log(`Previous key kept at ${r.replaced}`)
         console.log(`New next-key backup written to ${values['next-out']}. The old next-key backup is now useless: destroy it.`)
         console.log('Start the node. Site names (<name>.<key>) belong to the old key and must be republished; peers learn of the rotation from the key log. If the old key was stolen, assume everything signed with it after the theft is suspect.')
+        return 0
+      }
+      if (sub === 'handle-proof') {
+        const handle = normalizeHandle(positionals[1] ?? '')
+        if (!validHandle(handle)) throw new Error('usage: frenet identity handle-proof local@domain')
+        const { key } = await loadOrCreateIdentity(data)
+        const did = didFromPublicKeyRaw(key.publicKey.raw)
+        const proof = await signHandleProof(key, handle, did)
+        console.log(JSON.stringify({ v: 1, names: { [handle.split('@')[0]!]: { did, proof } } }, null, 2))
+        console.log(`\nServe this (merge into an existing file) at https://${handle.split('@')[1]}/.well-known/frenet-names.json`, '\n')
         return 0
       }
       if (sub === 'log') {

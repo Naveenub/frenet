@@ -9,6 +9,7 @@ import { ContentBlocked, DAY_MS } from './blocks.js'
 import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
 import { didDocument, resolveDid, toDid } from './did.js'
+import { isWebDid, validHandle, normalizeHandle } from './webid.js'
 import { REPORT_CATEGORIES } from './moderation.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
 import type { FrenetNode } from './node.js'
@@ -154,7 +155,19 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'GET' && url.pathname === '/api/did/resolve') {
         // Accepts a DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network.
         const q = String(url.searchParams.get('did') ?? url.searchParams.get('peer') ?? '')
+        if (isWebDid(q.split('#')[0])) return json(res, 200, (await n.web.resolve(q.split('#')[0]!, { fresh: true })).document)   // did:web: fetched over HTTPS
         return json(res, 200, resolveDid(q.startsWith('did:') ? q : toDid(q)).document)
+      }
+      if (req.method === 'GET' && url.pathname === '/api/handle/resolve') {
+        // alice@example.com -> DID, via https://example.com/.well-known/frenet-names.json (see src/webid.ts)
+        return json(res, 200, await n.handles.resolve(String(url.searchParams.get('handle') ?? ''), { fresh: true, requireProof: url.searchParams.get('requireProof') === '1' }))
+      }
+      if (req.method === 'POST' && url.pathname === '/api/handle/proof') {
+        // Consent proof (signature by this node's did:key) for a handle you are about to publish at your own domain. The key never leaves the node.
+        const handle = normalizeHandle(String((await body(req)).handle ?? ''))
+        if (!validHandle(handle)) return json(res, 400, { error: 'invalid handle (local@domain)' })
+        const proof = await n.handleProof(handle)
+        return json(res, 200, { handle, did: n.keyDid, proof, entry: { [handle.split('@')[0]!]: { did: n.keyDid, proof } } })
       }
       if (req.method === 'GET' && url.pathname === '/api/credentials') return json(res, 200, { did: n.did, credentials: n.credentials.list(), revocations: n.store.listRevocations().length })
       if (req.method === 'POST' && url.pathname === '/api/credentials/issue') {
