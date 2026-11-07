@@ -26,7 +26,7 @@ const MIME: Record<string, string> = { '.html': 'text/html; charset=utf-8', '.js
  * Local control API. Binds to loopback only, rejects foreign Host headers (DNS rebinding)
  * and cross-origin state-changing requests (CSRF).
  */
-export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number): Promise<{ server: Server, port: number }> {
+export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatewayPort?: number, proxy?: { port: number, stats: () => unknown }): Promise<{ server: Server, port: number }> {
   const clients = new Set<ServerResponse>()
   const push = (event: string, data: unknown): void => {
     const line = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`
@@ -57,7 +57,7 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         if (streamUpload ? !ct.startsWith('application/octet-stream') : !ct.startsWith('application/json')) return json(res, 415, { error: streamUpload ? 'octet-stream only' : 'json only' })
       }
 
-      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort))
+      if (req.method === 'GET' && url.pathname === '/api/status') return json(res, 200, await status(n, gatewayPort, proxy))
       if (req.method === 'GET' && url.pathname === '/api/peers') return json(res, 200, await peers(n))
       if (req.method === 'GET' && url.pathname === '/api/messages') {
         return json(res, 200, n.store.list(url.searchParams.get('peer') ?? undefined))
@@ -300,7 +300,7 @@ async function body (req: IncomingMessage, max = 64 * 1024): Promise<Record<stri
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}')
 }
 
-async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
+async function status (n: FrenetNode, gatewayPort?: number, proxy?: { port: number, stats: () => unknown }): Promise<unknown> {
   const l = n.libp2p
   const dht = (l.services as any).dht
   return {
@@ -309,6 +309,7 @@ async function status (n: FrenetNode, gatewayPort?: number): Promise<unknown> {
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
     gatewayPort: gatewayPort ?? null,
+    proxy: proxy ? { port: proxy.port, httpsOnly: true, ...(proxy.stats() as object) } : null,
     nat: {
       enabled: !!(l.services as any).autonat,
       relayServer: !!(l.services as any).relay,

@@ -16,7 +16,7 @@ import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
 import { base32 } from 'multiformats/bases/base32'
 import { isPeerId } from './channel.js'
-import { loadOrCreateIdentity } from './identity.js'
+import { assertEd25519, loadOrCreateIdentity } from './identity.js'
 import { IdentityLogs, verifyLog, type IdentityState } from './identity-log.js'
 import { readIdentityLog } from './recovery.js'
 import { Revocations } from './revocations.js'
@@ -37,6 +37,11 @@ import { Sites } from './sites.js'
 import { Store } from './store.js'
 import { meetsIdentityWork, SybilGuard } from './sybil.js'
 import { frenetKeyResolver, ZkAuth } from './zkauth.js'
+
+/** DHT value records are not part of FRENET: the DHT only maps CIDs to the peers that hold them. */
+export async function noValueRecords (): Promise<never> {
+  throw new Error('FRENET DHT stores provider records only; value records are refused')
+}
 
 export interface FrenetOptions {
   dataDir: string | ':memory:'
@@ -123,7 +128,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   let privateKey
   if (opts.dataDir === ':memory:') {
     const { generateKeyPair } = await import('@libp2p/crypto/keys')
-    privateKey = opts.privateKey ?? await generateKeyPair('Ed25519')
+    privateKey = assertEd25519(opts.privateKey ?? await generateKeyPair('Ed25519'))
   } else {
     privateKey = (await loadOrCreateIdentity(opts.dataDir)).key
   }
@@ -179,7 +184,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     dht: kadDHT({
       protocol: '/frenet/kad/1.0.0',
       clientMode: profile === 'mobile',
-      peerInfoMapper: passthroughMapper
+      peerInfoMapper: passthroughMapper,
+      // Provider records only. kad-dht ships a default validator for "/pk/" value records and would store them on request;
+      // replace it with a refusal so this node never accepts or serves arbitrary DHT values (no value store, no storage abuse).
+      validators: { pk: noValueRecords },
+      selectors: { pk: noValueRecords }
     })
   }
   if (useNat) {

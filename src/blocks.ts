@@ -45,8 +45,8 @@ export function cidFor (data: Uint8Array): CID {
   return CID.createV1(raw.code, createDigest(SHA256, createHash('sha256').update(data).digest()))
 }
 
-function verify (cid: CID, data: Uint8Array): boolean {
-  return cid.multihash.code === SHA256 && Buffer.from(cid.multihash.digest).equals(createHash('sha256').update(data).digest())
+export function verify (cid: CID, data: Uint8Array): boolean {
+  return cid.version === 1 && cid.code === raw.code && cid.multihash.code === SHA256 && Buffer.from(cid.multihash.digest).equals(createHash('sha256').update(data).digest())
 }
 
 /**
