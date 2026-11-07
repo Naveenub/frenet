@@ -72,6 +72,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS blocks (cid TEXT PRIMARY KEY, data BLOB NOT NULL, ts INTEGER NOT NULL, expires INTEGER);
       CREATE TABLE IF NOT EXISTS names (name TEXT NOT NULL, pub TEXT NOT NULL, seq INTEGER NOT NULL, own INTEGER NOT NULL DEFAULT 0, seen INTEGER NOT NULL, record TEXT NOT NULL, PRIMARY KEY (name, pub));
       CREATE TABLE IF NOT EXISTS files (cid TEXT PRIMARY KEY, name TEXT NOT NULL, size INTEGER NOT NULL, chunks TEXT NOT NULL, encrypted INTEGER NOT NULL, created INTEGER NOT NULL, expires INTEGER);
+      CREATE TABLE IF NOT EXISTS admin_log (id INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER NOT NULL, peer TEXT NOT NULL, cmd TEXT NOT NULL, ok INTEGER NOT NULL, detail TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS bans (peer TEXT PRIMARY KEY, reason TEXT NOT NULL, ts INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, owner TEXT NOT NULL, name TEXT NOT NULL, seq INTEGER NOT NULL, members TEXT NOT NULL, state TEXT NOT NULL CHECK (state IN ('invited','joined','removed','left')), updated INTEGER NOT NULL);
       CREATE TABLE IF NOT EXISTS group_events (community TEXT NOT NULL, id TEXT NOT NULL, kind TEXT NOT NULL, author TEXT NOT NULL, ts INTEGER NOT NULL, body TEXT NOT NULL, sig TEXT NOT NULL, meta TEXT, PRIMARY KEY (community, id));
@@ -346,6 +347,15 @@ export class Store {
   deleteReputation (peer: string): void { this.db.prepare('DELETE FROM reputation WHERE peer = ?').run(peer) }
   listReputation (): PeerReputation[] {
     return (this.db.prepare('SELECT * FROM reputation').all() as any[]).map((r) => ({ peer: r.peer, score: Number(r.score), good: Number(r.good), bad: Number(r.bad), strikes: Number(r.strikes), blockedUntil: r.blocked_until == null ? null : Number(r.blocked_until), lastReason: r.last_reason, updated: Number(r.updated) }))
+  }
+
+  /** Audit trail of remote administration commands that passed authentication (newest 1000 kept). */
+  addAdminLog (peer: string, cmd: string, ok: boolean, detail: string): void {
+    this.db.prepare('INSERT INTO admin_log (ts, peer, cmd, ok, detail) VALUES (?, ?, ?, ?, ?)').run(Date.now(), peer, cmd, ok ? 1 : 0, detail)
+    this.db.prepare('DELETE FROM admin_log WHERE id <= (SELECT MAX(id) FROM admin_log) - 1000').run()
+  }
+  listAdminLog (limit = 100): Array<{ ts: number, peer: string, cmd: string, ok: boolean, detail: string }> {
+    return (this.db.prepare('SELECT * FROM admin_log ORDER BY id DESC LIMIT ?').all(Math.min(Math.max(1, limit), 1000)) as any[]).map((r) => ({ ts: Number(r.ts), peer: r.peer, cmd: r.cmd, ok: Number(r.ok) === 1, detail: r.detail }))
   }
 
   /** Highest update manifest sequence accepted per channel (rollback protection). */

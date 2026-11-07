@@ -19,7 +19,8 @@
 - Real browser WebRTC media, NAT traversal and QUIC behind NATs are untested.
 - Reputation thresholds and proof-of-work levels are untuned guesses.
 - Equivocation by a community owner (different rosters to different members) is not detected.
-- Update trust roots cannot be rotated; there is no installer.
+- Update trust roots cannot be rotated. The installer (`src/installer.ts`) replaces files atomically but does not unpack or run anything; its path handling, backup/rollback and https-only fetching are new and unreviewed.
+- Remote administration (`src/admin.ts`) is new: signed requests, replay window and the command allow-list need review; admin peers bypass auto-blocking by design.
 - A `did:key` cannot be rotated or revoked (use `did:frenet`).
 - `did:web` and handles (`src/webid.ts`) trust DNS and TLS; they fetch attacker-influenced URLs (SSRF guard in `isNonPublicAddress`/`httpsJson`, no live-network test: handle pins are per node (TOFU); review the DNS-rebinding window between lookup and connect, which is closed by connecting to the vetted IP).
 

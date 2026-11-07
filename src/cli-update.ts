@@ -1,19 +1,24 @@
-import { closeSync, existsSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { closeSync, existsSync, mkdirSync, openSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, join } from 'node:path'
 import { parseArgs } from 'node:util'
 import { privateKeyFromProtobuf, privateKeyToProtobuf } from '@libp2p/crypto/keys'
+import { fetchUpdate, installStaged, rollbackLast } from './installer.js'
 import { Store } from './store.js'
 import { generateReleaseKey, MAX_VALIDITY_MS, sha256Hex, signManifest, Updates, validateRoots, verifyArtifact, type TrustRoots, type UpdateManifest } from './updates.js'
 
 /**
- * `frenet update keygen | manifest | sign | verify`. Verification never installs anything; it answers one question:
+ * `frenet update keygen | manifest | sign | verify | fetch | install | rollback`. verify never installs anything; it answers one question:
  * "are these bytes the release the maintainers signed, and is it newer than what I accepted before?"
  */
 const USAGE = `frenet update keygen --out KEYFILE                      new release signing key (prints its did:key)
 frenet update manifest --version X.Y.Z --seq N [--channel stable] [--days 30] [--notes TEXT] --out FILE ARTIFACT...
 frenet update sign --key KEYFILE --in MANIFEST_OR_ENVELOPE --out ENVELOPE      add this key's signature (repeat for each signer)
 frenet update verify ENVELOPE [--roots FILE] [--channel stable] [--current X.Y.Z] [--artifact FILE]... [--accept] [--data DIR]
+frenet update fetch --url BASE_URL [--roots FILE] [--channel stable] [--data DIR]       download + verify into <data>/updates/staged (https only)
+frenet update install --staged DIR --target DIR [--roots FILE] [--channel stable] [--data DIR]   verify again, back up, replace files atomically, record acceptance
+frenet update rollback --target DIR [--data DIR]                                         restore the files of the latest install
+  nothing here unpacks, runs or restarts anything; restart the node yourself after install
   roots file: {"threshold": 2, "keys": ["did:key:z...", ...]}   default <data>/update-roots.json; with none, everything is refused`
 
 const here = (rel: string): string => new URL(rel, import.meta.url).pathname
@@ -31,7 +36,7 @@ export async function runUpdateCommand (argv: string[]): Promise<number> {
       out: { type: 'string' }, key: { type: 'string' }, in: { type: 'string' }, roots: { type: 'string' },
       channel: { type: 'string', default: 'stable' }, current: { type: 'string' }, artifact: { type: 'string', multiple: true },
       version: { type: 'string' }, seq: { type: 'string' }, days: { type: 'string', default: '30' }, notes: { type: 'string' },
-      accept: { type: 'boolean', default: false },
+      accept: { type: 'boolean', default: false }, url: { type: 'string' }, staged: { type: 'string' }, target: { type: 'string' },
       data: { type: 'string', default: process.env.FRENET_DATA ?? join(homedir(), '.frenet') },
       help: { type: 'boolean', short: 'h', default: false }
     }
@@ -99,6 +104,34 @@ export async function runUpdateCommand (argv: string[]): Promise<number> {
           if ((values.artifact ?? []).length < r.manifest.artifacts.length) throw new Error('--accept needs every listed artifact to be passed with --artifact and verified')
           if (existsSync(values.data!)) { updates.accept(r.manifest); console.log('recorded: older releases on this channel will now be refused') }
           else console.log('note: data dir not found, rollback state was not recorded')
+        }
+      } finally { store.close() }
+      return 0
+    }
+    if (sub === 'fetch' || sub === 'install' || sub === 'rollback') {
+      if (sub === 'rollback') {
+        if (!values.target) throw new Error('usage: frenet update rollback --target DIR')
+        const r = await rollbackLast({ target: values.target, dataDir: values.data! })
+        console.log(`rolled back ${r.version}: restored ${r.restored.length} file(s)${r.skipped.length ? `; left alone because they changed since install: ${r.skipped.join(', ')}` : ''}`)
+        return 0
+      }
+      const rootsFile = values.roots ?? join(values.data!, 'update-roots.json')
+      if (!existsSync(rootsFile)) throw new Error(`no trust roots at ${rootsFile}; pin them first (everything is refused without them)`)
+      const roots = validateRoots(JSON.parse(readFileSync(rootsFile, 'utf8')))
+      mkdirSync(values.data!, { recursive: true, mode: 0o700 })
+      const store = new Store(values.data!)
+      try {
+        const updates = new Updates(store, roots, values.current ?? runningVersion())
+        if (sub === 'fetch') {
+          if (!values.url) throw new Error('usage: frenet update fetch --url BASE_URL')
+          const r = await fetchUpdate({ baseUrl: values.url, dataDir: values.data!, updates, channel: values.channel })
+          console.log(`VERIFIED and staged ${r.manifest.channel} ${r.manifest.version} (seq ${r.manifest.seq}), ${r.signers.length} trusted signature(s), ${r.files.length} file(s) in ${r.dir}`)
+          console.log(`next: frenet update install --staged ${r.dir} --target DIR`)
+        } else {
+          if (!values.staged || !values.target) throw new Error('usage: frenet update install --staged DIR --target DIR')
+          const r = await installStaged({ stagedDir: values.staged, target: values.target, dataDir: values.data!, updates, channel: values.channel })
+          console.log(`installed ${r.version} (seq ${r.seq}): ${r.installed.join(', ')}; backup of ${r.replaced.length} replaced file(s) in ${r.backup}`)
+          console.log('recorded: older releases on this channel are now refused. Restart the node to run the new files; undo with: frenet update rollback')
         }
       } finally { store.close() }
       return 0

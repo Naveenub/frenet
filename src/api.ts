@@ -219,6 +219,13 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
       if (req.method === 'POST' && url.pathname === '/api/operator/disconnect') { await n.operator.disconnect((await body(req)).peer); return json(res, 200, { ok: true }) }
       if (req.method === 'POST' && url.pathname === '/api/operator/sweep') return json(res, 200, { removed: n.operator.sweep() })
       if (req.method === 'POST' && url.pathname === '/api/operator/reannounce') return json(res, 200, await n.blocks.reannounce())
+      // Remote administration (see admin.ts): this node acting as an admin of another, and the audit log of who administered this one.
+      if (req.method === 'GET' && url.pathname === '/api/admin') return json(res, 200, { enabled: n.admin.enabled, admins: [...n.admin.admins], log: n.store.listAdminLog(100) })
+      if (req.method === 'POST' && url.pathname === '/api/admin/remote') {
+        const b = await body(req)
+        const args = b.args && typeof b.args === 'object' && !Array.isArray(b.args) ? b.args as Record<string, unknown> : {}
+        return json(res, 200, { result: await n.admin.call(String(b.peer), b.cmd as any, args, b.addr ? { addr: String(b.addr) } : {}) })
+      }
       // Content safety: local reports and the operator's blocklist (see Moderation).
       if (req.method === 'GET' && url.pathname === '/api/moderation') return json(res, 200, { categories: REPORT_CATEGORIES, blocklist: n.moderation.list(), reports: n.moderation.listReports() })
       if (req.method === 'POST' && url.pathname === '/api/moderation/report') {
@@ -317,6 +324,8 @@ async function status (n: FrenetNode, gatewayPort?: number, proxyPort?: number):
   return {
     peerId: l.peerId.toString(),
     did: n.did,
+    profile: n.profile,
+    remoteAdmin: n.admin.enabled,
     addresses: l.getMultiaddrs().map(String),
     connections: l.getConnections().length,
     gatewayPort: gatewayPort ?? null,

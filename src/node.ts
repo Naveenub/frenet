@@ -12,13 +12,15 @@ import { ping } from '@libp2p/ping'
 import { tcp } from '@libp2p/tcp'
 import { uPnPNAT } from '@libp2p/upnp-nat'
 import { createLibp2p } from 'libp2p'
-import { peerIdFromString } from '@libp2p/peer-id'
+import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
 import { base32 } from 'multiformats/bases/base32'
+import { isPeerId } from './channel.js'
 import { loadOrCreateIdentity } from './identity.js'
 import { IdentityLogs, verifyLog, type IdentityState } from './identity-log.js'
 import { readIdentityLog } from './recovery.js'
 import { Revocations } from './revocations.js'
+import { Admin } from './admin.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
 import { Credentials, type RevocationCheck } from './credentials.js'
@@ -69,6 +71,14 @@ export interface FrenetOptions {
   reannounceMs?: number
   /** Delay before the first re-announce after start, ms (default 30 s). */
   reannounceDelayMs?: number
+  /** Peer IDs allowed to administer this node remotely (ban, unban, disconnect, sweep, re-announce, blocklist, stats). Empty = remote administration is off and its protocol is not registered. */
+  adminPeers?: string[]
+  /**
+   * `mobile`: a low-resource preset for phones and other small devices (for example Node.js under Termux): at most 24
+   * connections, DHT client mode (announces and fetches, does not serve other peers' DHT queries), no relay server.
+   * It is a configuration of this same node, not an app.
+   */
+  profile?: 'default' | 'mobile'
   /** Only meaningful with dataDir ':memory:' (tests, embedding): use this key instead of a fresh random one. */
   privateKey?: PrivateKey
 }
@@ -84,6 +94,8 @@ export interface FrenetNode {
   calls: Calls
   groups: Groups
   operator: Operator
+  admin: Admin
+  profile: 'default' | 'mobile'
   moderation: Moderation
   /** Per-origin permission grants for sites served by the gateway (default: everything off). */
   permissions: SitePermissions
@@ -127,6 +139,11 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   }
 
   if (opts.reannounceMs !== undefined && !(Number.isFinite(opts.reannounceMs) && opts.reannounceMs >= 0)) throw new Error('reannounceMs must be a number >= 0 (0 turns re-announcing off)')
+  for (const a of opts.adminPeers ?? []) if (!isPeerId(a)) throw new Error(`invalid admin peer ID "${a}"`)   // before anything is opened
+  if ((opts.adminPeers ?? []).includes(peerIdFromPrivateKey(privateKey as any).toString())) throw new Error('this node cannot be its own remote admin')
+  const profile = opts.profile ?? 'default'
+  if (profile !== 'default' && profile !== 'mobile') throw new Error('profile must be "default" or "mobile"')
+  if (profile === 'mobile' && opts.relayServer) throw new Error('the mobile profile cannot run a relay server (it is rarely reachable and relaying drains battery and data)')
   const iceServers = opts.iceServers ?? []
   for (const s of iceServers) if (!/^stuns?:[A-Za-z0-9.:[\]-]{1,200}$/.test(s)) throw new Error(`invalid ICE server "${s}" (use stun:host[:port] or stuns:host[:port])`)
   const banned = new Set<string>()
@@ -150,6 +167,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   // Bootstrap peers and relays are dialed at startup (relays so the reservation can be made).
   const boot = [...(opts.bootstrap ?? []), ...relays]
   // Operator-chosen bootstrap/relay peers are exempt from the proof-of-work rule and from auto-blocking (still scored).
+  for (const a of opts.adminPeers ?? []) reputation.trusted.add(a)   // an operator-chosen admin is never auto-blocked or held to the PoW rule (still scored; a manual ban still applies)
   for (const a of boot) { const m = /\/p2p\/([^/]+)/.exec(a); if (m) reputation.trusted.add(m[1]!) }
   const refused = (p: { toString: () => string }): boolean => banned.has(p.toString()) || reputation.isBlocked(p.toString())
   const workOk = (p: { toString: () => string, publicKey?: { raw: Uint8Array } }): boolean => reputation.trusted.has(p.toString()) || meetsIdentityWork(p.publicKey?.raw, minBits)
@@ -160,7 +178,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     ping: ping(),
     dht: kadDHT({
       protocol: '/frenet/kad/1.0.0',
-      clientMode: false,
+      clientMode: profile === 'mobile',
       peerInfoMapper: passthroughMapper
     })
   }
@@ -195,6 +213,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
       denyOutboundEncryptedConnection: (p) => refused(p) || !workOk(p),
       denyInboundRelayReservation: (p) => refused(p)
     },
+    ...(profile === 'mobile' ? { connectionManager: { maxConnections: 24 } } : {}),
     peerDiscovery,
     services
   })
@@ -215,6 +234,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const calls = new Calls(libp2p, privateKey)
   const groups = new Groups(libp2p, store, privateKey)
   const operator = new Operator(libp2p, store, banned, { reputation, sybil, minIdentityBits: minBits })
+  const admin = new Admin(libp2p, store, privateKey, { operator, moderation, blocks }, opts.adminPeers)
   const identityLogs = new IdentityLogs(libp2p, store)
   const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
   const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations })
@@ -230,6 +250,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   messaging.on('dropped', dropped('msg'))
   calls.on('dropped', dropped('call'))
   groups.on('dropped', dropped('group'))
+  admin.on('dropped', dropped('admin'))
   messaging.on('message', (m) => report(m.peer, 'valid-message'))
   blocks.report = report
   names.report = report
@@ -244,6 +265,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   await messaging.start()
   await calls.start()
   await groups.start()
+  await admin.start()
   await blocks.start()
   await names.start()
   if (identity) await identityLogs.adopt(identity.events, true)
@@ -269,6 +291,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     calls,
     groups,
     operator,
+    admin,
+    profile,
     moderation,
     permissions: new SitePermissions(store),
     trackers: new TrackerBlocker(store),
@@ -288,6 +312,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
       await messaging.stop()
       await calls.stop()
       await groups.stop()
+      await admin.stop()
       await blocks.stop()
       await names.stop()
       await identityLogs.stop()
