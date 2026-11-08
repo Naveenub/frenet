@@ -52,12 +52,14 @@ describe('real two-node network (loopback TCP + Noise + yamux)', () => {
     const a = await track({ dataDir: ':memory:', listen: L, mdns: false })
     const b = await track({ dataDir: ':memory:', listen: L, mdns: false })
     const dropped: string[] = []
+    // Frozen clock: with real time, refill (2/s) during a slow run lets extra messages through and the count drifts.
+    ;(b.messaging as any).limiter = new RateLimiter(20, 2, () => 0)
     b.messaging.on('dropped', (d) => dropped.push(d.reason))
     await a.libp2p.dial(b.libp2p.getMultiaddrs()[0])
     for (let i = 0; i < 40; i++) await a.messaging.send(b.libp2p.peerId, `m${i}`).catch(() => {})
     await waitFor(() => dropped.includes('rate-limited'))
     await new Promise((r) => setTimeout(r, 200))
-    assert.ok(b.store.count().in <= 21 && b.store.count().in >= 20)
+    assert.equal(b.store.count().in, 20)
   })
 })
 
