@@ -31,6 +31,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |
 | Decentralized sites: publish a static folder (<= 64 files, 2 GiB total, 1 GiB per file; files over a few MB go in through `PUT /api/files/stream?encrypt=false` and are referenced by `cid` in `POST /api/sites`, and the gateway streams them), content-addressed, served by a local gateway on an isolated per-site origin (`<site-id>.localhost`) with a no-third-party CSP; dashboard Browser view | working, tested (publish on A, serve via B over the DHT) |
+| Decentralized browser: HTTPS browsing, tracker blocking, permission manager | **HTTPS browsing:** local HTTPS-only CONNECT proxy (`127.0.0.1:7779`, PAC at `/proxy.pac`, `--proxy-port`, `--no-proxy`). TLS is tunnelled end to end (no decryption, no installed certificate, no history kept); plain HTTP refused; only port 443; hosts are resolved here and every answer must be public, so a page cannot reach the control API, a router or a LAN service (`--proxy-allow-private` to opt out); optional SOCKS5 upstream such as Tor (`--proxy-upstream`). **Tracker blocking:** by host name before any DNS lookup, built-in list plus your own block/allow rules (allow wins) plus import of hosts-format or Adblock domain lists you supply (the node never downloads one). **Permission manager:** every FRENET site starts with camera, microphone, geolocation, fullscreen, clipboard-write and display-capture off; grant or revoke per origin (`site:<id>` or `name:<name>.<key>`) in the dashboard, enforced through the gateway's `Permissions-Policy`; the browser's own prompt still applies | working, tested (`test/browser.test.ts`: tunnelling, tracker refusal before DNS, private-target refusal, SOCKS5 upstream, grants and revokes, API with CSRF protection, persistence); dashboard **Decentralized Browser** view shows proxy status, tracker rules and permission grants. **Limits:** cannot block by URL or strip cookies (no decryption); the built-in tracker list is short and will miss most trackers (import a maintained list); name grants follow the name to every version its publisher signs; tested on loopback against local TLS stand-ins and an injected SOCKS5 server, **not against a live Tor or a large set of real sites** |
 | Voice/video: WebRTC calls from the dashboard, signed signalling over `/frenet/call/1.0.0` (ephemeral, rate limited, accept/decline) | signalling tested on two real nodes; dashboard call flow tested only with a stubbed WebRTC stack, so **real camera/microphone media across browsers and NATs is untested**. `--ice-server turn:HOST` with `--turn-username` / `--turn-credential` (or `FRENET_TURN_CREDENTIAL`) hands a TURN server to the dashboard; the config is validated and tested, **relayed media through a real TURN server is not**, and FRENET does not run a TURN server. No group calls |
 | Communities + group chat: owner-managed signed rosters, invitations need explicit join, signed messages fanned out to members (`/frenet/group/1.0.0`), **end-to-end encrypted** to the roster at send time (per-message key wrapped for each member) | working, tested (3 nodes). Chat messages and roster invitations for members who were unreachable are queued on the sender's node and retried for up to 7 days (a queued chat message is dropped if the member has since left or been removed); governance events are **not** queued because their deadlines depend on the clock window. Missed chat is recovered by **history sync** (`/frenet/group-sync/1.0.0`): on connect, and via `POST /api/communities/sync`, a member asks other members for chat sealed to them that they lack (7 days, 200 messages). Governance events are not synced, so a member who was offline can still miss them. Not tested across real networks; no forward secrecy (a stolen identity key opens every message addressed to it); a member added later cannot read earlier chat |
 | Governance: signed proposals, one-member-one-vote ballots, frozen electorate, quorum, tally verifiable by any node; transitive delegated voting; discussion period, comments, withdrawal; **binding** proposals (rename, add or remove members) applied only after every node re-verifies the signed ballots | working, tested (including across real peers). Advisory proposals still change nothing; no history sync, so a node that missed events can disagree; the owner stays a trusted party for invitations; weighted voting, secret ballots and a community-wide governance charter are not built |
@@ -53,11 +54,9 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
-## Scope: deliberately not built
+## Scope
 
-These are **not in the spec's feature list**, so their absence is not a gap or a to-do:
-
-- **General web browsing.** The Decentralized Browser section is only the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`). It does not browse the public web, so there is no HTTPS browsing, no tracker blocking and no permission manager. (Published sites are already locked down by a no-third-party CSP and a deny-all `Permissions-Policy`; that is site hardening, not a browser feature.)
+The Decentralized Browser section covers three things: the gateway for FRENET sites (`<site-id>.localhost`, `<name>.<publisher-key>.localhost`), HTTPS browsing through a local proxy, and the user-facing tracker blocker and permission manager (see the status table). What it does **not** do: filter by URL or page content (TLS is tunnelled, never decrypted), anonymise you (sites and your network still see your IP unless you set `--proxy-upstream`), or render the public web inside the dashboard. You use your own browser, pointed at the proxy.
 
 ## Privacy and data ownership
 
@@ -88,6 +87,16 @@ Publish a folder from the dashboard (**Decentralized Browser**) or via `POST /ap
 Sites are **public**: no encryption, anyone with the ID can read them. The ID is the hash of the site manifest, so the content cannot be swapped.
 Open `http://<site-id>.localhost:7778/` (the gateway fetches from peers and verifies hashes). Sites can only load their own files (no third-party requests, no framing)
 and each has its own browser origin. `--gateway-port N` / `--no-gateway`. Limits: static files only.
+
+### HTTPS browsing, tracker blocking, permissions
+
+```bash
+npm start                                  # proxy on 127.0.0.1:7779
+# browser proxy auto-config URL: http://127.0.0.1:7779/proxy.pac
+npm start -- --proxy-upstream socks5://127.0.0.1:9050   # optional: route web traffic through Tor
+```
+
+Regular HTTPS sites load through the proxy with known trackers refused; `*.localhost` FRENET sites go straight to the gateway. Manage tracker rules and per-site permissions in the dashboard under **Decentralized Browser**. `--proxy-port N` / `--no-proxy` / `--proxy-allow-private`.
 
 ### Names, updates and search
 

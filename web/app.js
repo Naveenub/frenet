@@ -197,6 +197,79 @@ function gatewayUrl (gw, input) {
 }
 
 function browser (v) {
+  const sites = el('div'); const web = el('div'); v.append(web, sites)
+  sitesPanel(sites)
+  webPanel(web)
+}
+
+// HTTPS browsing through the local proxy, tracker blocking, and per-site permissions (all live data from /api/browser).
+async function webPanel (v) {
+  let r
+  try { r = await api('/api/browser') } catch (e) { v.append(el('p', { className: 'err' }, e.message)); return }
+  const draw = (r) => {
+    v.replaceChildren()
+    const px = r.proxy
+    const proxyCard = el('div', { className: 'card' }, el('h3', {}, 'HTTPS browsing'))
+    if (!px.port) proxyCard.append(el('p', { className: 'dim' }, 'The web proxy is off. Restart the node without --no-proxy to browse HTTPS sites through FRENET.'))
+    else {
+      const pac = `http://127.0.0.1:${px.port}/proxy.pac`
+      proxyCard.append(
+        el('p', { className: 'dim' }, 'Point your browser at this proxy and normal HTTPS sites load as usual, with trackers refused. FRENET sites on *.localhost bypass it. TLS is tunnelled end to end: nothing is decrypted, no certificate is installed, no browsing history is kept.'),
+        el('div', { className: 'row' }, el('span', {}, 'Proxy auto-config'), el('div', { className: 'mono' }, pac)),
+        el('div', { className: 'row' }, el('span', {}, 'Manual proxy (HTTPS)'), el('div', { className: 'mono' }, `127.0.0.1:${px.port}`)),
+        el('div', { className: 'grid' }, stat('Active tunnels', px.active ?? 0), stat('Tunnels opened', px.tunnels ?? 0), stat('Trackers blocked', px.trackersBlocked ?? 0), stat('Refused (private / port / http)', `${px.refusedPrivate ?? 0} / ${px.refusedPort ?? 0} / ${px.refusedHttp ?? 0}`)),
+        px.upstream ? el('p', { className: 'dim' }, `Upstream: ${px.upstream} (host names are resolved there, not on this machine).`) : el('p', { className: 'dim' }, 'Not an anonymity tool: sites and your network still see your IP. Start the node with --proxy-upstream socks5://127.0.0.1:9050 to route through Tor.'))
+    }
+    v.append(proxyCard)
+
+    const t = r.trackers
+    const tmsg = el('p', { className: 'err' })
+    const run = async (path, body) => { tmsg.textContent = ''; try { draw(await api(path, body)) } catch (e) { tmsg.textContent = e.message } }
+    const host = el('input', { placeholder: 'domain, e.g. ads.example.com', 'aria-label': 'Tracker domain' })
+    const imp = el('textarea', { rows: 4, placeholder: 'Paste a hosts-format or Adblock domain list you downloaded yourself (the node never fetches lists)', 'aria-label': 'Blocklist text' })
+    const tc = el('div', { className: 'card' }, el('h3', {}, 'Tracker blocking'),
+      el('p', { className: 'dim' }, `Blocks by host name before any DNS lookup, using ${t.builtinCount} built-in domains plus your rules. An allow rule always wins, so a broken site can be fixed. It cannot filter by URL or content because TLS is not decrypted. The built-in list is short; import a maintained list for broader cover.`),
+      el('div', { className: 'grid' }, stat('Blocked this session', t.blocked), stat('Your rules', t.ruleCount), stat('Allow overrides used', t.allowedOverrides)),
+      el('div', { className: 'row' }, host,
+        el('button', { className: 'btn', type: 'button', onclick: () => run('/api/browser/trackers', { host: host.value, action: 'block' }) }, 'Block'),
+        el('button', { className: 'btn', type: 'button', onclick: () => run('/api/browser/trackers', { host: host.value, action: 'allow' }) }, 'Allow')),
+      el('div', { className: 'row' }, imp, el('button', { className: 'btn', type: 'button', onclick: async () => {
+        tmsg.textContent = ''
+        try { const j = await api('/api/browser/trackers/import', { text: imp.value }); draw(j); const m = el('p', { className: 'dim' }, `Imported ${j.imported.added} domains, skipped ${j.imported.skipped}.`); v.prepend(m) } catch (e) { tmsg.textContent = e.message }
+      } }, 'Import list')), tmsg)
+    if (t.rules.length) {
+      const rows = el('div')
+      for (const x of t.rules) rows.append(el('div', { className: 'row' }, el('span', { className: 'mono' }, x.host), el('span', { className: 'dim' }, x.action), el('button', { className: 'btn', type: 'button', onclick: () => run('/api/browser/trackers', { host: x.host, action: 'remove' }) }, 'Remove')))
+      tc.append(el('h4', {}, t.ruleCount > t.rules.length ? `Your rules (first ${t.rules.length} of ${t.ruleCount})` : 'Your rules'), rows,
+        el('div', { className: 'row' },
+          el('button', { className: 'btn', type: 'button', onclick: () => run('/api/browser/trackers/clear', { action: 'block' }) }, 'Clear all block rules'),
+          el('button', { className: 'btn', type: 'button', onclick: () => run('/api/browser/trackers/clear', { action: 'allow' }) }, 'Clear all allow rules')))
+    }
+    if (t.recent.length) {
+      tc.append(el('h4', {}, 'Recently refused (memory only, never saved)'), ...t.recent.slice(0, 10).map((x) => el('div', { className: 'mono' }, `${x.host}  ←  ${x.rule}`)))
+    }
+    v.append(tc)
+
+    const pmsg = el('p', { className: 'err' })
+    const prun = async (path, body) => { pmsg.textContent = ''; try { draw(await api(path, body)) } catch (e) { pmsg.textContent = e.message } }
+    const origin = el('input', { placeholder: 'site:<id> or name:<name>.<publisher-key>', 'aria-label': 'Site origin' })
+    const feat = el('select', { 'aria-label': 'Permission' }, ...r.permissions.features.map((f) => el('option', { value: f }, f)))
+    const pc = el('div', { className: 'card' }, el('h3', {}, 'Site permissions'),
+      el('p', { className: 'dim' }, 'Every FRENET site starts with all powerful features off. A grant lets that one site’s own page ask; your browser still shows its own prompt, so you can still say no. Grants never reach embedded frames. A name: grant follows the name to every version its publisher signs, so grant only to publishers you trust.'),
+      el('div', { className: 'row' }, origin, feat, el('button', { className: 'btn', type: 'button', onclick: () => prun('/api/browser/permissions/grant', { origin: origin.value.trim(), feature: feat.value }) }, 'Grant')), pmsg)
+    if (!r.permissions.origins.length) pc.append(el('p', { className: 'dim' }, 'No grants: every site is denied everything.'))
+    for (const o of r.permissions.origins) {
+      pc.append(el('div', { className: 'card' }, el('div', { className: 'mono' }, o.origin),
+        ...o.grants.map((g) => el('div', { className: 'row' }, el('span', {}, g.feature), el('span', { className: 'dim' }, `since ${new Date(g.since).toLocaleString()}`),
+          el('button', { className: 'btn', type: 'button', onclick: () => prun('/api/browser/permissions/revoke', { origin: o.origin, feature: g.feature }) }, 'Revoke'))),
+        el('button', { className: 'btn', type: 'button', onclick: () => prun('/api/browser/permissions/reset', { origin: o.origin }) }, 'Revoke all')))
+    }
+    v.append(pc)
+  }
+  draw(r)
+}
+
+function sitesPanel (v) {
   const gw = state.status.gatewayPort
   if (!gw) { v.append(el('div', { className: 'card' }, el('h3', {}, 'Gateway is off'), el('p', { className: 'dim' }, 'Restart the node without --no-gateway to publish and open sites.'))); return }
   const pick = el('input', { type: 'file', multiple: true, webkitdirectory: true, 'aria-label': 'Site folder' })
