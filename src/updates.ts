@@ -15,12 +15,12 @@ import type { Store } from './store.js'
  *   - its sequence number is not lower than the highest one this node has accepted, and its version is not
  *     lower than the running version (rollback / downgrade protection),
  *   - every artifact byte stream matches the signed size and SHA-256.
- * Nothing here downloads or installs anything: it decides whether bytes that arrived by any channel
+ * Nothing in this file downloads or installs anything (that is `installer.ts`, operator-initiated only): it decides whether bytes that arrived by any channel
  * (HTTPS, a FRENET content block, a USB stick) are the release the maintainers signed. With no trust roots
  * configured it refuses everything (fail closed).
  *
  * Not covered: key rotation of the roots themselves (roots are pinned out of band), compromise of >= t release
- * keys, build reproducibility, and the installer. See docs/ARCHITECTURE.md.
+ * keys, and build reproducibility. See docs/ARCHITECTURE.md.
  */
 
 export const UPDATE_PRODUCT = 'frenet'
