@@ -16,6 +16,7 @@
     "start": "tsx src/cli.ts",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
+    "test:fuzz": "node --import tsx --test test/fuzz.test.ts",
     "test:natlab": "FRENET_NATLAB=1 node --import tsx --test test/natlab.test.ts"
   },
   "dependencies": {

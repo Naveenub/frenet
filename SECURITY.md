@@ -1,9 +1,9 @@
 # Security
-- Crypto: Noise (XX), Ed25519 and AES-256-GCM via libp2p / `@libp2p/crypto` / Node `crypto`; scrypt for backup passphrases; Shamir secret sharing over GF(2^8) for recovery shares (a textbook construction, ~60 lines in `src/recovery.ts`, covered by tests, **not independently reviewed**). No custom ciphers or signature schemes.
+- Crypto: Noise (XX), Ed25519 and AES-256-GCM via libp2p / `@libp2p/crypto` / Node `crypto`; scrypt for backup passphrases; Shamir secret sharing over GF(2^8) for recovery shares (a textbook construction, ~60 lines in `src/recovery.ts`, covered by tests and cross-checked against SLIP-39's reference arithmetic, **not independently reviewed**). Its field arithmetic is table-free and branch-free on secret values (see below). No custom ciphers or signature schemes.
 - Private keys never leave `<data>/identity.key` (0600) except through the explicit recovery commands below. The HTTP API never returns key material.
 - **No independent security audit has been done.** `docs/AUDIT.md` lists scope, threat model and open questions for whoever is commissioned to do one.
 - This is unaudited pre-release software. Do not rely on it for high-risk use.
-- Report vulnerabilities privately to the maintainers before disclosure.
+- **Reporting a vulnerability: see "Reporting a vulnerability" below.** Please do not open a public issue for a security bug.
 
 ## Identity, credentials and recovery
 Your Ed25519 key is your account: peer ID, `did:key`, your `<name>.<pub>` addresses and the credentials you issue are all derived from it.
@@ -21,7 +21,7 @@ frenet restore ~/frenet.backup                # or: frenet recovery restore SHAR
 **What recovery cannot fix.**
 - **A stolen key.** Whoever holds the key is you. A plain `did:key` cannot be rotated or revoked, so there is no way to tell peers "the old key is dead"; if that key may be compromised, treat the identity as burned: create a new one and re-announce it out of band. If you ran `frenet identity rotation-init` beforehand (a `did:frenet`), rotate with the offline next-key backup instead: the DID stays, the old key stops being current.
 - **Backup passphrase strength.** An offline attacker with the backup file can guess passphrases at scrypt N=2^17 speed; use a long random passphrase.
-- Share arithmetic uses table lookups (not constant time). Run split/restore on a machine you control.
+- Share arithmetic (`gfMul`, `gfDiv` in `src/recovery.ts`) uses no lookup tables and no branches on secret bytes: multiplication is a fixed 8-step shift/AND/XOR loop and inversion is a fixed `a^254` chain, so no memory index or branch depends on a share or key byte. This is a software property of the source, **not a guarantee about the running code**: JavaScript engines may recompile, and nobody has measured timing on real hardware. Run split/restore on a machine you control.
 - Running split/restore with a node live on the same data directory is unsupported.
 
 **Credentials.** VC-JWTs are verified offline against the issuer's DID, with `alg` pinned to EdDSA. Expiry and issuer-signed revocation statements are honoured, but revocation is pull-only: a verifier only knows about revocations it has imported, and there is no revocation distribution network yet. A credential proves what the issuer signed, not that the issuer is trustworthy; deciding which DIDs to trust is the verifier's job. Presentations are only replay-safe if the verifier supplies a fresh nonce per request.
@@ -42,3 +42,14 @@ frenet restore ~/frenet.backup                # or: frenet recovery restore SHAR
 
 ## Abusive content (not a vulnerability)
 This node stores and serves content published by others. To report abusive content you found, use **Content Safety** in the dashboard: it records a signed local report and can block the content on your node (see README, "Content safety"). That is separate from reporting a vulnerability, which goes to the maintainers privately (above). Blocking is local and by exact hash; it does not remove content from other nodes. For an encrypted file, paste the whole link (it includes the key) when you block, so every chunk can be listed and blocked; the key is used once in memory and never saved, and it can be added later to an existing block (the manifest is then fetched from a peer, read once and not stored). Illegal content, child sexual abuse material above all, should also go to your national hotline (see inhope.org) and to the authorities where the law requires it.
+
+## Reporting a vulnerability
+**Contact:** `TODO-maintainers: publish a monitored address here` (the maintainers must replace this line before the first public release; until then there is **no working security contact**, and the README says so). Prefer GitHub's private vulnerability reporting ("Security" tab, "Report a vulnerability") once it is enabled on the repository, or an encrypted email if a PGP key is published here.
+
+- Send what you found, the commit or version, and how to reproduce it. A proof of concept is welcome; please do not test against nodes you do not run.
+- **Response targets:** acknowledgement within 3 working days, an initial assessment within 10, and a fix or a mitigation plan within 90 days of the report. These are targets for a volunteer project, not a service level.
+- **Disclosure:** coordinated. We will agree a date with you, normally when a fix is released or after 90 days, whichever is first; if a fix needs longer we will say why. Reporters are credited unless they ask not to be.
+- **In scope:** this repository, including the wire protocols and the loopback API. **Out of scope:** third-party libraries (report those upstream; tell us too if FRENET's use of them makes it worse), a compromised host, traffic analysis by a global observer, and denial of service by sheer volume.
+- **Good faith:** research that follows this policy, touches only your own nodes and data, and stops at proof of impact will not be treated as hostile by the maintainers.
+- Fuzzing: `npm run test:fuzz` runs the built-in fuzz pass; reports from it include the seed (`FRENET_FUZZ_SEED`) so any failure replays exactly.
+

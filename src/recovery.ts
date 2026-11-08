@@ -158,22 +158,31 @@ export async function openBackup (text: string, passphrase: string): Promise<{ p
 // 2. Shamir secret sharing over GF(2^8)
 // ---------------------------------------------------------------------------------------------------------------
 
-// GF(256) with the AES polynomial x^8+x^4+x^3+x+1 (0x11b), generator 3.
-const EXP = new Uint8Array(510)
-const LOG = new Uint8Array(256)
-{
-  let x = 1
-  for (let i = 0; i < 255; i++) {
-    EXP[i] = x
-    LOG[x] = i
-    x = (x ^ (((x << 1) ^ (x & 0x80 ? 0x11b : 0)) & 0xff)) & 0xff   // x *= 3
+// GF(256) with the AES polynomial x^8+x^4+x^3+x+1 (0x11b). Secret bytes flow through these functions, so they use no
+// lookup tables and no data-dependent branches: every call does the same fixed sequence of shifts, ANDs and XORs.
+// (JavaScript gives no hard constant-time guarantee, since the JIT may rewrite code, but nothing here indexes memory or
+// branches on a secret value, which removes the cache- and branch-timing channels of the earlier log/exp tables.)
+export const gfMul = (a: number, b: number): number => {
+  let r = 0
+  a &= 0xff; b &= 0xff
+  for (let i = 0; i < 8; i++) {
+    r ^= a & -(b & 1)                          // add a if the low bit of b is set (mask is 0 or -1)
+    a = ((a << 1) & 0xff) ^ (0x1b & -(a >> 7)) // a *= x, reduce when the top bit was set
+    b >>= 1
   }
-  for (let i = 255; i < 510; i++) EXP[i] = EXP[i - 255]!
+  return r
 }
-export const gfMul = (a: number, b: number): number => (a === 0 || b === 0 ? 0 : EXP[LOG[a]! + LOG[b]!]!)
+/** a^-1 = a^254 by a fixed square-and-multiply chain (0 maps to 0). */
+const gfInv = (a: number): number => {
+  const a2 = gfMul(a, a); const a3 = gfMul(a2, a); const a6 = gfMul(a3, a3); const a12 = gfMul(a6, a6)
+  const a14 = gfMul(a12, a2); const a15 = gfMul(a12, a3)
+  const a30 = gfMul(a15, a15); const a60 = gfMul(a30, a30); const a120 = gfMul(a60, a60); const a240 = gfMul(a120, a120)
+  return gfMul(a240, a14)   // 240 + 14 = 254
+}
+/** Division. `b` must be a public value (a share position); a zero divisor is a caller bug, not secret-dependent. */
 export const gfDiv = (a: number, b: number): number => {
   if (b === 0) throw new Error('division by zero')
-  return a === 0 ? 0 : EXP[LOG[a]! + 255 - LOG[b]!]!
+  return gfMul(a, gfInv(b))
 }
 
 const SHARE_PREFIX = 'frenet-share:1:'
@@ -211,7 +220,8 @@ export function splitSecret (secret: Uint8Array, k: number, n: number): string[]
 }
 
 export function parseShare (text: string): ParsedShare {
-  const t = String(text).trim()
+  if (typeof text !== 'string') throw new Error('not a FRENET recovery share')
+  const t = text.trim()
   const parts = t.split(':')
   if (!t.startsWith(SHARE_PREFIX) || parts.length !== 7 || t.length > 2048) throw new Error('not a FRENET recovery share')
   const body = parts.slice(0, 6).join(':')
@@ -226,6 +236,7 @@ export function parseShare (text: string): ParsedShare {
 
 /** Rebuild the secret from at least k shares of one split. Throws on too few, mixed, duplicate or inconsistent shares. */
 export function combineShares (texts: string[]): Uint8Array {
+  if (!Array.isArray(texts) || texts.length > MAX_SHARES) throw new Error(`give between 1 and ${MAX_SHARES} shares`)
   const shares = texts.map(parseShare)
   if (shares.length === 0) throw new Error('no shares given')
   const { k, set } = shares[0]!
