@@ -19,7 +19,7 @@ frenet restore ~/frenet.backup                # or: frenet recovery restore SHAR
 - Restore never overwrites a different existing key unless you pass `--force`, and then keeps the old key as `identity.key.replaced-<time>`.
 
 **What recovery cannot fix.**
-- **A stolen key.** Whoever holds the key is you. A `did:key` cannot be rotated or revoked, so there is no way to tell peers "the old key is dead". If the key may be compromised, treat the identity as burned: create a new one and re-announce it out of band.
+- **A stolen key.** Whoever holds the key is you. A plain `did:key` cannot be rotated or revoked, so there is no way to tell peers "the old key is dead"; if that key may be compromised, treat the identity as burned: create a new one and re-announce it out of band. If you ran `frenet identity rotation-init` beforehand (a `did:frenet`), rotate with the offline next-key backup instead: the DID stays, the old key stops being current.
 - **Backup passphrase strength.** An offline attacker with the backup file can guess passphrases at scrypt N=2^17 speed; use a long random passphrase.
 - Share arithmetic uses table lookups (not constant time). Run split/restore on a machine you control.
 - Running split/restore with a node live on the same data directory is unsupported.

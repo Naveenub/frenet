@@ -38,7 +38,9 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | NAT traversal: circuit-relay v2 client + server, AutoNAT, DCUtR hole punching, UPnP port mapping | circuit-relay v2 (TCP and QUIC, cone and symmetric NAT, mobile profile), AutoNAT v2 and UPnP mapping: tested in a Linux network-namespace lab behind netfilter NAT (`npm run test:natlab`, root + miniupnpd). **DCUtR hole punching does not yet produce a direct link** (known todo: Node cannot dial from a port that has a live listener, so `@libp2p/tcp` and the QUIC client punch from an unannounced port; needs an upstream or native-transport fix), so NATed pairs stay on the relay. Real routers, CGNAT and UDP-blocking firewalls untested |
 | Names + updates: `<name>.<publisher-key>`, signed by your identity key, higher `seq` replaces lower, so a site keeps its address when you republish | working, tested (publish on A, resolve + serve on B, update, forged/stale/tampered records rejected) |
 | Search: keyword search over names/titles/keywords that publishers announce on the DHT, every record signature-checked | working, tested; opt-in per site, unranked, spammable (see limits) |
-| DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID | working, tested (spec test vector) |
+| DIDs: your identity key is also a `did:key` (Ed25519); resolves offline; any Ed25519 peer ID maps to a DID. Also `did:frenet` (rotatable, below) and `did:web` (Ed25519 keys, https only) | `did:key` working, tested (spec test vector); `did:web` resolved by the node (`GET /api/did/resolve`) and accepted as a credential issuer, tested against an injected fetcher only, **not against a live domain**; `did:web` trusts DNS and TLS |
+| Key rotation: `did:frenet:<id>`, a hash-chained key event log with pre-rotation (the next key is committed by hash and kept offline), distributed over the DHT (`/frenet/did/1.0.0`); credentials, handle proofs and ring membership follow the current key | working, tested (rotation after total key loss, peers follow the log over the network, superseded-key checks); `frenet identity rotation-init / rotate / log`, `GET /api/identity/log`. The peer ID changes on rotation, so `<name>.<publisher-key>` names must be republished; if the current **and** the next key are stolen there is no recovery; `iat` of a superseded-key signature is signer-claimed |
+| Human-memorable global names: domain handles `alice@example.com` -> DID through `https://example.com/.well-known/frenet-names.json`, optional consent proof signed by the DID's key, trust-on-first-use pinning | working over the local API (`GET /api/handles/resolve`, `GET /api/handles`) and `frenet identity handle-proof`; tested with an injected fetcher, **not against a live domain, no dashboard view yet**. Uniqueness and trust come from DNS and the web PKI (a domain can re-point a handle; the pin refuses a silent change, `repin=1` accepts it). Not a registry: there is no registration, no transfer and no global namespace without a domain |
 | Verifiable credentials: issue/verify W3C VC-JWTs signed by your identity key, holder presentations bound to a verifier nonce, issuer-signed revocation | working, tested (tamper, alg-confusion, replay, wrong-holder cases); revocation is pull-only, no trust registry |
 | Zero-knowledge authentication: prove "I am one of these N identities" without saying which (linkable ring proof over the same Ed25519 keys, `@noble/curves`), bound to a verifier challenge, scope and audience; a per-scope tag lets a verifier allow each anonymous member one action (a vote, a claim) | working, tested (every signer position, replay, tamper, forged/small-order tags, one-per-scope, two nodes over the API); anonymity set = the ring (O(n), max 1024; default minimum 5, optional `ringId` fingerprint pin against padded rings); dashboard view **Anonymous Auth** and `frenet zk` CLI; **not a general-purpose zk-SNARK, not independently audited** |
 | Account recovery: passphrase-encrypted key backup and k-of-n Shamir recovery shares, CLI only | working, tested end to end; recovers the *same* key, cannot help if the key is stolen (see SECURITY.md) |
@@ -47,7 +49,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Node reputation and malicious-node detection: local scores from verified misbehaviour (bad signatures, corrupt blocks, forged records, floods), automatic escalating blocks, dashboard/API view | working, tested; local only, nothing is shared between nodes, a rotated peer ID starts fresh |
 | Secure software updates: threshold-signed release manifests, expiry, rollback/downgrade protection, artifact hash check (`frenet update …`) | verification and signing tools working, tested; **the node never downloads or installs updates itself**, no trust roots are shipped (you pin them), root-key rotation not built |
 | Independent audits | **not done.** `docs/AUDIT.md` is the preparation package; no third party has reviewed this code |
-| Human-memorable global names, key rotation | **not built** |
+| Decentralized (registry-free, DNS-free) human-memorable names | **not built**; names without a domain are `<label>.<publisher-key>` (self-certifying, not memorable), memorable names need a domain you own |
 
 Nothing in the dashboard is simulated. Empty states mean there is no data.
 
@@ -99,12 +101,12 @@ curl -s localhost:7777/api/sites -H 'content-type: application/json' -d '{
 # -> name.link = frenet-name://my-blog.<your-publisher-key>, url = http://my-blog.<key>.localhost:7778/
 ```
 
-- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that names are not globally human-memorable: the key is part of the address.
+- A name is `<label>.<publisher-key>`: label `a-z0-9-` (1-63 chars), key = your Ed25519 public key (base32, 52 chars). The record `{name, target site ID, seq, ts, keywords, title}` is signed with your identity key, so **only you can create or update your names**, there is nothing to register, and nobody can squat or take over a name. The price is that `<label>.<publisher-key>` names are not human-memorable: the key is part of the address. For memorable names use a domain handle (`alice@example.com`, see Identity below), which depends on DNS.
 - **Updates:** publishing again under the same name signs a record with `seq + 1`; resolvers take the highest valid `seq`. The immutable `frenet-site://<id>` link of each version keeps working.
 - **Search:** keywords you attach are announced on the DHT; `GET /api/search?q=vegan+recipes` (or the dashboard) asks the network, verifies each record's signature and that it really carries the keyword, and returns names matching *all* query words. Names without keywords are not searchable.
 - Resolution: `GET /api/names/resolve?name=…&pub=…`; your names: `GET /api/names`. A name page runs on its own origin (`<name>.<key>.localhost`) that stays the same across versions.
 
-Limits: no global human-memorable names (key is in the address); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
+Limits: `<label>.<publisher-key>` names are not human-memorable (domain handles are, but depend on DNS and TLS); a malicious provider can serve an *older* valid record (resolvers ask up to 8 providers and take the highest `seq`, but a rollback is possible if only stale holders are reachable); search is unranked and anyone can publish spam under any keyword (per-peer reputation and Sybil limits exist, but search results are not ranked by them); full-text search of page contents is not built; own names are re-announced every 6 h and stored blocks every 12 h, but name records are announced only by their publisher (nodes that merely resolved a name keep a copy but do not announce it), so a *named* site's name needs its publisher online even though the site's files can live on in replicas; there is no name transfer or revocation (publish a new record pointing elsewhere).
 
 ### Content safety (reports and blocking)
 
@@ -134,13 +136,15 @@ Limits: local only (nothing is sent anywhere, no shared or gossiped blocklists, 
 ### Identity, credentials and recovery
 
 ```bash
-frenet identity                              # peer ID + DID (did:key:z6Mk...)
+frenet identity                              # peer ID + DID (did:key:z6Mk..., or did:frenet:... once rotation is set up)
+frenet identity rotation-init --next-out next.key   # make the identity rotatable; keep next.key OFFLINE
+frenet identity handle-proof alice@example.com      # entry to publish at https://example.com/.well-known/frenet-names.json
 frenet backup --out ~/frenet.backup          # passphrase-encrypted key backup (node stopped)
 frenet recovery split -k 3 -n 5              # 5 shares, any 3 recover the key
 frenet restore ~/frenet.backup               # or: frenet recovery restore SHARE SHARE SHARE
 ```
 
-Back the key up **now**: losing it loses the identity, and a stolen key cannot be revoked (see `SECURITY.md`).
+Back the key up **now**. A plain `did:key` identity cannot be rotated or revoked; run `rotation-init` to get a `did:frenet` that survives a lost or stolen key (see `SECURITY.md`). Resolve a handle with `GET /api/handles/resolve?handle=alice@example.com` (add `requireProof=1` to demand the DID holder's consent proof).
 Credentials go through the local API; subjects are DIDs or peer IDs:
 
 ```bash

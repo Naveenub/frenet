@@ -24,6 +24,7 @@ import { Admin } from './admin.js'
 import { Blocks } from './blocks.js'
 import { Calls } from './calls.js'
 import { Credentials, type RevocationCheck } from './credentials.js'
+import { Handles, WebDids, type JsonFetcher } from './webid.js'
 import { FileStore } from './files.js'
 import { Groups } from './groups.js'
 import { Messaging } from './messaging.js'
@@ -46,6 +47,8 @@ export async function noValueRecords (): Promise<never> {
 
 export interface FrenetOptions {
   dataDir: string | ':memory:'
+  /** Fetcher for did:web documents and domain handles (https only, SSRF-guarded by default). Tests inject a fake; there is no other network use. */
+  fetchJson?: JsonFetcher
   listen?: string[]
   bootstrap?: string[]
   mdns?: boolean
@@ -117,6 +120,10 @@ export interface FrenetNode {
   /** Anonymous membership proofs (linkable ring proofs) and single-use verifier challenges. */
   zk: ZkAuth
   identityLogs: IdentityLogs
+  /** did:web resolver (https, SSRF-guarded). */
+  webDids: WebDids
+  /** Domain handles (`alice@example.com`) with trust-on-first-use pinning. */
+  handles: Handles
   revocations: Revocations
   /** Primary DID: did:frenet when this node has a rotatable identity (key log), otherwise the did:key of its key. */
   did: string
@@ -262,7 +269,13 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const admin = new Admin(libp2p, store, privateKey, { operator, moderation, blocks }, opts.adminPeers)
   const identityLogs = new IdentityLogs(libp2p, store)
   const revocations: Revocations = new Revocations(libp2p, store, (jwt: unknown): Promise<RevocationCheck> => credentials.checkRevocation(jwt))
-  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations })
+  const webDids = new WebDids(opts.fetchJson)
+  const credentials: Credentials = new Credentials(store, privateKey, { identity, logs: identityLogs, revocations, web: webDids })
+  const handles = new Handles(webDids, {
+    ...(opts.fetchJson ? { fetchJson: opts.fetchJson } : {}),
+    pins: { get: (h) => store.getHandlePin(h), set: (h, d) => store.setHandlePin(h, d) },
+    resolveLog: async (id) => (identity && identity.id === id ? identity : identityLogs.resolve(id, { network: true }))
+  })
   const zk = new ZkAuth(store, privateKey, { resolveFrenet: frenetKeyResolver((id) => identityLogs.resolve(id, { network: false })) })
   // Malicious-node detection: every verified-bad act feeds the peer's reputation; crossing the threshold blocks and disconnects it.
   const report = (peer: string, ev: ReputationEvent, detail = ''): void => {
@@ -328,6 +341,8 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
     credentials,
     zk,
     identityLogs,
+    webDids,
+    handles,
     revocations,
     did: credentials.did,
     keyDid: credentials.keyDid,

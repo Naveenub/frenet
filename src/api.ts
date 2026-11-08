@@ -8,7 +8,9 @@ import { peerIdFromString } from '@libp2p/peer-id'
 import { ContentBlocked, DAY_MS } from './blocks.js'
 import { MAX_FILE_BYTES, openBlock, sealBlock, validFileKey } from './files.js'
 import { isPeerId } from './channel.js'
-import { didDocument, resolveDid, toDid } from './did.js'
+import { didDocument, frenetId, isFrenetDid, resolveDid, toDid } from './did.js'
+import { didDocumentFor } from './identity-log.js'
+import { HandleChanged, isWebDid, normalizeHandle } from './webid.js'
 import { PERMISSION_FEATURES } from './permissions.js'
 import { REPORT_CATEGORIES } from './moderation.js'
 import { cleanKeywords, cleanTitle, NameNotFound, NAME_RE } from './names.js'
@@ -159,12 +161,34 @@ export function startApi (n: FrenetNode, port: number, host = '127.0.0.1', gatew
         const q = String(url.searchParams.get('q') ?? '').slice(0, 200)
         return json(res, 200, { query: q, results: await n.names.search(q) })
       }
-      if (req.method === 'GET' && url.pathname === '/api/identity') return json(res, 200, { peerId: n.libp2p.peerId.toString(), did: n.did, document: didDocument(n.did) })
+      if (req.method === 'GET' && url.pathname === '/api/identity') return json(res, 200, { peerId: n.libp2p.peerId.toString(), did: n.did, keyDid: n.keyDid, document: n.identity ? didDocumentFor(n.identity) : didDocument(n.did) })
+      if (req.method === 'GET' && url.pathname === '/api/identity/log') {
+        // The public key event log of a rotatable identity (self-certifying; safe to hand out). Keep a copy with the offline next-key backup.
+        return n.identity ? json(res, 200, { did: n.identity.did, seq: n.identity.seq, events: n.identity.events }) : json(res, 404, { error: 'this identity has no key log (run: frenet identity rotation-init)' })
+      }
       if (req.method === 'GET' && url.pathname === '/api/did/resolve') {
-        // Accepts a DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network.
+        // A DID / DID URL, or an Ed25519 peer ID (converted to its did:key). did:key needs no network; did:frenet is
+        // answered from its verified key log (network lookup if unknown); did:web fetches https://<domain>/.well-known/did.json.
         const q = String(url.searchParams.get('did') ?? url.searchParams.get('peer') ?? '')
+        const did = (q.startsWith('did:') ? q : toDid(q)).split('#')[0]!
+        if (isFrenetDid(did)) {
+          const st = await n.identityLogs.resolve(frenetId(did), { network: true })
+          return st ? json(res, 200, didDocumentFor(st)) : json(res, 404, { error: 'unknown did:frenet identity (no key log found)' })
+        }
+        if (isWebDid(did)) return json(res, 200, (await n.webDids.resolve(did, { fresh: url.searchParams.get('fresh') === '1' })).document)
         return json(res, 200, resolveDid(q.startsWith('did:') ? q : toDid(q)).document)
       }
+      if (req.method === 'GET' && url.pathname === '/api/handles/resolve') {
+        // alice@example.com -> DID, via https://example.com/.well-known/frenet-names.json. Trust on first use: a changed answer is refused until ?repin=1.
+        const handle = normalizeHandle(String(url.searchParams.get('handle') ?? ''))
+        try {
+          return json(res, 200, await n.handles.resolve(handle, { requireProof: url.searchParams.get('requireProof') === '1', fresh: url.searchParams.get('fresh') === '1', repin: url.searchParams.get('repin') === '1' }))
+        } catch (e) {
+          if (e instanceof HandleChanged) return json(res, 409, { error: e.message, handle: e.handle, pinned: e.pinned, now: e.now })
+          throw e
+        }
+      }
+      if (req.method === 'GET' && url.pathname === '/api/handles') return json(res, 200, { pins: n.store.listHandlePins() })
       if (req.method === 'GET' && url.pathname === '/api/credentials') return json(res, 200, { did: n.did, credentials: n.credentials.list(), revocations: n.store.listRevocations().length })
       if (req.method === 'POST' && url.pathname === '/api/credentials/issue') {
         const b = await body(req)

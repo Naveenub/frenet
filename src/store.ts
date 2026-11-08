@@ -91,6 +91,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS outbox (kind TEXT NOT NULL CHECK (kind IN ('msg','group')), id TEXT NOT NULL, peer TEXT NOT NULL, ts INTEGER NOT NULL, payload TEXT NOT NULL, tries INTEGER NOT NULL DEFAULT 0, next INTEGER NOT NULL, PRIMARY KEY (kind, id, peer));
       CREATE TABLE IF NOT EXISTS site_permissions (origin TEXT NOT NULL, feature TEXT NOT NULL, ts INTEGER NOT NULL, PRIMARY KEY (origin, feature));
       CREATE TABLE IF NOT EXISTS tracker_rules (host TEXT PRIMARY KEY, action TEXT NOT NULL CHECK (action IN ('block','allow')), ts INTEGER NOT NULL);
+      CREATE TABLE IF NOT EXISTS handle_pins (handle TEXT PRIMARY KEY, did TEXT NOT NULL, ts INTEGER NOT NULL);
     `)
     try { this.db.exec('ALTER TABLE blocks ADD COLUMN expires INTEGER') } catch { /* column already present */ }
     try { this.db.exec('ALTER TABLE revocations ADD COLUMN own INTEGER NOT NULL DEFAULT 0') } catch { /* column already present */ }
@@ -339,6 +340,18 @@ export class Store {
   listIdentityLogs (ownOnly = false): Array<{ id: string, seq: number, own: boolean }> {
     const sql = `SELECT id, seq, own FROM identity_logs ${ownOnly ? 'WHERE own = 1 ' : ''}ORDER BY seen DESC`
     return (this.db.prepare(sql).all() as any[]).map((r) => ({ id: r.id, seq: Number(r.seq), own: !!r.own }))
+  }
+
+  /** Trust-on-first-use pins for domain handles (`alice@example.com` -> the first DID it resolved to). */
+  getHandlePin (handle: string): string | null {
+    const r = this.db.prepare('SELECT did FROM handle_pins WHERE handle = ?').get(handle) as any
+    return r ? String(r.did) : null
+  }
+  setHandlePin (handle: string, did: string): void {
+    this.db.prepare('INSERT OR REPLACE INTO handle_pins (handle, did, ts) VALUES (?, ?, ?)').run(handle, did, Date.now())
+  }
+  listHandlePins (): Array<{ handle: string, did: string, ts: number }> {
+    return (this.db.prepare('SELECT handle, did, ts FROM handle_pins ORDER BY handle LIMIT 500').all() as any[]).map((r) => ({ handle: String(r.handle), did: String(r.did), ts: Number(r.ts) }))
   }
 
   putReputation (r: PeerReputation): void {

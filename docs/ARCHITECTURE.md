@@ -11,7 +11,7 @@ web/ (dashboard)  <--HTTP+SSE, loopback only-->  src/api.ts          src/gateway
                                |-- src/names.ts      /frenet/name/1.0.0, signed name records + keyword search
                                |-- src/calls.ts      /frenet/call/1.0.0, signed WebRTC signalling (media stays in the browser)
                                |-- src/groups.ts     /frenet/group/1.0.0, communities, group chat, proposals and ballots
-                               |-- src/did.ts        did:key (Ed25519) derivation, DID documents, offline resolution
+                               |-- src/did.ts        did:key (Ed25519) derivation, DID documents, offline resolution; did:frenet / did:web ids (identity-log.ts, webid.ts)
                                |-- src/credentials.ts  VC-JWT issue/verify, presentations, revocation
                                |-- src/recovery.ts   encrypted key backup, Shamir recovery shares (CLI: src/cli-identity.ts)
                                |-- src/operator.ts   ban list (connection gater), disconnect, sweep, stats
@@ -77,7 +77,8 @@ A persistent ban list (SQLite `bans`) loaded into a live set that the libp2p con
 
 **Limits (zero-knowledge).** Anonymity set = the ring the verifier names; O(n) size and time; tags are stable within a scope by design; no general ZK statements; not audited; the CLI `verify` cannot know nonce freshness or tag reuse (only the node's API tracks them); the proof binds to a nonce this node issued, so cross-node challenge exchange is up to the application (use `externalNonce` only if the caller guarantees freshness and single use).
 
-**Limits.** A did:key cannot be rotated or revoked, so a stolen key cannot be recovered from (no pre-rotation / KERI-style continuity yet). Revocation is pull-only; nothing distributes statements. Credentials are not exchanged over the network by the node (hand the JWT over any channel, e.g. a message). Backup covers the key only: messages, blocks, held credentials and file keys are separate. No dashboard UI yet.
+**Other DID methods and handles.** `did:frenet` (`src/identity-log.ts`, `src/rotation.ts`): hash-chained key events with pre-rotation, public log served over `/frenet/did/1.0.0`; `GET /api/identity`, `GET /api/identity/log`. `did:web` and `alice@example.com` handles (`src/webid.ts`): https-only, SSRF-guarded fetches, `GET /api/did/resolve` for `did:web`/`did:frenet`, `GET /api/handles/resolve` and `GET /api/handles` (trust-on-first-use pins in the `handle_pins` table; a changed answer returns 409 until `repin=1`). Both did:web and handles trust DNS and TLS.
+**Limits.** A plain did:key cannot be rotated or revoked; `did:frenet` exists for that (if both the current and the pre-committed next key are stolen, nothing helps). Revocation is pull-only; nothing distributes statements. Credentials are not exchanged over the network by the node (hand the JWT over any channel, e.g. a message). Backup covers the key only: messages, blocks, held credentials and file keys are separate. No dashboard UI yet.
 
 ## Content safety (`src/moderation.ts`)
 **Why local.** A node serves other people's data and there is no central party who can remove it, so every operator needs their own tools. Nothing here is transmitted, gossiped or scanned automatically.
