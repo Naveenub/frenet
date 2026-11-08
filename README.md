@@ -11,7 +11,9 @@ This is the actual stack. It differs from the original spec, which assumed Next.
 | Frontend (`web/`) | Plain JavaScript ES modules (`web/app.js`), hand-written HTML and CSS, no framework, no bundler, no build step (`scripts/copy-web.mjs` only copies the files into `dist/`). Talks to the node over loopback HTTP + SSE. | Next.js, React, TypeScript, Tailwind |
 | Backend (`src/`) | Node.js >= 22.13 + strict TypeScript (ESM, `tsc`, run with `tsx`), js-libp2p, `node:sqlite` | Go, Rust |
 
-The one Rust component is a dependency, not our code: the QUIC transport `@chainsafe/libp2p-quic` is a native binding over `quinn`. All FRENET source is TypeScript.
+The native components are dependencies, not our code: the QUIC transport `@chainsafe/libp2p-quic` is a binding over Rust's `quinn`, and the optional WebRTC transport `@libp2p/webrtc` uses `node-datachannel` (C++, libdatachannel). All FRENET source is TypeScript.
+
+**WebRTC.** There are two separate uses. (1) *Node transport* (opt-in, `--webrtc`): `/webrtc-direct` (UDP, no signalling server, the DTLS certificate hash is in the address) and `/webrtc` (private-to-private, signalled over a circuit relay, needs NAT/relay mode). (2) *Dashboard calls*: browser-to-browser media, with signalling relayed by the node. These are independent: the node does not carry call media.
 
 ## Status (what is real)
 
@@ -27,6 +29,7 @@ The one Rust component is a dependency, not our code: the QUIC transport `@chain
 | Re-announcement: every block held locally (own files and sites first, then replicas) is announced on the DHT again at start-up and every 12 h (`--reannounce-hours`), so content stays findable across restarts and while its publisher is offline | working, tested (restart, schedule, blocked/expired skipped); only helps while some node still holds the content |
 | Content safety: signed local content reports, operator blocklist for content IDs, names and publisher keys, purge of local copies, refusal to store/fetch/serve/announce/render blocked content (HTTP 451 at the gateway), dashboard view | working, tested; **local to each node**: nothing is shared or scanned automatically, matching is by exact hash (see Content safety) |
 | Dashboard: Distributed Storage (add, share link, download, delete) | working |
+| WebRTC node transport (`--webrtc`, opt-in): `/webrtc-direct` listener and dialer, `/webrtc` private-to-private via relay | `/webrtc-direct` working, tested between two real nodes on loopback (connect + signed message). **`/webrtc` via a relay and WebRTC across real NATs are untested**; UDP can be blocked by firewalls; the transport is third-party native code |
 | Direct encrypted messaging, local SQLite storage | working. A message to an unreachable peer is kept in a persistent sender-side outbox and retried when the peer connects and on a backoff timer, for up to 7 days (`queued: true` in the API). No relay holds mail, so the **sender's node must be online** when the recipient returns; the outbox is capped (200 per peer, 2000 total) |
 | Replay protection, per-peer rate limit, size caps | working, tested |
 | Dashboard: overview, peers, messages, identity, privacy, security | working (live data only) |

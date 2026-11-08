@@ -11,6 +11,7 @@ import { mdns } from '@libp2p/mdns'
 import { ping } from '@libp2p/ping'
 import { tcp } from '@libp2p/tcp'
 import { uPnPNAT } from '@libp2p/upnp-nat'
+import { webRTC, webRTCDirect } from '@libp2p/webrtc'
 import { createLibp2p } from 'libp2p'
 import { peerIdFromPrivateKey, peerIdFromString } from '@libp2p/peer-id'
 import type { Libp2p, PrivateKey } from '@libp2p/interface'
@@ -70,6 +71,13 @@ export interface FrenetOptions {
   turnCredential?: string
   /** QUIC transport (UDP, `/quic-v1`) next to TCP. Default true. When `listen` is not given, a QUIC listener is added. */
   quic?: boolean
+  /**
+   * libp2p WebRTC transports (native `node-datachannel`), opt-in: `/webrtc-direct` (UDP, no signalling server, DTLS with a certhash in the
+   * address) and `/webrtc` (private-to-private: signalled over a circuit relay, so it needs `nat` or a `relays` entry). This is node-to-node
+   * transport; browser call media is separate and stays in the dashboard. When `listen` is not given, a `/udp/0/webrtc-direct` listener is
+   * added (plus `/webrtc` when relays are in use). Default false.
+   */
+  webrtc?: boolean
   /** Refuse peers whose key lacks this many bits of identity proof-of-work (see `frenet identity mine`). Default 0 (off). */
   minIdentityBits?: number
   /** At most this many distinct peers per IPv4 /24 (IPv6 /48) at once; loopback/LAN/relayed are exempt. Default 8, 0 disables. */
@@ -182,11 +190,13 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const useNat = opts.nat !== false
   const relays = opts.relays ?? []
   const useQuic = opts.quic !== false
-  const listen = [...(opts.listen ?? ['/ip4/0.0.0.0/tcp/0', ...(useQuic ? ['/ip4/0.0.0.0/udp/0/quic-v1'] : [])])]
+  const useWebrtc = opts.webrtc === true
+  const listen = [...(opts.listen ?? ['/ip4/0.0.0.0/tcp/0', ...(useQuic ? ['/ip4/0.0.0.0/udp/0/quic-v1'] : []), ...(useWebrtc ? ['/ip4/0.0.0.0/udp/0/webrtc-direct'] : [])])]
   // Reserve a slot on each configured relay; with none configured, let libp2p
   // discover relays among connected peers that run the hop protocol.
   for (const r of relays) listen.push(`${r.replace(/\/p2p-circuit$/, '')}/p2p-circuit`)
   if (useNat && relays.length === 0) listen.push('/p2p-circuit')
+  if (useWebrtc && (useNat || relays.length > 0)) listen.push('/webrtc')   // private-to-private: needs the circuit-relay listeners above
   // Bootstrap peers and relays are dialed at startup (relays so the reservation can be made).
   const boot = [...(opts.bootstrap ?? []), ...relays]
   // Operator-chosen bootstrap/relay peers are exempt from the proof-of-work rule and from auto-blocking (still scored).
@@ -228,7 +238,7 @@ export async function startFrenet (opts: FrenetOptions): Promise<FrenetNode> {
   const libp2p = await createLibp2p({
     privateKey,
     addresses: { listen, ...(opts.announce?.length ? { announce: opts.announce } : {}) },
-    transports: [tcp(), ...(useQuic ? [quic()] : []), ...(useNat || opts.relayServer ? [circuitRelayTransport()] : [])],
+    transports: [tcp(), ...(useQuic ? [quic()] : []), ...(useWebrtc ? [webRTCDirect()] : []), ...(useNat || opts.relayServer || relays.length > 0 ? [circuitRelayTransport()] : []), ...(useWebrtc && (useNat || relays.length > 0) ? [webRTC()] : [])],
     connectionEncrypters: [noise()],   // Noise XX: authenticated, forward-secret
     streamMuxers: [yamux()],
     // Refuse banned or auto-blocked peers, peers whose identity lacks the required proof-of-work, and (inbound)

@@ -1,7 +1,7 @@
 {
   "name": "frenet",
   "version": "0.1.0",
-  "description": "FRENET \u2014 decentralized, privacy-first peer-to-peer internet (Phase 1 MVP node)",
+  "description": "FRENET — decentralized, privacy-first peer-to-peer internet (Phase 1 MVP node)",
   "license": "Apache-2.0",
   "type": "module",
   "private": true,
@@ -35,6 +35,7 @@
     "@libp2p/ping": "^3.1.17",
     "@libp2p/tcp": "^11.0.32",
     "@libp2p/upnp-nat": "^4.0.32",
+    "@libp2p/webrtc": "^7.0.2",
     "@multiformats/multiaddr": "^13.0.3",
     "@noble/curves": "^2.4.0",
     "libp2p": "^3.5.1",

@@ -17,7 +17,7 @@
 ## Known gaps a reviewer should expect to confirm (self-assessed, not verified)
 - Constant-time behaviour of the Shamir implementation: the source avoids secret-indexed tables and secret-dependent branches, but JIT-compiled JavaScript offers no guarantee and no timing measurement has been made. A reviewer should confirm or, better, replace it with a vetted library. Noise/QUIC are the upstream libraries' responsibility.
 - Fuzzing is random and structure-aware, not coverage-guided; a reviewer should run a real coverage-guided fuzzer (e.g. Jazzer.js) against the entry points listed in `test/fuzz.test.ts`.
-- Real browser WebRTC media is untested. NAT traversal and QUIC behind NATs are tested only in a Linux network-namespace lab (see `docs/ARCHITECTURE.md`); hole punching does not work; real routers, CGNAT and UDP-blocking firewalls are untested.
+- The optional WebRTC node transport (`--webrtc`, `@libp2p/webrtc` over native `node-datachannel`) is tested on loopback only (`/webrtc-direct`); `/webrtc` via relay and real NATs are untested. Real browser WebRTC media is untested. NAT traversal and QUIC behind NATs are tested only in a Linux network-namespace lab (see `docs/ARCHITECTURE.md`); hole punching does not work; real routers, CGNAT and UDP-blocking firewalls are untested.
 - Reputation thresholds and proof-of-work levels are untuned guesses.
 - Equivocation by a community owner (different rosters to different members) is not detected.
 - Update trust roots cannot be rotated. The installer (`src/installer.ts`) replaces files atomically but does not unpack or run anything; its path handling, backup/rollback and https-only fetching are new and unreviewed.
