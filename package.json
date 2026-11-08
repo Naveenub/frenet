@@ -1,7 +1,7 @@
 {
   "name": "frenet",
   "version": "0.1.0",
-  "description": "FRENET — decentralized, privacy-first peer-to-peer internet (Phase 1 MVP node)",
+  "description": "FRENET \u2014 decentralized, privacy-first peer-to-peer internet (Phase 1 MVP node)",
   "license": "Apache-2.0",
   "type": "module",
   "private": true,
@@ -17,7 +17,8 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "test:fuzz": "node --import tsx --test test/fuzz.test.ts",
-    "test:natlab": "FRENET_NATLAB=1 node --import tsx --test test/natlab.test.ts"
+    "test:natlab": "FRENET_NATLAB=1 node --import tsx --test test/natlab.test.ts",
+    "test:scale": "node --import tsx scripts/scale.ts"
   },
   "dependencies": {
     "@chainsafe/libp2p-noise": "^17.0.0",
