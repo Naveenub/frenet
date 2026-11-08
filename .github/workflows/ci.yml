@@ -1,5 +1,9 @@
 name: ci
-on: [push, pull_request]
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '17 3 * * *'   # nightly long fuzz run with a fresh seed
 permissions:
   contents: read
 jobs:
@@ -14,3 +18,13 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+  fuzz:
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22 }
+      - run: npm ci
+      - name: long fuzz run (the seed is printed in any failure so it can be replayed)
+        run: FRENET_FUZZ_ITERS=100000 FRENET_FUZZ_SEED=$(date +%s) npm run test:fuzz
